@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .fs_utils import atomic_write_json, atomic_write_text, safe_read_json
 from .task_parser import (
     Task, ProjectConfig, parse_task_file,
     topological_levels, get_task_map,
@@ -142,7 +143,7 @@ class Orchestrator:
             ],
         }
         snapshot_file = self.coord_dir / "plan-snapshot.json"
-        snapshot_file.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        atomic_write_json(snapshot_file, snapshot)
 
     # ── 智能上下文提取 ──
 
@@ -159,7 +160,7 @@ class Orchestrator:
         )
 
         ctx_file = self.coord_dir / "context" / f"{task.id}.md"
-        ctx_file.write_text(context)
+        atomic_write_text(ctx_file, context)
 
     def _build_dependency_context(self, task: Task) -> str:
         """从上游任务结果中构建依赖上下文注入 prompt"""
@@ -355,11 +356,11 @@ class Orchestrator:
         # 持久化 cancelled 结果，避免 resume 后语义漂移成 failed
         if self.coord_dir:
             result_file = self.coord_dir / "coord" / f"{task.id}.result"
-            result_file.parent.mkdir(parents=True, exist_ok=True)
             summary = {
                 "task_id": task.id,
                 "success": False,
                 "status": "cancelled",
+                "task_hash": getattr(task, "signature", ""),
                 "cost_usd": 0.0,
                 "duration_s": 0.0,
                 "num_turns": 0,
@@ -369,10 +370,10 @@ class Orchestrator:
                 "error": reason[:1000] if reason else "",
                 "retry_attempt": 0,
             }
-            result_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+            atomic_write_json(result_file, summary)
 
             status_file = self.coord_dir / "coord" / f"{task.id}.STATUS"
-            status_file.write_text(f"CANCELLED\n{time.time()}\n")
+            atomic_write_text(status_file, f"CANCELLED\n{time.time()}\n")
 
     def _cancel_remaining(self):
         """取消所有剩余任务"""
@@ -415,37 +416,48 @@ class Orchestrator:
         if not self.config:
             self.load()
 
-        # 加载已有结果
+        # 加载已有结果（签名不匹配 / 文件损坏 → 忽略，重新执行）
+        stale_count = 0
         for task in self.tasks:
             result_file = self.coord_dir / "coord" / f"{task.id}.result"
-            if result_file.exists():
-                try:
-                    data = json.loads(result_file.read_text())
-                    self.results[task.id] = WorkerResult(
-                        task_id=data["task_id"],
-                        success=data["success"],
-                        cost_usd=data.get("cost_usd", 0),
-                        duration_s=data.get("duration_s", 0),
-                        num_turns=data.get("num_turns", 0),
-                        model_used=data.get("model_used", ""),
-                        worktree_path=data.get("worktree_path", ""),
-                        output=data.get("output_summary", ""),
-                        error=data.get("error", ""),
-                    )
-                    persisted_status = data.get("status", "")
-                    if data["success"]:
-                        task.status = "done"
-                        self.stats.completed += 1
-                    elif persisted_status == "cancelled":
-                        task.status = "cancelled"
-                        self.stats.skipped += 1
-                    else:
-                        task.status = "failed"
-                        self.stats.failed += 1
-                    # 无论成功失败都累加成本
-                    self.stats.total_cost_usd += data.get("cost_usd", 0)
-                except (json.JSONDecodeError, KeyError):
-                    pass
+            data = safe_read_json(result_file)
+            if not data:
+                continue
+            try:
+                stored_hash = data.get("task_hash", "")
+                if stored_hash and task.signature and stored_hash != task.signature:
+                    # YAML 被修改：丢弃旧结果，强制重跑
+                    stale_count += 1
+                    print(f"  [resume] 任务 '{task.id}' 签名不匹配，将重新执行")
+                    continue
+                self.results[task.id] = WorkerResult(
+                    task_id=data["task_id"],
+                    success=data["success"],
+                    cost_usd=data.get("cost_usd", 0),
+                    duration_s=data.get("duration_s", 0),
+                    num_turns=data.get("num_turns", 0),
+                    model_used=data.get("model_used", ""),
+                    worktree_path=data.get("worktree_path", ""),
+                    output=data.get("output_summary", ""),
+                    error=data.get("error", ""),
+                )
+                persisted_status = data.get("status", "")
+                if data["success"]:
+                    task.status = "done"
+                    self.stats.completed += 1
+                elif persisted_status == "cancelled":
+                    task.status = "cancelled"
+                    self.stats.skipped += 1
+                else:
+                    task.status = "failed"
+                    self.stats.failed += 1
+                # 无论成功失败都累加成本
+                self.stats.total_cost_usd += data.get("cost_usd", 0)
+            except KeyError:
+                pass
+
+        if stale_count:
+            print(f"  [resume] 共 {stale_count} 个任务因定义变更需重新执行")
 
         # 重新过滤需要执行的任务
         remaining = [t for t in self.tasks if t.status == "pending"]
@@ -580,7 +592,7 @@ class Orchestrator:
     def _save_report(self, report: dict):
         """保存报告到文件"""
         report_file = self.coord_dir / "results" / f"report-{int(time.time())}.json"
-        report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        atomic_write_json(report_file, report)
 
     # ── Worktree 管理 ──
 

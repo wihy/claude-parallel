@@ -316,15 +316,21 @@ class LiveMetricsStreamer:
 
     def _stream_loop(self):
         """后台定期导出循环"""
+        consecutive_errors = 0
         while self._running.is_set():
             try:
                 self._tick()
-            except Exception:
-                pass
+                consecutive_errors = 0
+            except Exception as e:
+                consecutive_errors += 1
+                self._log_error(f"_tick 异常 (连续 {consecutive_errors} 次): {e!r}")
+                # 连续失败过多 — xctrace 可能已挂，放慢节奏避免占 CPU
+                if consecutive_errors >= 5:
+                    time.sleep(min(30.0, self.interval_sec * 2))
             # 分段 sleep，以便快速响应 stop
             deadline = time.time() + self.interval_sec
             while self._running.is_set() and time.time() < deadline:
-                time.sleep(min(1.0, deadline - time.time()))
+                time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
     def _tick(self):
         """单次导出+解析+告警"""
@@ -337,16 +343,27 @@ class LiveMetricsStreamer:
         with self._lock:
             self._snapshots.append(snap)
 
-        # 写 JSONL
+        # 写 JSONL（失败抛出让 _stream_loop 记录）
         if self.jsonl_path:
-            try:
-                with open(self.jsonl_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(snap.to_dict(), ensure_ascii=False) + "\n")
-            except Exception:
-                pass
+            with open(self.jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(snap.to_dict(), ensure_ascii=False) + "\n")
+                f.flush()
 
         # 检查阈值
         self._check_thresholds(snap)
+
+    def _log_error(self, msg: str):
+        """把 _stream_loop 异常写到 jsonl 旁边的 errors.log。"""
+        if not self.jsonl_path:
+            return
+        err_path = Path(self.jsonl_path).parent / "live_metrics.errors.log"
+        try:
+            ts = time.strftime("%H:%M:%S")
+            err_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(err_path, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {msg}\n")
+        except Exception:
+            pass
 
     def _check_thresholds(self, snap: MetricSnapshot):
         for t in self.thresholds:

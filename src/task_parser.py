@@ -2,6 +2,8 @@
 任务解析器 — 从 YAML 文件解析任务定义，构建 DAG 依赖图，拓扑排序。
 """
 
+import hashlib
+import json
 import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,9 +24,28 @@ class Task:
     effort: str = "medium"
     extra_prompt: str = ""  # 追加的上下文/指令
     status: str = "pending"  # pending / running / done / failed / cancelled
+    signature: str = ""  # resume 校验用，由 compute_signature() 填充
 
     def __repr__(self):
         return f"Task({self.id}, deps={self.depends_on}, status={self.status})"
+
+    def compute_signature(self) -> str:
+        """
+        基于影响 Worker 行为的语义字段计算稳定哈希。
+        用于 resume 时检测 YAML 是否被修改（signature 不匹配 → 需重跑）。
+        不包含 status（运行态）、max_budget_usd/effort/model（调参不改语义）。
+        """
+        payload = {
+            "id": self.id,
+            "description": self.description,
+            "files": sorted(self.files),
+            "allowed_tools": sorted(self.allowed_tools),
+            "depends_on": sorted(self.depends_on),
+            "max_turns": self.max_turns,
+            "extra_prompt": self.extra_prompt,
+        }
+        blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()[:16]
 
 
 @dataclass
@@ -113,7 +134,11 @@ def parse_task_file(filepath: str) -> tuple[ProjectConfig, list[Task]]:
         for dep in task.depends_on:
             if dep not in task_ids:
                 raise ValueError(f"任务 '{task.id}' 依赖不存在的任务 '{dep}'")
-    
+
+    # 为每个任务计算签名（供 resume 校验）
+    for task in tasks:
+        task.signature = task.compute_signature()
+
     return config, tasks
 
 

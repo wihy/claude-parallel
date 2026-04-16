@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
 from .config import PerfConfig
+from ..fs_utils import atomic_write_json, safe_read_json
 
 
 class PerfSessionManager:
@@ -153,8 +154,7 @@ class PerfSessionManager:
 
         self._save_meta(meta)
         if not self.timeline_file.exists():
-            self.timeline_file.parent.mkdir(parents=True, exist_ok=True)
-            self.timeline_file.write_text(json.dumps({"events": []}, ensure_ascii=False, indent=2))
+            atomic_write_json(self.timeline_file, {"events": []})
         self.mark_event("perf_session_started", detail="collector booted")
         return meta
 
@@ -186,12 +186,7 @@ class PerfSessionManager:
         return "\n".join(data[-lines:])
 
     def mark_event(self, name: str, detail: str = "", level_idx: Optional[int] = None, tasks: Optional[list] = None):
-        payload = {"events": []}
-        if self.timeline_file.exists():
-            try:
-                payload = json.loads(self.timeline_file.read_text())
-            except Exception:
-                payload = {"events": []}
+        payload = safe_read_json(self.timeline_file, {"events": []}) or {"events": []}
         if "events" not in payload or not isinstance(payload["events"], list):
             payload["events"] = []
         payload["events"].append({
@@ -201,8 +196,7 @@ class PerfSessionManager:
             "level_idx": level_idx,
             "tasks": tasks or [],
         })
-        self.timeline_file.parent.mkdir(parents=True, exist_ok=True)
-        self.timeline_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+        atomic_write_json(self.timeline_file, payload)
 
     # ---------- analysis ----------
     def report(self, with_callstack: bool = False, callstack_top_n: int = 20) -> Dict[str, Any]:
@@ -232,8 +226,7 @@ class PerfSessionManager:
             if self.config.threshold_pct > 0:
                 report["gate"] = self._gate_check(report["baseline"]["delta"], self.config.threshold_pct)
 
-        self.report_file.parent.mkdir(parents=True, exist_ok=True)
-        self.report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        atomic_write_json(self.report_file, report)
         return report
 
     # ---------- internals ----------
@@ -399,11 +392,29 @@ class PerfSessionManager:
         meta["syslog"]["reliable"] = reliable
         self._save_meta(meta)
 
-    def _kill_pid(self, pid: int):
+    def _kill_pid(self, pid: int, grace_seconds: float = 5.0):
+        """SIGTERM → 每 0.2s 探测 → grace 耗尽则 SIGKILL."""
         if not pid:
             return
         try:
             os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except Exception:
+            return
+
+        deadline = time.time() + grace_seconds
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            except Exception:
+                return
+            time.sleep(0.2)
+
+        try:
+            os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             return
         except Exception:
@@ -418,8 +429,7 @@ class PerfSessionManager:
             return {}
 
     def _save_meta(self, meta: Dict[str, Any]):
-        self.meta_file.parent.mkdir(parents=True, exist_ok=True)
-        self.meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+        atomic_write_json(self.meta_file, meta)
 
     def _avg(self, arr: list) -> Optional[float]:
         if not arr:

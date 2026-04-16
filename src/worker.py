@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from .fs_utils import atomic_write_json, atomic_write_text
 from .task_parser import Task, ProjectConfig
 
 
@@ -217,7 +218,7 @@ class Worker:
             # 等待进程退出
             await asyncio.wait_for(self.process.wait(), timeout=10)
         except asyncio.TimeoutError:
-            self._kill()
+            await self._kill()
             if hasattr(self, "_stderr_task"):
                 self._stderr_task.cancel()
             self.logger.error(f"超时 ({timeout}s)")
@@ -308,18 +309,43 @@ class Worker:
 
         return result
 
-    def _kill(self):
-        """强制终止 Worker (terminate → 等 5s → kill)"""
-        if self.process and self.process.returncode is None:
+    async def _kill(self, grace_seconds: float = 5.0):
+        """强制终止 Worker (terminate → 等 grace_seconds → kill -9)"""
+        if not self.process or self.process.returncode is not None:
+            return
+        self._killed = True
+        try:
             self.process.terminate()
-            self._killed = True
             self.logger.warning("Worker 被 terminate")
-            # 注意: 真正的 kill 在 wait() 中通过 timeout 处理
-            # 如果 5s 后进程仍在，asyncio 会自动回收
+        except ProcessLookupError:
+            return
+        except Exception as e:
+            self.logger.warning(f"terminate 失败: {e}")
+
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=grace_seconds)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            self.process.kill()
+            self.logger.warning(f"Worker 未在 {grace_seconds}s 内退出，已 SIGKILL")
+        except ProcessLookupError:
+            return
+        except Exception as e:
+            self.logger.error(f"SIGKILL 失败: {e}")
+            return
+
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            self.logger.error("Worker 在 SIGKILL 后仍未回收")
 
     async def cleanup_worktree(self):
-        """清理当前 Worker 的 worktree（重试前调用）"""
+        """清理当前 Worker 的 worktree + 同名 cp-* 分支（重试前调用）"""
         wt_path = Path(self.config.repo) / ".claude" / "worktrees" / f"cp-{self.task.id}"
+        branch_name = f"cp-{self.task.id}"
         if wt_path.exists():
             proc = await asyncio.create_subprocess_exec(
                 "git", "worktree", "remove", str(wt_path), "--force",
@@ -330,20 +356,29 @@ class Worker:
             await proc.communicate()
             self.logger.info(f"已清理 worktree: {wt_path}")
 
+        # 删除占位分支，防止重试时 "branch already exists" 冲突
+        proc = await asyncio.create_subprocess_exec(
+            "git", "branch", "-D", branch_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self.config.repo,
+        )
+        await proc.communicate()
+
     def _write_status_file(self, status: str):
-        """写入状态标记文件"""
+        """写入状态标记文件（原子写）"""
         status_file = self.coord_dir / "coord" / f"{self.task.id}.STATUS"
-        status_file.parent.mkdir(parents=True, exist_ok=True)
-        status_file.write_text(f"{status}\n{time.time()}\n")
+        atomic_write_text(status_file, f"{status}\n{time.time()}\n")
 
     def _write_result_file(self, result: WorkerResult):
-        """写入结果摘要文件"""
+        """写入结果摘要文件（原子写）"""
         result_file = self.coord_dir / "coord" / f"{self.task.id}.result"
-        result_file.parent.mkdir(parents=True, exist_ok=True)
 
         summary = {
             "task_id": result.task_id,
             "success": result.success,
+            "status": self.task.status,
+            "task_hash": getattr(self.task, "signature", ""),
             "cost_usd": result.cost_usd,
             "duration_s": round(result.duration_s, 1),
             "num_turns": result.num_turns,
@@ -353,7 +388,7 @@ class Worker:
             "error": result.error[:1000] if result.error else "",
             "retry_attempt": result.retry_attempt,
         }
-        result_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+        atomic_write_json(result_file, summary)
 
     @property
     def is_running(self) -> bool:
@@ -430,7 +465,7 @@ async def retry_worker(
             logger.info(f"上次失败原因: {last_result.error[:200] if last_result and last_result.error else 'unknown'}")
             await asyncio.sleep(backoff)
 
-            # 清理旧 worktree
+            # 清理旧 worktree + 同名分支（否则新 Worker 的 -w cp-{task.id} 会失败）
             old_wt = Path(config.repo) / ".claude" / "worktrees" / f"cp-{task.id}"
             if old_wt.exists():
                 proc = await asyncio.create_subprocess_exec(
@@ -441,6 +476,13 @@ async def retry_worker(
                 )
                 await proc.communicate()
                 logger.info("已清理旧 worktree")
+            proc = await asyncio.create_subprocess_exec(
+                "git", "branch", "-D", f"cp-{task.id}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=config.repo,
+            )
+            await proc.communicate()
 
         task.status = "pending"
         worker = Worker(task, config, coord_dir)

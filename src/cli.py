@@ -366,28 +366,106 @@ async def cmd_validate(args):
 
 
 async def cmd_clean(args):
-    """清理所有 worktree"""
+    """清理所有 worktree + 对应的 cp-* 分支 + 协调目录
+
+    --prune-logs 模式下只轮转老日志，保留 worktree 和最新结果。
+    """
     import subprocess
     import shutil
+    import time as _time
+
+    repo_path = Path(args.repo).expanduser().resolve()
+    coord_root = repo_path / ".claude-parallel"
+
+    # ── 分支一: 仅轮转日志/上下文/报告 ──
+    if getattr(args, "prune_logs", False):
+        if not coord_root.exists():
+            print("  无协调目录，无需轮转")
+            return
+
+        keep_days = max(1, int(getattr(args, "keep_days", 7)))
+        keep_last = max(1, int(getattr(args, "keep_last", 20)))
+        cutoff = _time.time() - keep_days * 86400
+        removed = 0
+
+        # logs/ 与 context/ 按 mtime 删除
+        for sub in ("logs", "context"):
+            sub_dir = coord_root / sub
+            if not sub_dir.exists():
+                continue
+            for f in sub_dir.iterdir():
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+                    removed += 1
+
+        # results/ 按 mtime 保留最新 N 份
+        results_dir = coord_root / "results"
+        if results_dir.exists():
+            reports = sorted(
+                [f for f in results_dir.iterdir() if f.is_file()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for f in reports[keep_last:]:
+                f.unlink(missing_ok=True)
+                removed += 1
+
+        # perf/ 下旧会话目录 (按 tag 子目录 mtime)
+        perf_dir = coord_root / "perf"
+        if perf_dir.exists():
+            for session_dir in perf_dir.iterdir():
+                if session_dir.is_dir() and session_dir.stat().st_mtime < cutoff:
+                    shutil.rmtree(session_dir, ignore_errors=True)
+                    removed += 1
+
+        print(f"  轮转完成: 清理 {removed} 个过期文件/目录 (保留近 {keep_days} 天 / results 保留 {keep_last} 份)")
+        return
+
+    def _delete_cp_branch(name: str):
+        """删除 cp-* 分支；失败（分支不存在或被占用）静默跳过"""
+        if not name or not name.startswith("cp-"):
+            return
+        res = subprocess.run(
+            ["git", "branch", "-D", name],
+            cwd=args.repo, capture_output=True, text=True,
+        )
+        if res.returncode == 0:
+            print(f"  删除分支: {name}")
+
+    cleaned_branches: set[str] = set()
 
     proc = subprocess.run(
         ["git", "worktree", "list", "--porcelain"],
         capture_output=True, text=True, cwd=args.repo,
     )
-    for line in proc.stdout.splitlines():
+    # porcelain 格式: worktree <path>\nHEAD <sha>\nbranch refs/heads/<name>
+    current_path = ""
+    current_branch = ""
+    for line in proc.stdout.splitlines() + [""]:  # 末尾空行触发 flush
         if line.startswith("worktree "):
-            wt_path = line.split(" ", 1)[1]
-            if "/cp-" in wt_path:
+            if current_path and "/cp-" in current_path:
                 subprocess.run(
-                    ["git", "worktree", "remove", wt_path, "--force"],
+                    ["git", "worktree", "remove", current_path, "--force"],
                     cwd=args.repo,
                 )
-                print(f"  清理: {wt_path}")
-
-    coord_dir = Path(args.repo) / ".claude-parallel"
-    if coord_dir.exists():
-        shutil.rmtree(coord_dir)
-        print(f"  清理协调目录: {coord_dir}")
+                print(f"  清理 worktree: {current_path}")
+                if current_branch:
+                    cleaned_branches.add(current_branch)
+            current_path = line.split(" ", 1)[1]
+            current_branch = ""
+        elif line.startswith("branch refs/heads/"):
+            current_branch = line.split("refs/heads/", 1)[1]
+        elif line == "" and current_path:
+            if "/cp-" in current_path:
+                subprocess.run(
+                    ["git", "worktree", "remove", current_path, "--force"],
+                    cwd=args.repo,
+                )
+                print(f"  清理 worktree: {current_path}")
+                if current_branch:
+                    cleaned_branches.add(current_branch)
+            current_path = ""
+            current_branch = ""
 
     claude_dir = Path(args.repo) / ".claude" / "worktrees"
     if claude_dir.exists():
@@ -398,6 +476,23 @@ async def cmd_clean(args):
                     cwd=args.repo, capture_output=True,
                 )
                 print(f"  清理: {wt}")
+                cleaned_branches.add(wt.name)  # 按约定分支名=目录名
+
+    # 兜底：扫所有 cp-* 本地分支一并删除
+    br = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/cp-*"],
+        capture_output=True, text=True, cwd=args.repo,
+    )
+    for name in br.stdout.splitlines():
+        cleaned_branches.add(name.strip())
+
+    for name in sorted(cleaned_branches):
+        _delete_cp_branch(name)
+
+    coord_dir = Path(args.repo) / ".claude-parallel"
+    if coord_dir.exists():
+        shutil.rmtree(coord_dir)
+        print(f"  清理协调目录: {coord_dir}")
 
     print("  清理完成")
 
@@ -920,6 +1015,18 @@ def main():
     # ── clean ──
     clean_parser = subparsers.add_parser("clean", help="清理 worktree 和协调文件")
     clean_parser.add_argument("repo", help="项目仓库路径")
+    clean_parser.add_argument(
+        "--prune-logs", action="store_true",
+        help="仅轮转 logs/context/results 老文件，保留 worktree 和最新结果",
+    )
+    clean_parser.add_argument(
+        "--keep-days", type=int, default=7,
+        help="保留最近 N 天的日志/上下文 (配合 --prune-logs, 默认 7)",
+    )
+    clean_parser.add_argument(
+        "--keep-last", type=int, default=20,
+        help="results/ 目录最多保留最近 N 份报告 (配合 --prune-logs, 默认 20)",
+    )
 
     # ── logs ──
     logs_parser = subparsers.add_parser("logs", help="查看任务日志")

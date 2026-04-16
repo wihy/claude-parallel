@@ -434,7 +434,12 @@ class LiveLogAnalyzer:
         """后台读取 syslog 逐行分析"""
         try:
             while self._running.is_set() and self._process and self._process.poll() is None:
-                line = self._process.stdout.readline()
+                try:
+                    line = self._process.stdout.readline()
+                except Exception as e:
+                    # 读取错误（例如设备断开）— 记录并退出循环
+                    self._log_error(f"syslog readline 失败: {e!r}")
+                    break
                 if not line:
                     time.sleep(0.1)
                     continue
@@ -443,17 +448,37 @@ class LiveLogAnalyzer:
                 if not line:
                     continue
 
-                with self._lock:
-                    self._lines_processed += 1
-                    self._line_buffer.append(line)
-                    if len(self._line_buffer) > self.buffer_lines:
-                        self._line_buffer = self._line_buffer[-self.buffer_lines:]
+                try:
+                    with self._lock:
+                        self._lines_processed += 1
+                        self._line_buffer.append(line)
+                        if len(self._line_buffer) > self.buffer_lines:
+                            self._line_buffer = self._line_buffer[-self.buffer_lines:]
 
-                self._analyze_line(line)
+                    self._analyze_line(line)
+                except Exception as e:
+                    # 单行分析异常不影响整体 — 记录后继续
+                    self._log_error(f"_analyze_line 异常: {e!r}")
         except Exception as e:
-            # 进程被杀等异常属于正常退出
+            # 仅当处于运行态时才视为异常退出
             if self._running.is_set():
-                pass
+                self._log_error(f"_reader_loop 异常退出: {e!r}")
+        finally:
+            if self._running.is_set():
+                self._log_error("_reader_loop 提前结束（设备断开？）")
+
+    def _log_error(self, msg: str):
+        """把后台线程异常写到 alert log 旁边的 errors.log，避免静默。"""
+        if not self.alert_log_path:
+            return
+        err_path = self.alert_log_path.parent / "live_log.errors.log"
+        try:
+            ts = time.strftime("%H:%M:%S")
+            err_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(err_path, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {msg}\n")
+        except Exception:
+            pass
 
     def _analyze_line(self, line: str):
         """对一行日志应用所有规则"""
