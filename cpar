@@ -77,7 +77,7 @@ case "${1:-help}" in
         echo "  resume <yaml>     从中断处恢复"
         echo "  clean <repo>      清理 worktree 和协调文件"
         echo "  logs <repo>       查看任务日志 (-t TASK -n N)"
-        echo "  perf <subcmd>     真机性能采集/分析 (start/stop/tail/report/devices)"
+        echo "  perf <subcmd>     真机性能采集/分析 (start/stop/tail/report/devices/live/rules/stream/snapshot/callstack/templates)"
         echo ""
         echo "示例:"
         echo "  cpar chat                                     # 交互式对话"

@@ -472,8 +472,31 @@ async def cmd_perf_report(args):
         threshold_pct=args.threshold_pct or 0.0,
     )
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
-    rep = perf.report()
-    print(json.dumps(rep, ensure_ascii=False, indent=2))
+    with_cs = getattr(args, "with_callstack", False)
+    cs_top_n = getattr(args, "callstack_top", 20)
+    rep = perf.report(with_callstack=with_cs, callstack_top_n=cs_top_n)
+
+    if with_cs and "callstack" in rep:
+        text = perf.format_callstack_text(rep["callstack"])
+        print(text)
+        print()
+
+    if getattr(args, "json", False):
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    else:
+        # 简洁文本输出
+        print(f"  标签: {rep.get('tag')}")
+        print(f"  状态: {rep.get('status')}")
+        metrics = rep.get("metrics", {})
+        if metrics.get("source") != "none":
+            for k in ("display_avg", "cpu_avg", "networking_avg"):
+                v = metrics.get(k)
+                if v is not None:
+                    print(f"  {k}: {v}")
+        gate = rep.get("gate", {})
+        if gate.get("checked"):
+            status = "PASS" if gate.get("passed") else "FAIL"
+            print(f"  gate: {status} ({gate.get('reason', '')})")
 
 
 async def cmd_perf_devices(args):
@@ -744,6 +767,24 @@ async def cmd_perf_snapshot(args):
         print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+async def cmd_perf_callstack(args):
+    """调用栈分析 (Time Profiler)"""
+    repo = Path(args.repo).expanduser().resolve()
+    cfg = PerfConfig(enabled=True, tag=args.tag)
+    perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
+    data = perf.callstack(
+        top_n=args.top,
+        min_weight=args.min_weight,
+        flatten=not args.no_flatten,
+    )
+
+    if getattr(args, "json", False):
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        text = perf.format_callstack_text(data, max_depth=args.max_depth)
+        print(text)
+
+
 async def cmd_perf_templates(args):
     """模板管理"""
     from src.perf import TemplateLibrary, BUILTIN_TEMPLATES
@@ -831,7 +872,7 @@ def main():
     run_parser.add_argument("--perf-duration", type=int, default=1800, help="xctrace 录制时长(秒)")
     run_parser.add_argument("--perf-templates", default="power", help="预留: 采集模板列表")
     run_parser.add_argument("--perf-baseline", default="", help="baseline perf tag")
-    run_parser.add_argument("--perf-threshold-pct", type=float, default=0.0, help="性能退化阈值(%)")
+    run_parser.add_argument("--perf-threshold-pct", type=float, default=0.0, help="性能退化阈值(%%)")
     run_parser.add_argument("--strict-perf-gate", action="store_true", help="perf gate 失败时返回非0")
 
     # ── resume ──
@@ -849,7 +890,7 @@ def main():
     resume_parser.add_argument("--perf-duration", type=int, default=1800, help="xctrace 录制时长(秒)")
     resume_parser.add_argument("--perf-templates", default="power", help="预留: 采集模板列表")
     resume_parser.add_argument("--perf-baseline", default="", help="baseline perf tag")
-    resume_parser.add_argument("--perf-threshold-pct", type=float, default=0.0, help="性能退化阈值(%)")
+    resume_parser.add_argument("--perf-threshold-pct", type=float, default=0.0, help="性能退化阈值(%%)")
     resume_parser.add_argument("--strict-perf-gate", action="store_true", help="perf gate 失败时返回非0")
 
     # ── plan ──
@@ -898,7 +939,7 @@ def main():
     perf_start.add_argument("--duration", type=int, default=1800, help="录制时长(秒)")
     perf_start.add_argument("--templates", default="power", help="模板列表")
     perf_start.add_argument("--baseline", default="", help="baseline tag")
-    perf_start.add_argument("--threshold-pct", type=float, default=0.0, help="阈值(%)")
+    perf_start.add_argument("--threshold-pct", type=float, default=0.0, help="阈值(%%)")
 
     perf_stop = perf_sub.add_parser("stop", help="停止 perf 采集")
     perf_stop.add_argument("--repo", required=True, help="项目仓库路径")
@@ -913,7 +954,10 @@ def main():
     perf_report.add_argument("--repo", required=True, help="项目仓库路径")
     perf_report.add_argument("--tag", default="perf", help="会话标签")
     perf_report.add_argument("--baseline", default="", help="baseline tag")
-    perf_report.add_argument("--threshold-pct", type=float, default=0.0, help="阈值(%)")
+    perf_report.add_argument("--threshold-pct", type=float, default=0.0, help="阈值(%%)")
+    perf_report.add_argument("--with-callstack", action="store_true", help="包含 Time Profiler 调用栈分析")
+    perf_report.add_argument("--callstack-top", type=int, default=20, help="调用栈热点 Top N")
+    perf_report.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     perf_devices = perf_sub.add_parser("devices", help="列出 xctrace 设备")
 
@@ -941,6 +985,16 @@ def main():
     perf_snap = perf_sub.add_parser("snapshot", help="立即导出指标快照")
     perf_snap.add_argument("trace", help="xctrace trace 文件路径")
     perf_snap.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    # ── perf callstack (调用栈分析) ──
+    perf_cs = perf_sub.add_parser("callstack", help="Time Profiler 调用栈分析")
+    perf_cs.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_cs.add_argument("--tag", default="perf", help="会话标签")
+    perf_cs.add_argument("--top", type=int, default=20, help="热点函数 Top N")
+    perf_cs.add_argument("--min-weight", type=float, default=0.5, help="最小权重百分比")
+    perf_cs.add_argument("--max-depth", type=int, default=8, help="调用路径最大显示深度")
+    perf_cs.add_argument("--no-flatten", action="store_true", help="不聚合函数(保留完整路径)")
+    perf_cs.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     # ── perf templates (模板管理) ──
     perf_tpl = perf_sub.add_parser("templates", help="Instruments 模板管理")
@@ -998,10 +1052,12 @@ def main():
             asyncio.run(cmd_perf_stream(args))
         elif args.perf_cmd == "snapshot":
             asyncio.run(cmd_perf_snapshot(args))
+        elif args.perf_cmd == "callstack":
+            asyncio.run(cmd_perf_callstack(args))
         elif args.perf_cmd == "templates":
             asyncio.run(cmd_perf_templates(args))
         else:
-            print("  用法: cpar perf <start|stop|tail|report|devices|live|rules|stream|snapshot|templates> ...")
+            print("  用法: cpar perf <start|stop|tail|report|devices|live|rules|stream|snapshot|callstack|templates> ...")
 
 
 if __name__ == "__main__":

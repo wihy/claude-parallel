@@ -11,11 +11,13 @@ PerfSessionManager — 性能采集会话的完整生命周期管理。
 
 import json
 import os
+import re
 import signal
 import subprocess
 import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 from .config import PerfConfig
 
@@ -203,7 +205,7 @@ class PerfSessionManager:
         self.timeline_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
     # ---------- analysis ----------
-    def report(self) -> Dict[str, Any]:
+    def report(self, with_callstack: bool = False, callstack_top_n: int = 20) -> Dict[str, Any]:
         meta = self._load_meta()
         report = {
             "tag": self.config.tag,
@@ -214,6 +216,9 @@ class PerfSessionManager:
             "baseline": {},
             "gate": {"checked": False, "passed": True, "reason": ""},
         }
+
+        if with_callstack:
+            report["callstack"] = self.callstack(top_n=callstack_top_n)
 
         if self.config.baseline_tag:
             baseline = PerfSessionManager(str(self.repo), self.coordination_dir, PerfConfig(tag=self.config.baseline_tag))
@@ -420,3 +425,284 @@ class PerfSessionManager:
         if not arr:
             return None
         return round(sum(arr) / len(arr), 4)
+
+    # ── 调用栈分析 (Time Profiler) ──
+
+    def callstack(
+        self,
+        top_n: int = 20,
+        min_weight: float = 0.5,
+        flatten: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        解析 Time Profiler 调用栈，返回热点函数排名。
+
+        Args:
+            top_n:       返回前 N 个热点
+            min_weight:  最小权重百分比 (低于此值忽略)
+            flatten:     True=按函数聚合(火焰图风格), False=保留完整调用路径
+
+        Returns:
+            dict 包含 hot_functions / call_paths / summary
+        """
+        meta = self._load_meta()
+        if meta.get("status") not in ("stopped", "running"):
+            return {"error": "没有已完成的 perf 采集会话", "hot_functions": [], "call_paths": []}
+
+        # 查找 TimeProfiler trace 文件
+        trace_files = self._find_timeprofiler_traces(meta)
+        if not trace_files:
+            return {"error": "未找到 Time Profiler trace (录制时需要 --templates time)", "hot_functions": [], "call_paths": []}
+
+        # 导出并解析
+        all_samples = []
+        for trace_file in trace_files:
+            xml_path = self.exports_dir / f"TimeProfiler_{trace_file.stem}.xml"
+            self._export_schema(trace_file, "TimeProfiler", xml_path)
+            if not xml_path.exists():
+                continue
+            samples = self._parse_timeprofiler_xml(xml_path)
+            all_samples.extend(samples)
+
+        if not all_samples:
+            return {"error": "TimeProfiler XML 中无采样数据", "hot_functions": [], "call_paths": [], "total_samples": 0}
+
+        total_samples = len(all_samples)
+
+        if flatten:
+            # 按函数聚合权重 (火焰图风格)
+            func_weight = defaultdict(float)
+            for frame, weight in all_samples:
+                func_weight[frame] += weight
+            hot = sorted(func_weight.items(), key=lambda x: x[1], reverse=True)
+            hot_functions = []
+            for func, w in hot[:top_n]:
+                pct = w / total_samples * 100.0
+                if pct < min_weight:
+                    break
+                hot_functions.append({
+                    "symbol": func,
+                    "samples": int(round(w)),
+                    "weight_pct": round(pct, 2),
+                })
+        else:
+            hot_functions = []
+
+        # 提取 Top N 完整调用路径 (最深栈帧 → 最浅)
+        path_weight = defaultdict(float)
+        for frame, weight in all_samples:
+            path_weight[frame] += weight
+        top_paths = sorted(path_weight.items(), key=lambda x: x[1], reverse=True)[:top_n]
+        call_paths = []
+        for path, w in top_paths:
+            pct = w / total_samples * 100.0
+            if pct < min_weight:
+                break
+            # 按调用层级拆分
+            frames = [f.strip() for f in path.split(" → ") if f.strip()]
+            call_paths.append({
+                "frames": frames,
+                "depth": len(frames),
+                "samples": int(round(w)),
+                "weight_pct": round(pct, 2),
+                "leaf": frames[-1] if frames else "",
+            })
+
+        return {
+            "source": str(trace_files[0]),
+            "total_samples": total_samples,
+            "hot_functions": hot_functions,
+            "call_paths": call_paths,
+            "summary": {
+                "unique_symbols": len(set(f for f, _ in all_samples)),
+                "top_symbol": hot_functions[0]["symbol"] if hot_functions else "",
+                "top_weight_pct": hot_functions[0]["weight_pct"] if hot_functions else 0.0,
+            },
+        }
+
+    def format_callstack_text(self, data: Dict[str, Any], max_depth: int = 8) -> str:
+        """将调用栈分析结果格式化为可读文本"""
+        if "error" in data:
+            return f"  [错误] {data['error']}"
+
+        lines = []
+        total = data.get("total_samples", 0)
+        lines.append(f"  总采样数: {total}")
+        summary = data.get("summary", {})
+        lines.append(f"  唯一函数: {summary.get('unique_symbols', 0)}")
+        lines.append("")
+
+        # 热点函数 Top N
+        hot = data.get("hot_functions", [])
+        if hot:
+            lines.append("  ── 热点函数 (按采样权重排序) ──")
+            lines.append("")
+            max_sym_len = max(len(h["symbol"]) for h in hot[:10])
+            for i, h in enumerate(hot):
+                bar_len = int(h["weight_pct"] / 2)
+                bar = "█" * bar_len
+                sym = h["symbol"][:80]
+                lines.append(f"  {i+1:2d}. {sym:<{max_sym_len}}  {h['weight_pct']:5.1f}%  ({h['samples']} samples)  {bar}")
+            lines.append("")
+
+        # 调用路径 Top N
+        paths = data.get("call_paths", [])
+        if paths:
+            lines.append("  ── 调用路径 (从调用者到被调用者) ──")
+            lines.append("")
+            for i, p in enumerate(paths[:10]):
+                leaf = p["leaf"]
+                lines.append(f"  {i+1:2d}. {leaf}  ({p['weight_pct']}%, depth={p['depth']})")
+                frames = p.get("frames", [])
+                # 从底层(leaf)向上显示调用链
+                display_frames = frames[:max_depth]
+                for j, frame in enumerate(display_frames):
+                    indent = "      " + "  " * j
+                    arrow = "→ " if j > 0 else "  "
+                    lines.append(f"{indent}{arrow}{frame}")
+                if len(frames) > max_depth:
+                    lines.append(f"      ... ({len(frames) - max_depth} more frames)")
+                lines.append("")
+
+        return "\n".join(lines)
+
+    # ── callstack 内部辅助 ──
+
+    def _find_timeprofiler_traces(self, meta: Dict[str, Any]) -> List[Path]:
+        """查找 TimeProfiler 相关的 trace 文件"""
+        traces = []
+
+        # 单模板场景
+        tpl_name = meta.get("xctrace", {}).get("template", "")
+        trace_str = meta.get("xctrace", {}).get("trace", "")
+        if tpl_name.lower() in ("time", "time profiler") and trace_str:
+            p = Path(trace_str)
+            if p.exists():
+                traces.append(p)
+
+        # 多模板场景
+        for entry in meta.get("xctrace_multi", []):
+            tpl = entry.get("template", "")
+            trace_str = entry.get("trace", "")
+            if tpl.lower() in ("time", "time profiler") and trace_str:
+                p = Path(trace_str)
+                if p.exists():
+                    traces.append(p)
+
+        # 兜底: 在 traces_dir 中搜索含 time_profiler 的文件
+        if not traces and self.traces_dir.exists():
+            for f in self.traces_dir.glob("*time*.trace"):
+                if f not in traces:
+                    traces.append(f)
+
+        return traces
+
+    def _parse_timeprofiler_xml(self, xml_path: Path) -> List[Tuple[str, float]]:
+        """
+        解析 xctrace export 的 TimeProfiler XML。
+
+        返回 [(frame_string, weight), ...]
+        frame_string 格式: "caller → callee → leaf" (按调用层级)
+        weight: 采样权重 (通常=1，或由 Sample Count 列决定)
+        """
+        try:
+            text = xml_path.read_text(errors="replace")
+        except Exception:
+            return []
+
+        # 解析 schema 列名
+        col_names = []
+        for m in re.finditer(r'<col><name>([^<]+)</name>', text):
+            col_names.append(m.group(1))
+
+        if not col_names:
+            return []
+
+        # 定位关键列
+        col_idx = {name.lower(): i for i, name in enumerate(col_names)}
+        # TimeProfiler 常见列名: Thread, Process, Symbol Name, Sample Count, Weight, etc.
+        symbol_idx = col_idx.get("symbol name",
+                    col_idx.get("symbol",
+                    col_idx.get("name", -1)))
+        weight_idx = col_idx.get("sample count",
+                    col_idx.get("weight",
+                    col_idx.get("count", -1)))
+        thread_idx = col_idx.get("thread", -1)
+        process_idx = col_idx.get("process", -1)
+        binary_idx = col_idx.get("binary", -1)
+
+        if symbol_idx == -1:
+            return []
+
+        # 解析行
+        samples = []
+        row_pat = re.compile(r'<row>(.*?)</row>', re.S)
+
+        # 尝试用标签解析 (xctrace 用 mnemonic 作为 XML 标签名)
+        # 也用 fallback 的 <c> 标签解析
+        for row_m in row_pat.finditer(text):
+            row_text = row_m.group(1)
+
+            # 方法1: 按 mnemonic 标签解析
+            symbol = self._extract_mnemonic_value(row_text, "symbol-name",
+                       self._extract_mnemonic_value(row_text, "symbol", ""))
+            if not symbol:
+                symbol = self._extract_mnemonic_value(row_text, "name", "")
+
+            if not symbol:
+                # 方法2: 按 <c> 位置解析
+                cells = re.findall(r'<c[^>]*>(.*?)</c>', row_text, re.S)
+                if symbol_idx < len(cells):
+                    symbol = cells[symbol_idx].strip()
+                    # 去掉 fmt 属性等残留
+                    symbol = re.sub(r'<[^>]+/>', '', symbol).strip()
+
+            if not symbol or symbol == "?":
+                continue
+
+            # 提取权重
+            weight = 1.0
+            if weight_idx != -1:
+                w_str = self._extract_mnemonic_value(row_text, "sample-count",
+                         self._extract_mnemonic_value(row_text, "weight",
+                         self._extract_mnemonic_value(row_text, "count", "")))
+                if w_str:
+                    try:
+                        weight = float(re.sub(r'[^\d.]', '', w_str.split()[0]))
+                    except (ValueError, IndexError):
+                        weight = 1.0
+
+            # 提取线程/进程信息（用于区分上下文）
+            thread = ""
+            if thread_idx != -1:
+                thread = self._extract_mnemonic_value(row_text, "thread", "")
+            process = ""
+            if process_idx != -1:
+                process = self._extract_mnemonic_value(row_text, "process", "")
+
+            # 构建调用栈帧字符串
+            # 如果有调用者信息，构建路径；否则只记录当前函数
+            caller = self._extract_mnemonic_value(row_text, "caller", "")
+            frame = symbol
+            if caller:
+                frame = f"{caller} → {symbol}"
+
+            samples.append((frame, weight))
+
+        return samples
+
+    def _extract_mnemonic_value(self, row_text: str, mnemonic: str, default: str = "") -> str:
+        """从 XML row 中提取指定 mnemonic 的 fmt 值"""
+        # 匹配 <mnemonic-tag id="N" fmt="显示值">原始值</mnemonic-tag>
+        # 或 <mnemonic-tag id="N" ref="M"/>
+        patterns = [
+            re.compile(rf'<{re.escape(mnemonic)}[^>]*fmt="([^"]*)"', re.S),
+            re.compile(rf'<{re.escape(mnemonic)}[^>]*>(.*?)</{re.escape(mnemonic)}>', re.S),
+        ]
+        for pat in patterns:
+            m = pat.search(row_text)
+            if m:
+                val = m.group(1).strip()
+                if val:
+                    return val
+        return default
