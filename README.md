@@ -24,12 +24,26 @@
 - **配置校验** — 执行前验证 YAML 正确性，友好错误提示
 - **自动提交** — Worktree 中未提交变更自动 commit，防丢失
 
+### 真机性能采集 (Phase 4 — perf 子系统)
+- **Instruments 模板管理** — 10 个内置模板 (Power/Time/Network/GPU/Leaks 等)，支持自定义扩展
+- **xctrace 采集会话** — 自动管理 xctrace record 生命周期 (start/stop)，支持 attach 进程
+- **实时 syslog 告警** — 流式分析 iOS 真机日志，13 条内置规则 (OOM/Jetsam/热管理/WebKit 崩溃/ANR 等)
+- **实时指标流** — 周期性导出 xctrace 指标，滚动窗口快照，支持 JSONL 时序记录
+- **与 run 命令集成** — `--with-perf` 在任务执行期间同步采集真机性能数据
+- **基线对比 + 回归门禁** — 对比历史基线，超阈值自动告警，可配置 `--strict-perf-gate` 阻断发布
+
 ## 前置要求
 
 - Python 3.9+
 - Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)
 - 已认证的 Claude 账号（OAuth 或 API Key）
 - Git 仓库
+
+### perf 子系统额外要求（可选）
+- macOS (xctrace / Instruments)
+- Xcode Command Line Tools (`xcode-select --install`)
+- 已连接的 iOS 真机或模拟器
+- idevicesyslog (libimobiledevice，用于 syslog 采集)
 
 ## 安装
 
@@ -105,10 +119,49 @@ python3 run.py review tasks.yaml --budget 1.0
 python3 run.py resume tasks.yaml --merge
 ```
 
+### 7. 真机性能采集
+
+```bash
+# 查看已连接设备
+cpar perf devices
+
+# 启动功耗采集 (attach 到目标进程)
+cpar perf start --device 00008120-00164C893AEB401E --attach Soul_New --templates power
+
+# 实时查看 syslog 告警
+cpar perf live --device 00008120-00164C893AEB401E
+
+# 实时 xctrace 指标流
+cpar perf stream --device 00008120-00164C893AEB401E --tag power
+
+# 导出指标快照
+cpar perf snapshot --tag perf
+
+# 停止采集并生成报告
+cpar perf stop --tag perf
+cpar perf report --tag perf
+
+# 查看可用 Instruments 模板
+cpar perf templates
+
+# 管理告警规则
+cpar perf rules
+```
+
+也可以在执行任务时同步采集:
+
+```bash
+python3 run.py run tasks.yaml --with-perf \
+  --perf-device 00008120-00164C893AEB401E \
+  --perf-attach Soul_New \
+  --perf-templates power,time \
+  --perf-duration 600
+```
+
 ## 完整命令列表
 
 ```
-run       执行任务 (--dry/--merge/--clean/--retry N/--total-budget $)
+run       执行任务 (--dry/--merge/--clean/--retry N/--total-budget $, --with-perf ...)
 resume    从中断处恢复
 plan      展示执行计划
 validate  校验 YAML 配置
@@ -117,6 +170,19 @@ merge     合并 worktree (支持冲突自动解决)
 review    对所有变更执行 Code Review
 clean     清理 worktree 和协调文件
 logs      查看任务日志
+chat      对话模式 (自然语言生成任务 YAML)
+
+perf 子命令:
+  perf start       启动 xctrace 采集会话
+  perf stop        停止采集
+  perf tail        实时查看 syslog
+  perf report      生成性能报告
+  perf devices     列出已连接设备
+  perf live        实时 syslog 告警分析
+  perf rules       列出/管理告警规则 (13 条内置)
+  perf stream      实时 xctrace 指标流
+  perf snapshot    导出指标快照
+  perf templates   Instruments 模板管理 (10 个内置)
 ```
 
 ## 文件结构
@@ -124,6 +190,8 @@ logs      查看任务日志
 ```
 claude-parallel/
 ├── run.py                      # CLI 入口
+├── chat.py                     # 对话模式入口
+├── cpar                        # 封装脚本
 ├── src/
 │   ├── cli.py                  # CLI 命令处理
 │   ├── task_parser.py          # YAML 解析 + DAG 拓扑排序
@@ -133,12 +201,21 @@ claude-parallel/
 │   ├── merger.py               # Worktree 合并 + 冲突自动解决
 │   ├── reviewer.py             # 自动 Code Review
 │   ├── validator.py            # YAML 配置校验
-│   └── context_extractor.py    # 多语言上下文提取
+│   ├── context_extractor.py    # 多语言上下文提取
+│   └── perf/                   # 真机性能采集子系统
+│       ├── config.py           # PerfConfig 数据类
+│       ├── session.py          # xctrace 采集会话生命周期
+│       ├── live_log.py         # 实时 syslog 流式告警分析
+│       ├── live_metrics.py     # 实时 xctrace 指标流 + 滚动窗口
+│       ├── templates.py        # Instruments 模板注册与管理
+│       └── integrator.py       # 与 Orchestrator 深度集成胶水
 ├── examples/
 │   ├── auth-system.yaml        # 4任务 DAG 示例
 │   ├── test-dag.yaml           # 端到端 DAG 测试
 │   ├── simple-parallel.yaml    # 简单并行
 │   └── test-p2.yaml            # Phase 2 测试
+├── docs/
+│   └── playbook.md             # 编排 playbook
 └── README.md
 ```
 
