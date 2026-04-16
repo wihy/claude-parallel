@@ -26,6 +26,7 @@ SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from src.validator import TaskValidator
+from src.chat_input import ChatInputSession
 
 # Rich UI
 from rich.console import Console
@@ -78,85 +79,26 @@ tasks:
 """
 
 
+_CHAT_INPUT: ChatInputSession | None = None
+
+
+def _chat_input() -> ChatInputSession:
+    """模块级单例，共享历史记录."""
+    global _CHAT_INPUT
+    if _CHAT_INPUT is None:
+        _CHAT_INPUT = ChatInputSession()
+    return _CHAT_INPUT
+
+
 def get_user_input(prompt: str) -> str:
-    """获取用户输入，支持多行。
+    """获取用户输入，支持多行（prompt_toolkit 富编辑；缺依赖时降级到 input()）。
 
-    结束输入方式:
-    - 输入空行（兼容旧行为）
-    - 输入 /done 或 /end
+    终止方式:
+    - Esc Enter (prompt_toolkit 模式) / 空行 (降级模式) / /done
     - Ctrl+D (EOF)
-
-    编辑命令:
-    - /clear   清空已输入的全部内容，重新开始
-    - /undo    删除上一行
-    - /show    显示已输入的内容
+    - Ctrl+C 清空 buffer 继续，二次退出
     """
-    try:
-        import readline  # noqa: F401
-    except ImportError:
-        pass
-
-    if prompt:
-        console.print(prompt)
-    console.print("[dim]  (多行输入; 空行或 /done 结束; /clear 清空 /undo 删上一行 /show 预览)[/]")
-    lines = []
-    while True:
-        try:
-            if lines:
-                prompt_str = f"  [{len(lines) + 1}] "
-            else:
-                prompt_str = "  > "
-            line = input(prompt_str)
-        except EOFError:
-            break
-        except KeyboardInterrupt:
-            if lines:
-                print()
-                console.print(f"  [yellow]已清空 {len(lines)} 行，重新输入[/]")
-                lines = []
-                continue
-            else:
-                break
-
-        text = line.strip()
-
-        if text in ("/done", "/end"):
-            break
-
-        if text == "/clear":
-            if lines:
-                console.print(f"  [yellow]已清空 {len(lines)} 行[/]")
-                lines = []
-            else:
-                console.print("  [dim]没有已输入的内容[/]")
-            continue
-
-        if text == "/undo":
-            if lines:
-                removed = lines.pop()
-                console.print(f"  [yellow]删除: {removed}[/]")
-            else:
-                console.print("  [dim]没有可撤销的行[/]")
-            continue
-
-        if text == "/show":
-            if lines:
-                console.print("[dim]── 已输入内容 ──[/]")
-                for i, l in enumerate(lines, 1):
-                    console.print(f"    [dim]{i}|[/] {l}")
-                console.print("[dim]────────────────[/]")
-            else:
-                console.print("  [dim]暂无内容[/]")
-            continue
-
-        if text == "" and not lines:
-            continue
-        if text == "":
-            break
-
-        lines.append(line)
-
-    return "\n".join(lines).strip()
+    return _chat_input().read_requirement(prompt)
 
 
 def read_requirement_from_stdin() -> str:
