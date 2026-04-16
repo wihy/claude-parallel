@@ -197,7 +197,7 @@ class Monitor:
     def _print_fallback(self) -> None:
         """输出简单文本状态摘要（非 TTY 环境）。"""
         stats = self._orch.stats
-        elapsed = time.time() - stats.start_time if stats.start_time > 0 else 0.0
+        elapsed = time.time() - stats.start_time if (stats.start_time or 0) > 0 else 0.0
         active = sum(1 for w in self._orch.workers.values() if w.is_running)
 
         lines = [
@@ -265,7 +265,7 @@ class Monitor:
         # 计算进度
         finished = stats.completed + stats.failed + stats.skipped
         total = stats.total_tasks
-        elapsed = time.time() - stats.start_time if stats.start_time > 0 else 0.0
+        elapsed = time.time() - stats.start_time if (stats.start_time or 0) > 0 else 0.0
 
         # 构建 Progress
         progress = Progress(

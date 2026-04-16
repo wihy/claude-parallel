@@ -24,6 +24,7 @@ class PerfSessionManager:
     def __init__(self, repo: str, coordination_dir: str, config: PerfConfig):
         self.repo = Path(repo).expanduser().resolve()
         self.config = config
+        self.coordination_dir = coordination_dir
         self.root = self.repo / coordination_dir / "perf" / config.tag
         self.logs_dir = self.root / "logs"
         self.traces_dir = self.root / "traces"
@@ -77,6 +78,8 @@ class PerfSessionManager:
                 cmd = ["idevicesyslog", "-u", self.config.device]
                 f = open(syslog_log, "a", encoding="utf-8")
                 proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+                # Popen 接管 fd 后立即关闭 Python 侧句柄，防止泄漏
+                f.close()
                 meta["syslog"]["enabled"] = True
                 meta["syslog"]["pid"] = proc.pid
             except Exception as e:
@@ -108,6 +111,7 @@ class PerfSessionManager:
                 try:
                     ferr = open(stderr_path, "a", encoding="utf-8")
                     proc = subprocess.Popen(cmd, stdout=ferr, stderr=subprocess.STDOUT)
+                    ferr.close()
                     meta["xctrace"]["enabled"] = True
                     meta["xctrace"]["pid"] = proc.pid
                     meta["xctrace"]["trace"] = str(trace_path)
@@ -137,6 +141,7 @@ class PerfSessionManager:
                     try:
                         ferr = open(stderr_path, "a", encoding="utf-8")
                         proc = subprocess.Popen(cmd, stdout=ferr, stderr=subprocess.STDOUT)
+                        ferr.close()
                         entry["enabled"] = True
                         entry["pid"] = proc.pid
                     except Exception as e:
@@ -211,7 +216,7 @@ class PerfSessionManager:
         }
 
         if self.config.baseline_tag:
-            baseline = PerfSessionManager(str(self.repo), ".claude-parallel", PerfConfig(tag=self.config.baseline_tag))
+            baseline = PerfSessionManager(str(self.repo), self.coordination_dir, PerfConfig(tag=self.config.baseline_tag))
             base_meta = baseline._load_meta()
             base_metrics = baseline._trace_metrics(base_meta)
             report["baseline"] = {

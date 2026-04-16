@@ -35,6 +35,13 @@ class ReviewResult:
 # 用于统计 issues 的关键词
 ISSUE_KEYWORDS = ["BUG", "FIXME", "ISSUE", "问题", "缺陷"]
 
+# 用于单词边界匹配的正则，避免 "BUG" 匹配 "DEBUG" 等
+import re as _re
+_ISSUE_KW_PATTERNS = [
+    (_re.compile(r'\b' + _re.escape(kw) + r'\b'), kw) if kw.isascii() else (None, kw)
+    for kw in ISSUE_KEYWORDS
+]
+
 
 class CodeReviewer:
     """自动代码审查器 — 使用 Claude Code 对任务变更进行 review"""
@@ -395,15 +402,13 @@ class CodeReviewer:
             return (False, f"(review 异常: {e})", 0.0)
 
     def _count_issues(self, text: str) -> int:
-        """统计 review 文本中的 issue 关键词出现次数"""
+        """统计 review 文本中的 issue 关键词出现次数（使用单词边界避免误匹配）"""
         count = 0
-        text_upper = text.upper()
-        for keyword in ISSUE_KEYWORDS:
-            # 不区分大小写匹配 (中文关键词不需要 upper)
-            if keyword.isascii():
-                count += text_upper.count(keyword.upper())
+        for pattern, kw in _ISSUE_KW_PATTERNS:
+            if pattern is not None:
+                count += len(pattern.findall(text))
             else:
-                count += text.count(keyword)
+                count += text.count(kw)
         return count
 
     def _extract_score(self, text: str) -> Optional[int]:

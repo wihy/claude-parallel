@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable
@@ -241,7 +242,7 @@ class LiveLogAnalyzer:
         buffer_lines: int = 200,
     ):
         self.device = device
-        self.rules = rules if rules is not None else list(DEFAULT_RULES)
+        self.rules = rules if rules is not None else [copy.deepcopy(r) for r in DEFAULT_RULES]
         self.alert_callback = alert_callback
         self.alert_log_path = Path(alert_log_path) if alert_log_path else None
         self.perf_manager = perf_manager

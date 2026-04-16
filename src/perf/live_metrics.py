@@ -154,8 +154,19 @@ def build_snapshot_from_exports(
             continue
 
         parsed = _parse_exported_xml(xml_out)
-        # 对每个列，取最近一个值
+        # 对每个列，取最近一个值 (精确匹配优先，子串匹配兜底)
         for col_name, field_name in col_map.items():
+            matched = False
+            # 1. 精确匹配 (忽略大小写)
+            for key, vals in parsed.items():
+                if key.lower().strip() == col_name.lower().strip() and vals:
+                    val = vals[-1]
+                    setattr(snap, field_name, val)
+                    matched = True
+                    break
+            if matched:
+                continue
+            # 2. 子串兜底
             for key, vals in parsed.items():
                 if col_name.lower() in key.lower() and vals:
                     val = vals[-1]  # 最近一次采样
