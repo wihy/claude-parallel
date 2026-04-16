@@ -31,6 +31,10 @@
 - **实时指标流** — 周期性导出 xctrace 指标，滚动窗口快照，支持 JSONL 时序记录
 - **与 run 命令集成** — `--with-perf` 在任务执行期间同步采集真机性能数据
 - **基线对比 + 回归门禁** — 对比历史基线，超阈值自动告警，可配置 `--strict-perf-gate` 阻断发布
+- **Time Profiler 调用栈分析** — `perf callstack` 自动导出 xctrace trace 并解析调用栈热点，Top N 排行
+- **PerfGate 退化检测** — 功耗/CPU/调用栈多维对比基线，百分比偏差计算，超阈值告警
+- **Session 持久化管理** — 采集会话 save/load/list/delete，支持跨 session 基线对比
+- **Report 增强** — `--with-callstack` 一键含调用栈分析，`--callstack-top N` 控制热点数量
 
 ## 前置要求
 
@@ -141,6 +145,15 @@ cpar perf snapshot --tag perf
 cpar perf stop --tag perf
 cpar perf report --tag perf
 
+# 带调用栈分析的报告
+cpar perf report --tag perf --with-callstack --callstack-top 20
+
+# 单独分析调用栈热点
+cpar perf callstack --tag perf --top 15
+
+# 基线对比 + 性能退化门禁
+cpar perf report --tag perf --baseline baseline_run --threshold-pct 10.0
+
 # 查看可用 Instruments 模板
 cpar perf templates
 
@@ -161,7 +174,7 @@ python3 run.py run tasks.yaml --with-perf \
 ## 完整命令列表
 
 ```
-run       执行任务 (--dry/--merge/--clean/--retry N/--total-budget $, --with-perf ...)
+run       执行任务 (--dry/--merge/--clean/--retry N/--total-budget $, --with-perf ..., --perf-threshold-pct N, --strict-perf-gate)
 resume    从中断处恢复
 plan      展示执行计划
 validate  校验 YAML 配置
@@ -173,15 +186,16 @@ logs      查看任务日志
 chat      对话模式 (自然语言生成任务 YAML)
 
 perf 子命令:
-  perf start       启动 xctrace 采集会话
+  perf start       启动 xctrace 采集会话 (--threshold-pct 退化阈值)
   perf stop        停止采集
   perf tail        实时查看 syslog
-  perf report      生成性能报告
+  perf report      生成性能报告 (--with-callstack, --callstack-top N, --threshold-pct)
   perf devices     列出已连接设备
   perf live        实时 syslog 告警分析
   perf rules       列出/管理告警规则 (13 条内置)
   perf stream      实时 xctrace 指标流
   perf snapshot    导出指标快照
+  perf callstack   Time Profiler 调用栈分析 (--top N, --threshold-pct)
   perf templates   Instruments 模板管理 (10 个内置)
 ```
 
