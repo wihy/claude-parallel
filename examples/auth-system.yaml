@@ -1,0 +1,85 @@
+# 示例: 用户认证系统 — 多 Claude Code 并行开发
+#
+# 用法:
+#   python3 run.py plan examples/auth-system.yaml    # 查看计划
+#   python3 run.py run examples/auth-system.yaml      # 执行
+#   python3 run.py run examples/auth-system.yaml --merge --clean  # 执行+合并+清理
+
+project:
+  repo: ~/myproject  # 改为你的项目路径
+  branch: main
+  max_workers: 3
+  default_max_turns: 12
+  default_max_budget_usd: 1.5
+
+tasks:
+  # === Level 0: 无依赖，立即启动 ===
+  - id: user-model
+    description: |
+      创建 User SQLAlchemy model:
+      - 文件: src/models/user.py
+      - 字段: id(UUID), email(str, unique), password_hash(str), created_at, updated_at
+      - 方法: set_password(raw), check_password(raw), to_dict()
+      - 使用 bcrypt 哈希
+      - 创建测试: tests/test_user_model.py
+    files: ["src/models/user.py", "tests/test_user_model.py"]
+    allowed_tools: ["Read", "Edit", "Write", "Bash"]
+    max_turns: 12
+    depends_on: []
+
+  # === Level 1: 依赖 user-model ===
+  - id: auth-service
+    description: |
+      创建认证服务层:
+      - 文件: src/services/auth_service.py
+      - 功能: register(email, password), login(email, password), verify_token(token)
+      - 使用 JWT (PyJWT) 生成 token
+      - 调用 User model
+      - 创建测试: tests/test_auth_service.py
+    files: ["src/services/auth_service.py", "tests/test_auth_service.py"]
+    allowed_tools: ["Read", "Edit", "Write", "Bash"]
+    max_turns: 15
+    depends_on: ["user-model"]
+    extra_prompt: |
+      User model 位于 src/models/user.py，提供:
+      - User(email, password_hash) 构造
+      - User.set_password(raw) → 设置 bcrypt hash
+      - User.check_password(raw) → bool
+      - User.to_dict() → dict
+
+  # === Level 2: 依赖 auth-service (两个并行) ===
+  - id: auth-api
+    description: |
+      创建 FastAPI 认证端点:
+      - 文件: src/api/auth.py
+      - POST /api/register — 注册
+      - POST /api/login — 登录返回 JWT
+      - GET /api/me — 获取当前用户 (需 Bearer token)
+      - 创建测试: tests/test_auth_api.py
+    files: ["src/api/auth.py", "tests/test_auth_api.py"]
+    allowed_tools: ["Read", "Edit", "Write", "Bash"]
+    max_turns: 15
+    depends_on: ["auth-service"]
+    extra_prompt: |
+      AuthService 位于 src/services/auth_service.py，提供:
+      - register(email, password) → User
+      - login(email, password) → str (JWT token)
+      - verify_token(token) → User | None
+
+  - id: auth-docs
+    description: |
+      更新 API 文档:
+      - 更新 README.md 中的认证部分
+      - 创建 docs/auth-api.md，包含:
+        - 所有端点说明、请求/响应示例
+        - JWT 认证流程图
+        - 错误码列表
+    files: ["README.md", "docs/auth-api.md"]
+    allowed_tools: ["Read", "Edit", "Write"]
+    max_turns: 8
+    depends_on: ["auth-service"]
+    extra_prompt: |
+      认证系统提供以下端点:
+      - POST /api/register — body: {email, password} → {user}
+      - POST /api/login — body: {email, password} → {token}
+      - GET /api/me — header: Authorization: Bearer <token> → {user}

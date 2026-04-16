@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.trace
+*.log
+tasks/
+test-dag/
+test-project/
+test-project-new/
+*.egg-info/
+dist/
+build/
+.venv/

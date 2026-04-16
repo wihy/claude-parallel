@@ -1,0 +1,40 @@
+# 端到端测试: 创建一个小型 Python 项目
+# 3 个独立并行任务，无依赖
+
+project:
+  repo: ~/claude-parallel/test-project
+  max_workers: 3
+  default_max_turns: 8
+  default_max_budget_usd: 0.5
+
+tasks:
+  - id: create-greeting
+    description: |
+      创建 src/greeting.py，包含:
+      - greet(name: str) -> str 函数，返回 "Hello, {name}!"
+      - farewell(name: str) -> str 函数，返回 "Goodbye, {name}!"
+      - if __name__ == "__main__": 演示调用两个函数
+    files: ["src/greeting.py"]
+    allowed_tools: ["Read", "Write", "Bash"]
+    max_turns: 5
+
+  - id: create-math
+    description: |
+      创建 src/math_utils.py，包含:
+      - add(a, b) -> 返回 a + b
+      - multiply(a, b) -> 返回 a * b
+      - 所有函数添加 type hints
+      - if __name__ == "__main__": 演示调用
+    files: ["src/math_utils.py"]
+    allowed_tools: ["Read", "Write", "Bash"]
+    max_turns: 5
+
+  - id: create-readme
+    description: |
+      创建 README.md，包含:
+      - 项目名称: Test Project
+      - 简短描述
+      - 使用说明
+    files: ["README.md"]
+    allowed_tools: ["Read", "Write"]
+    max_turns: 3

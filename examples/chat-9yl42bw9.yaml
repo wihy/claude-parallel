@@ -1,0 +1,125 @@
+project:
+  repo: /Users/chunhaixu/Desktop/ai空间
+  max_workers: 3
+  default_max_turns: 15
+  default_max_budget_usd: 2.0
+  retry_count: 1
+
+tasks:
+  - id: audio-video-power
+    description: |
+      分析群聊派对房间中音频/视频实时处理相关的功耗影响点，并输出详细分析文档。
+
+      已有分析覆盖了：网络通信与定时器（docs/power-analysis-network-timer.md）、UI渲染与动画（docs/power-analysis-ui-animation.md）。
+      本任务聚焦【音频/视频编解码与实时处理】领域，不要与已有文档重复。
+
+      需要分析的功耗影响点包括但不限于：
+      1. 音频编解码器选择（硬件加速 vs 软件解码，如 AAC/Opus 硬解 vs 软解功耗差异）
+      2. 实时音频处理链路：回声消除(AEC)、噪声抑制(ANS)、自动增益控制(AGC) 的 CPU 开销
+      3. 音频混流（多人同时说话时的混音计算）
+      4. 视频编解码（H.264/H.265 硬解 vs 软解、分辨率与帧率对功耗的影响）
+      5. 视频渲染管线（OpenGL ES / Metal 渲染、纹理上传、像素格式转换）
+      6. 音视频同步机制的定时器与线程开销
+      7. 静音/关麦时是否仍在采集和编码
+      8. 多路视频流同时解码时的功耗叠加
+      9. 音频session配置（AVAudioSession category/mode）对系统功耗策略的影响
+      10. 摄像头采集帧率、分辨率、自动对焦/曝光对功耗的影响
+
+      每个影响点需包含：影响描述、影响等级(High/Medium/Low)、量化估算、优化建议。
+      参考 Apple WWDC 相关 session 和 Energy Efficiency Guide。
+
+      输出文件：docs/power-analysis-audio-video.md
+      格式参考已有文档 docs/power-analysis-ui-animation.md 的风格和结构。
+    files:
+      - docs/power-analysis-audio-video.md
+    allowed_tools: ["Read", "Write", "Edit", "Bash"]
+    depends_on: []
+
+  - id: cpu-memory-power
+    description: |
+      分析群聊派对房间中 CPU 计算密集型操作和内存管理相关的功耗影响点，并输出详细分析文档。
+
+      已有分析覆盖了：网络通信与定时器（docs/power-analysis-network-timer.md）、UI渲染与动画（docs/power-analysis-ui-animation.md）。
+      本任务聚焦【CPU 计算与内存管理】领域，不要与已有文档重复。
+
+      需要分析的功耗影响点包括但不限于：
+      1. 消息序列化/反序列化（Protobuf/JSON 频繁编解码的 CPU 开销，尤其高频消息场景）
+      2. 加密/解密运算（TLS 握手、消息端到端加密、Token 签名验证的 CPU 占用）
+      3. 富文本解析与排版计算（正则匹配@/话题/链接、NSAttributedString 构建、CoreText 排版）
+      4. 图片处理 CPU 开销（解码大图、缩放、模糊效果、圆角预裁剪的 CPU vs GPU 取舍）
+      5. 内存压力与 GC（大量临时对象 autorelease pool 压力、内存警告触发缓存清理的 I/O 风暴）
+      6. 线程调度开销（过多 GCD 并发队列、线程爆炸、锁竞争导致的上下文切换功耗）
+      7. KVO/通知中心的观察者泛滥（频繁触发导致的无效计算）
+      8. 日志系统开销（高频日志写入、格式化字符串、I/O 阻塞主线程）
+      9. 数据库操作（SQLite/FMDB/CoreData 频繁读写、WAL checkpoint、索引缺失导致全表扫描）
+      10. 磁盘 I/O（聊天记录持久化、图片缓存写入、临时文件清理）
+
+      每个影响点需包含：影响描述、影响等级(High/Medium/Low)、量化估算、优化建议。
+      参考 Apple Instruments 工具分析方法和 WWDC 最佳实践。
+
+      输出文件：docs/power-analysis-cpu-memory.md
+      格式参考已有文档 docs/power-analysis-ui-animation.md 的风格和结构。
+    files:
+      - docs/power-analysis-cpu-memory.md
+    allowed_tools: ["Read", "Write", "Edit", "Bash"]
+    depends_on: []
+
+  - id: sensor-background-power
+    description: |
+      分析群聊派对房间中传感器使用、后台任务管理和系统服务相关的功耗影响点，并输出详细分析文档。
+
+      已有分析覆盖了：网络通信与定时器（docs/power-analysis-network-timer.md）、UI渲染与动画（docs/power-analysis-ui-animation.md）。
+      本任务聚焦【传感器、定位、后台任务、系统服务】领域，不要与已有文档重复。
+
+      需要分析的功耗影响点包括但不限于：
+      1. 定位服务（GPS 精度级别选择对功耗的影响：kCLLocationAccuracyBest vs Kilometer，持续定位 vs 显著位置变化）
+      2. 运动传感器（陀螺仪/加速度计用于摇一摇、体感互动等功能时的持续采样功耗）
+      3. 距离传感器（贴耳检测在语音房中是否持续开启）
+      4. 蓝牙（附近发现、蓝牙耳机连接状态轮询）
+      5. 后台音频保活（Background Audio mode 的合规使用与功耗代价）
+      6. 后台任务管理（BGTaskScheduler 配置、后台刷新频率、beginBackgroundTask 超时处理）
+      7. 推送通知处理（APNs 唤醒后的处理时长、静默推送触发的后台工作）
+      8. Siri/Spotlight 索引（后台索引构建的 CPU 和 I/O 开销）
+      9. 屏幕亮度与常亮（`idleTimerDisabled` 在房间场景下的功耗影响，OLED 深色模式节能效果）
+      10. 热管理与CPU降频（持续高负载导致系统热保护、CPU 降频，反而延长任务时间增加总功耗）
+      11. 振动反馈（Haptic Engine 在互动场景如送礼、点赞中的频繁触发）
+      12. 剪贴板/系统服务（频繁读取剪贴板、系统弹窗等隐式功耗）
+
+      每个影响点需包含：影响描述、影响等级(High/Medium/Low)、量化估算、优化建议。
+      参考 Apple Energy Efficiency Guide 和 WWDC 相关 session。
+
+      输出文件：docs/power-analysis-sensor-background.md
+      格式参考已有文档 docs/power-analysis-ui-animation.md 的风格和结构。
+    files:
+      - docs/power-analysis-sensor-background.md
+    allowed_tools: ["Read", "Write", "Edit", "Bash"]
+    depends_on: []
+
+  - id: power-summary
+    description: |
+      汇总所有功耗分析文档，生成一份综合功耗分析总览文档。
+
+      需要读取以下所有分析文档：
+      - docs/power-analysis-network-timer.md（已有 - 网络通信与定时器）
+      - docs/power-analysis-ui-animation.md（已有 - UI渲染与动画）
+      - docs/power-analysis-audio-video.md（新增 - 音视频处理）
+      - docs/power-analysis-cpu-memory.md（新增 - CPU计算与内存管理）
+      - docs/power-analysis-sensor-background.md（新增 - 传感器与后台任务）
+
+      生成综合总览文档，包含：
+      1. 功耗影响全景图：按影响等级(High/Medium/Low)汇总所有影响点
+      2. Top 10 高功耗影响点排名（跨所有领域综合评估）
+      3. 优化优先级矩阵：按"功耗影响程度 × 优化实施难度"二维矩阵排列
+      4. 快速见效清单：列出实施成本低但功耗收益高的优化项（Quick Wins）
+      5. 各领域功耗占比估算（饼图用文字描述）
+      6. 分阶段优化路线图建议（P0/P1/P2）
+
+      输出文件：docs/power-analysis-summary.md
+      这是面向技术决策者的文档，需要简洁清晰，便于制定优化计划。
+    files:
+      - docs/power-analysis-summary.md
+    allowed_tools: ["Read", "Write", "Edit", "Bash"]
+    depends_on:
+      - audio-video-power
+      - cpu-memory-power
+      - sensor-background-power

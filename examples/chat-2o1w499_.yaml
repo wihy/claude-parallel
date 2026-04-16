@@ -1,0 +1,196 @@
+project:
+  repo: /Users/chunhaixu/Desktop/ai空间
+  max_workers: 3
+  default_max_turns: 6
+  default_max_budget_usd: 1.0
+  retry_count: 1
+
+tasks:
+  - id: ui-animation-power
+    description: |
+      分析群聊派对房间中 UI 渲染和动画相关的功耗影响点，并输出详细分析文档。
+
+      创建文件: docs/power-analysis-ui-animation.md
+
+      需要覆盖以下方面:
+      1. GPU 渲染功耗:
+         - 离屏渲染(cornerRadius+masksToBounds、shadow、mask)的功耗代价
+         - 图层混合(blending)和透明度叠加的 GPU 开销
+         - 大面积模糊效果(UIVisualEffectView/UIBlurEffect)的持续 GPU 消耗
+      2. 动画功耗:
+         - Lottie/SVGA 礼物动画的帧率与功耗关系(60fps vs 30fps vs 24fps)
+         - 粒子特效(CAEmitterLayer)的持续 GPU/CPU 占用
+         - 弹幕/跑马灯连续动画的功耗
+         - CADisplayLink 驱动动画未在不可见时暂停
+      3. 列表与滚动:
+         - 聊天消息列表(UITableView/UICollectionView)频繁 reloadData 的 CPU 开销
+         - Cell 中复杂布局(AutoLayout 约束计算)的 CPU 消耗
+         - 在线用户列表频繁刷新导致的重绘
+      4. 图片与头像:
+         - 大图解码在主线程的 CPU 占用
+         - 头像圆角裁剪的 GPU 开销(推荐预裁剪方案)
+         - 动图(GIF/WebP)持续解码的 CPU+内存消耗
+      5. 优化建议:
+         - 每个问题点给出具体优化方案和预估功耗降低比例
+         - 参考 Apple Energy Efficiency Guide 和 WWDC 相关 Session
+
+      输出为结构化 Markdown，每个章节包含: 问题描述、功耗影响量化、优化方案、代码示例。
+    files: [docs/power-analysis-ui-animation.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebFetch", "WebSearch"]
+    depends_on: []
+
+  - id: audio-video-power
+    description: |
+      分析群聊派对房间中音视频(RTC)相关的功耗影响点，并输出详细分析文档。
+
+      创建文件: docs/power-analysis-audio-video.md
+
+      需要覆盖以下方面:
+      1. 音频采集与播放:
+         - 麦克风常开采集的功耗(AVAudioSession 配置影响)
+         - 音频编解码器选择对 CPU 的影响(Opus vs AAC vs SILK)
+         - 扬声器/听筒模式切换的功耗差异
+         - 3D 音效/空间音频处理的额外 CPU 开销
+      2. 实时通信(RTC):
+         - WebRTC/声网(Agora)/ZEGO 等 SDK 的基础功耗开销
+         - 多人语音房不同人数(2人/4人/8人/16人)对功耗的影响
+         - 音频流混音(mixing)在客户端 vs 服务端的功耗对比
+         - 静音/非静音状态下 SDK 是否仍消耗资源
+      3. 音频处理:
+         - 降噪(ANS/AI降噪)的 CPU 消耗
+         - 回声消除(AEC)的持续计算开销
+         - 音量检测(VAD)的采样频率与功耗
+         - 变声/音效处理的额外功耗
+      4. 视频相关(如有):
+         - 摄像头预览的功耗
+         - 视频编解码的 CPU/GPU 消耗
+         - 分辨率和帧率对功耗的影响
+      5. 后台音频:
+         - 后台保活音频会话的功耗
+         - 后台播放静音音频保活的代价
+         - 合理的后台音频策略
+      6. 优化建议:
+         - 每个问题点给出具体方案和预估功耗降低比例
+         - 参考主流 RTC SDK 的最佳实践文档
+
+      输出为结构化 Markdown，包含问题描述、功耗量化、优化方案、配置代码示例。
+    files: [docs/power-analysis-audio-video.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebFetch", "WebSearch"]
+    depends_on: []
+
+  - id: network-timer-power
+    description: |
+      分析群聊派对房间中网络通信和定时器相关的功耗影响点，并输出详细分析文档。
+
+      注意: 项目中已有部分分析内容在 .claude/worktrees/cp-network-timer-power/docs/power-analysis-network.md，
+      请先用 Read 工具读取该文件获取已有分析内容，在此基础上补充完善，最终输出到 docs/power-analysis-network-timer.md。
+
+      创建文件: docs/power-analysis-network-timer.md
+
+      需要覆盖以下方面:
+      1. WebSocket 长连接:
+         - 心跳间隔设置对功耗的影响(10s vs 30s vs 60s)
+         - 多条 WebSocket 连接并存的 radio 唤醒代价
+         - 断线重连策略(指数退避 vs 固定间隔)的功耗差异
+      2. HTTP 轮询:
+         - 房间状态轮询频率优化(推送替代轮询)
+         - 在线用户列表刷新策略
+         - 礼物排行榜拉取频率
+      3. 定时器泄漏:
+         - NSTimer 循环引用导致的持续 CPU 唤醒
+         - CADisplayLink 未正确 invalidate 的功耗
+         - dispatch_source_t 定时器的生命周期管理
+         - 多个定时器合并(timer coalescing)策略
+      4. 网络请求优化:
+         - 请求合并与批处理(batch API)
+         - 数据压缩(gzip/brotli)减少传输功耗
+         - CDN 缓存策略减少重复请求
+         - HTTP/2 多路复用减少连接数
+      5. 图片加载网络开销:
+         - 头像/礼物图片的缓存策略
+         - 缩略图 vs 原图的带宽差异
+         - 预加载 vs 懒加载的功耗权衡
+      6. 优化建议汇总
+
+      输出为结构化 Markdown，合并已有分析和新增内容。
+    files: [docs/power-analysis-network-timer.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebFetch", "WebSearch"]
+    depends_on: []
+
+  - id: external-app-research
+    description: |
+      调研其他主流 App 和三方 SDK 在语音房/派对房场景下的功耗优化方案，输出竞品分析文档。
+
+      创建文件: docs/external-app-research.md
+
+      需要调研以下内容(通过 WebSearch 搜索技术博客、开发者文档、WWDC 演讲等):
+
+      1. 主流社交/语音房 App 的功耗优化实践:
+         - Discord: 语音频道的功耗优化策略、自适应码率、静音检测
+         - Clubhouse: 大规模语音房的功耗控制方案
+         - Twitter Spaces: 音频直播的电量优化
+         - 微信: 群语音/视频通话的功耗优化
+         - 抖音/TikTok: 直播间功耗优化实践
+         - 网易云音乐一起听: 社交音频功耗方案
+      2. 三方 RTC SDK 的功耗优化文档:
+         - 声网(Agora): 官方功耗优化建议和 API 配置
+         - ZEGO(即构): 低功耗模式和最佳实践
+         - 腾讯云 TRTC: 功耗优化配置项
+         - 阿里云 RTC: 功耗相关参数
+      3. Apple 官方功耗优化指南:
+         - Energy Efficiency Guide for iOS Apps 关键要点
+         - WWDC 相关 Session(Designing for Adverse Network Conditions, Writing Energy Efficient Apps 等)
+         - Instruments Energy Log 和 MetricKit 的使用方法
+      4. 业界通用优化模式:
+         - 前台/后台状态切换时的资源管理
+         - 用户活跃度检测(idle detection)降级策略
+         - 暗黑模式对 OLED 屏幕功耗的影响
+         - 低电量模式适配策略(ProcessInfo.isLowPowerModeEnabled)
+      5. 总结与对比:
+         - 将各家方案按功耗维度(CPU/GPU/网络/音频/屏幕)归类对比
+         - 标注可直接借鉴的方案和需要适配的方案
+
+      每个调研项需注明信息来源(URL 或文档名称)。
+      输出为结构化 Markdown，包含调研对象、优化策略、效果数据(如有)、参考链接。
+    files: [docs/external-app-research.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebFetch", "WebSearch"]
+    depends_on: []
+
+  - id: summary-report
+    description: |
+      汇总所有功耗分析和竞品调研结果，生成最终的综合优化建议报告。
+
+      读取以下文件:
+      - docs/power-analysis-ui-animation.md (UI/动画功耗分析)
+      - docs/power-analysis-audio-video.md (音视频功耗分析)
+      - docs/power-analysis-network-timer.md (网络/定时器功耗分析)
+      - docs/external-app-research.md (竞品调研)
+
+      创建文件: docs/power-optimization-summary.md
+
+      报告结构:
+      1. 执行摘要(Executive Summary):
+         - 群聊派对房间功耗的主要瓶颈 Top 5
+         - 预估优化后的整体功耗降低比例
+      2. 功耗影响全景图:
+         - 按影响程度排序的所有功耗问题清单
+         - 每个问题标注: 影响等级(高/中/低)、优化难度、预期收益
+      3. 优先级排序的优化方案:
+         - P0(立即优化): 投入小收益大的方案
+         - P1(短期优化): 需要一定开发量但收益显著
+         - P2(中期优化): 需要架构调整的方案
+         - P3(长期规划): 需要较大改动或依赖三方配合
+      4. 竞品对标:
+         - 与主流 App 的功耗策略对比表格
+         - 值得借鉴的最佳实践
+      5. 实施路线图:
+         - 分阶段实施计划
+         - 每阶段的验收指标(使用 Instruments/MetricKit 量化)
+      6. 监控与度量:
+         - 功耗监控方案(MetricKit/自定义埋点)
+         - 关键指标定义和告警阈值
+
+      输出为结构清晰的 Markdown，适合作为技术方案文档在团队内评审。
+    files: [docs/power-optimization-summary.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash"]
+    depends_on: [ui-animation-power, audio-video-power, network-timer-power, external-app-research]

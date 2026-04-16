@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# claude-parallel 封装脚本
+# 用法: cpar <command> [args...]
+#
+# 命令:
+#   cpar chat              对话模式 (自然语言描述需求)
+#   cpar run <yaml>        执行任务
+#   cpar plan <yaml>       预览计划
+#   cpar validate <yaml>   校验配置
+#   cpar diff <yaml>       预览变更
+#   cpar review <yaml>     Code Review
+#   cpar merge <yaml>      合并 worktree
+#   cpar resume <yaml>     恢复执行
+#   cpar clean <repo>      清理 worktree
+#   cpar logs <repo>       查看日志
+#   cpar perf ...          真机性能采集 (start/stop/tail/report/devices)
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+case "${1:-help}" in
+    chat)
+        shift
+        python3 "$SCRIPT_DIR/chat.py" "$@"
+        ;;
+    run)
+        shift
+        python3 "$SCRIPT_DIR/run.py" run "$@"
+        ;;
+    plan)
+        shift
+        python3 "$SCRIPT_DIR/run.py" plan "$@"
+        ;;
+    validate)
+        shift
+        python3 "$SCRIPT_DIR/run.py" validate "$@"
+        ;;
+    diff)
+        shift
+        python3 "$SCRIPT_DIR/run.py" diff "$@"
+        ;;
+    review)
+        shift
+        python3 "$SCRIPT_DIR/run.py" review "$@"
+        ;;
+    merge)
+        shift
+        python3 "$SCRIPT_DIR/run.py" merge "$@"
+        ;;
+    resume)
+        shift
+        python3 "$SCRIPT_DIR/run.py" resume "$@"
+        ;;
+    clean)
+        shift
+        python3 "$SCRIPT_DIR/run.py" clean "$@"
+        ;;
+    logs)
+        shift
+        python3 "$SCRIPT_DIR/run.py" logs "$@"
+        ;;
+    perf)
+        shift
+        python3 "$SCRIPT_DIR/run.py" perf "$@"
+        ;;
+    help|--help|-h)
+        echo "用法: cpar <command> [args...]"
+        echo ""
+        echo "命令:"
+        echo "  chat              对话模式: 用自然语言描述需求，自动拆分执行"
+        echo "                    选项: -m 文本, --message-file 文件, -i (引导向导), --repo PATH, --auto, --budget $, --planner-budget $, --planner-retries N, --planner-models m1,m2, --keep-chat-files N, --no-merge"
+        echo "  run <yaml>        执行任务 (--merge/--clean/--retry N/--total-budget \$, --with-perf ...)"
+        echo "  plan <yaml>       预览执行计划"
+        echo "  validate <yaml>   校验 YAML 配置"
+        echo "  diff <yaml>       预览所有 worktree 变更"
+        echo "  review <yaml>     自动 Code Review"
+        echo "  merge <yaml>      合并 worktree"
+        echo "  resume <yaml>     从中断处恢复"
+        echo "  clean <repo>      清理 worktree 和协调文件"
+        echo "  logs <repo>       查看任务日志 (-t TASK -n N)"
+        echo "  perf <subcmd>     真机性能采集/分析 (start/stop/tail/report/devices)"
+        echo ""
+        echo "示例:"
+        echo "  cpar chat                                     # 交互式对话"
+        echo "  cpar chat -i                                  # 引导向导模式 (7步问答)"
+        echo "  cpar chat -m \"给项目增加登录功能和测试\""
+        echo "  cpar chat --message-file ~/req.txt --repo ~/myproject"
+        echo "  cat ~/req.txt | cpar chat --repo ~/myproject"
+        echo "  cpar chat --repo ~/myproject --auto           # 全自动模式"
+        echo "  cpar chat --repo ~/myproject --planner-budget 1.2 --planner-retries 3"
+        echo "  cpar chat --repo ~/myproject --planner-models claude-sonnet-4-5,claude-3-5-haiku"
+        echo "  cpar validate examples/test-dag.yaml"
+        echo "  cpar run examples/test-dag.yaml --merge"
+        echo "  cpar diff examples/test-dag.yaml"
+        echo "  cpar review examples/test-dag.yaml"
+        ;;
+    *)
+        # 未知命令，直接透传
+        python3 "$SCRIPT_DIR/run.py" "$@"
+        ;;
+esac

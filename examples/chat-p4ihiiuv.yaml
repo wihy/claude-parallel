@@ -1,0 +1,134 @@
+project:
+  repo: /Users/chunhaixu/Desktop/ai空间
+  max_workers: 3
+  default_max_turns: 6
+  default_max_budget_usd: 0.5
+  retry_count: 1
+
+tasks:
+  - id: ui-animation-power
+    description: |
+      分析群聊派对房间中 UI 渲染与动画相关的功耗影响点，生成分析文档。
+
+      需要分析的功耗影响维度：
+      1. Lottie 动画（LOTAnimationView / AnimationView）：常驻循环动画、高帧率动画、大尺寸 JSON 资源
+      2. SVGA 动画（SVGAPlayer）：礼物特效、全屏特效的 GPU 占用
+      3. CADisplayLink / 高帧率组件：SOHeadPortraitView 等自定义帧驱动组件
+      4. 粒子系统与 OpenGL/Metal 渲染：礼物粒子、背景特效
+      5. 跑马灯 / 轮播组件：持续滚动的定时器驱动 UI
+      6. 悬浮组件（FloatView / StatusView）：拖拽、吸附、倒计时等持续刷新
+      7. 离屏渲染：圆角（cornerRadius + masksToBounds）、阴影（shadow）、模糊（UIBlurEffect）
+      8. 大量 Cell 复用与复杂布局：聊天消息列表的频繁刷新
+
+      输出要求：
+      - 创建文件 /docs/power-analysis-ui.md
+      - 每个影响点包含：影响描述、影响等级（High/Medium/Low）、优化建议
+      - 使用 WebSearch 或 WebFetch 搜索 iOS UI 渲染功耗优化的业界最佳实践
+      - 结合 SoulApp 群聊房间的实际场景给出针对性建议
+    files: [docs/power-analysis-ui.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebSearch", "WebFetch"]
+    depends_on: []
+
+  - id: audio-video-power
+    description: |
+      分析群聊派对房间中音视频与 RTC 相关的功耗影响点，生成分析文档。
+
+      需要分析的功耗影响维度：
+      1. RTC 语音引擎（TRTC / Agora / Zego）：长时间语音连麦、多人混音的 CPU 与基带功耗
+      2. 音频处理链路：变声、降噪、回声消除（AEC）、AudioUnit 链路
+      3. 视频渲染与摄像头：视频连麦时 Camera 采集 + 编解码 + 渲染的功耗
+      4. 硬件编解码 vs 软件编解码：VideoToolbox 硬编码 vs FFmpeg 软编码的功耗差异
+      5. 媒体播放：AVPlayer / AudioPlayer 背景音乐、音效播放
+      6. 音频会话管理：AVAudioSession category 配置不当导致的功耗浪费
+      7. 麦克风与扬声器：长时间占用硬件资源
+
+      输出要求：
+      - 创建文件 /docs/power-analysis-av.md
+      - 每个影响点包含：影响描述、影响等级（High/Medium/Low）、优化建议
+      - 使用 WebSearch 或 WebFetch 搜索 RTC 音视频功耗优化的业界实践（尤其是 Agora、TRTC 官方文档）
+      - 给出语音房场景下的功耗优化优先级排序
+    files: [docs/power-analysis-av.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebSearch", "WebFetch"]
+    depends_on: []
+
+  - id: network-timer-power
+    description: |
+      分析群聊派对房间中网络通信与定时器相关的功耗影响点，生成分析文档。
+
+      需要分析的功耗影响维度：
+      1. WebSocket 长连接：心跳间隔过短、频繁断线重连、多条长连接并存
+      2. HTTP 轮询：定时拉取房间状态、在线列表、礼物排行等接口
+      3. 图片加载（SDWebImage / YYImage）：大量头像、礼物图、背景图的频繁下载与解码
+      4. 定时器泄漏：NSTimer / dispatch_source_t / CADisplayLink / DispatchTimer 未正确释放
+      5. 后台任务：beginBackgroundTask、Background Fetch、后台音频保活
+      6. 定位服务：CLLocationManager 持续定位 vs 显著位置变化
+      7. 推送与通知：频繁的远程推送处理、本地通知调度
+
+      输出要求：
+      - 创建文件 /docs/power-analysis-network.md
+      - 每个影响点包含：影响描述、影响等级（High/Medium/Low）、优化建议
+      - 使用 WebSearch 或 WebFetch 搜索 iOS 网络与定时器功耗优化的最佳实践
+      - 重点关注语音房场景下的长连接与轮询优化策略
+    files: [docs/power-analysis-network.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebSearch", "WebFetch"]
+    depends_on: []
+
+  - id: external-app-research
+    description: |
+      调研其他社交/直播类 App 及三方 SDK 在语音房/派对房场景下的功耗优化策略，生成调研报告。
+
+      需要调研的对象：
+      1. 国内竞品：
+         - 微信/QQ 语音房：腾讯系的功耗优化方案
+         - 抖音/快手直播间：字节/快手的直播间功耗治理经验
+         - 网易云音乐一起听：网易系的语音房方案
+         - 酷狗/全民K歌：音频类 App 的功耗控制
+      2. 海外竞品：
+         - Discord Stage Channels：语音频道的功耗优化
+         - Clubhouse：纯语音社交的功耗控制策略
+         - Twitter Spaces / Spotify Greenroom：大厂的语音房方案
+      3. 三方 SDK 优化指南：
+         - Agora（声网）官方功耗优化文档
+         - TRTC（腾讯云）功耗优化最佳实践
+         - Lottie 性能优化指南
+         - SVGA 性能优化建议
+      4. Apple 官方指南：
+         - Energy Efficiency Guide for iOS Apps
+         - Instruments Energy Log 使用方法
+         - MetricKit 功耗监控集成
+         - Xcode Energy Gauge 解读
+
+      输出要求：
+      - 创建文件 /docs/power-optimization-research.md
+      - 每个调研对象包含：优化策略摘要、关键技术点、可借鉴之处
+      - 使用 WebSearch 或 WebFetch 搜索上述 App 和 SDK 的公开技术文章、官方文档
+      - 最终给出 SoulApp 可直接借鉴的 Top 10 优化建议（按投入产出比排序）
+    files: [docs/power-optimization-research.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebSearch", "WebFetch"]
+    depends_on: []
+
+  - id: summary-report
+    description: |
+      汇总前四个分析任务的结果，生成一份完整的功耗优化总览报告。
+
+      操作步骤：
+      1. 读取以下四个文档：
+         - /docs/power-analysis-ui.md（UI 渲染与动画功耗分析）
+         - /docs/power-analysis-av.md（音视频与 RTC 功耗分析）
+         - /docs/power-analysis-network.md（网络与定时器功耗分析）
+         - /docs/power-optimization-research.md（外部调研报告）
+      2. 汇总所有 High 级别的功耗影响点，生成优先级排序表
+      3. 从外部调研中提取可直接落地的优化方案
+      4. 生成分阶段优化路线图（P0/P1/P2）
+
+      输出要求：
+      - 创建文件 /docs/power-optimization-summary.md
+      - 包含以下章节：
+        - 一、功耗影响全景图（按 High/Medium/Low 分类汇总）
+        - 二、Top 10 高优功耗问题（附影响等级和优化建议）
+        - 三、业界最佳实践对标（SoulApp vs 竞品）
+        - 四、优化路线图（P0: 1周内、P1: 1月内、P2: 季度内）
+        - 五、功耗监控体系建设建议（MetricKit + 自定义埋点）
+    files: [docs/power-optimization-summary.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash"]
+    depends_on: [ui-animation-power, audio-video-power, network-timer-power, external-app-research]

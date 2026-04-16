@@ -1,0 +1,59 @@
+# Phase 3 端到端测试: 4 任务 DAG (3 层级)
+#
+# Level 0: utils (独立)
+# Level 1: greeting (依赖 utils), math (依赖 utils)
+# Level 2: main (依赖 greeting + math)
+
+project:
+  repo: ~/claude-parallel/test-dag
+  max_workers: 3
+  default_max_turns: 6
+  default_max_budget_usd: 0.5
+  retry_count: 1
+  total_budget_usd: 3.0
+
+tasks:
+  # === Level 0 ===
+  - id: utils
+    description: |
+      创建 src/utils.py，包含:
+      - format_output(title: str, content: str) -> str: 格式化为 "=== {title} ===\n{content}"
+      - validate_name(name: str) -> bool: 非空且长度 > 0
+      所有函数添加 type hints 和 docstring
+    files: ["src/utils.py"]
+    allowed_tools: ["Read", "Write", "Bash"]
+    max_turns: 4
+
+  # === Level 1 ===
+  - id: greeting
+    description: |
+      创建 src/greeting.py，使用 src/utils.py 中的工具函数:
+      - hello(name: str) -> str: 用 format_output 格式化 "Hello, {name}!"
+      - goodbye(name: str) -> str: 用 format_output 格式化 "Goodbye, {name}!"
+      - validate_name 来自 utils.py，如果名字无效返回 "Invalid name"
+    files: ["src/greeting.py"]
+    allowed_tools: ["Read", "Write", "Bash"]
+    max_turns: 4
+    depends_on: ["utils"]
+
+  - id: mathops
+    description: |
+      创建 src/mathops.py，使用 src/utils.py 中的工具函数:
+      - add(a, b): 返回 format_output("加法", f"{a} + {b} = {a+b}")
+      - multiply(a, b): 返回 format_output("乘法", f"{a} * {b} = {a*b}")
+    files: ["src/mathops.py"]
+    allowed_tools: ["Read", "Write", "Bash"]
+    max_turns: 4
+    depends_on: ["utils"]
+
+  # === Level 2 ===
+  - id: main-app
+    description: |
+      创建 main.py 入口文件:
+      - 导入 src.greeting 和 src.mathops
+      - if __name__ == "__main__": 演示调用所有函数
+      - 打印结果
+    files: ["main.py"]
+    allowed_tools: ["Read", "Write", "Bash"]
+    max_turns: 5
+    depends_on: ["greeting", "mathops"]

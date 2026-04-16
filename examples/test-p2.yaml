@@ -1,0 +1,25 @@
+project:
+  repo: ~/claude-parallel/test-project-new
+  max_workers: 3
+  default_max_turns: 5
+  default_max_budget_usd: 0.5
+  retry_count: 1
+
+tasks:
+  - id: hello-py
+    description: "创建 hello.py，包含 hello(name) 函数返回 'Hello, {name}!'，和 __main__ 演示"
+    files: ["hello.py"]
+    allowed_tools: ["Read", "Write", "Bash"]
+    max_turns: 3
+
+  - id: calc-py
+    description: "创建 calc.py，包含 add(a,b), sub(a,b), mul(a,b), div(a,b) 四个函数，带 type hints"
+    files: ["calc.py"]
+    allowed_tools: ["Read", "Write", "Bash"]
+    max_turns: 3
+
+  - id: readme
+    description: "创建 README.md，包含项目名称 'Mini Utils'、简介、每个模块的用法"
+    files: ["README.md"]
+    allowed_tools: ["Read", "Write"]
+    max_turns: 3

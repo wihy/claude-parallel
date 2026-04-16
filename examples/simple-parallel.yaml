@@ -1,0 +1,38 @@
+# 简单示例: 3 个完全独立的并行任务 (无依赖)
+# 适合首次测试
+
+project:
+  repo: ~/myproject
+  max_workers: 3
+
+tasks:
+  - id: fix-lint
+    description: |
+      修复项目中所有的 lint 错误:
+      - 运行 ruff check src/ 找出问题
+      - 逐一修复所有 lint 错误
+      - 最后运行 ruff check src/ 确认 0 errors
+    allowed_tools: ["Read", "Edit", "Write", "Bash"]
+    max_turns: 10
+    max_budget_usd: 1.0
+
+  - id: add-type-hints
+    description: |
+      为 src/utils.py 添加完整的 type hints:
+      - 所有公开函数添加参数和返回值类型注解
+      - 确保 mypy src/utils.py 通过
+    files: ["src/utils.py"]
+    allowed_tools: ["Read", "Edit", "Write", "Bash"]
+    max_turns: 10
+    max_budget_usd: 1.0
+
+  - id: update-readme
+    description: |
+      更新 README.md:
+      - 添加项目简介
+      - 添加安装说明
+      - 添加使用示例
+    files: ["README.md"]
+    allowed_tools: ["Read", "Edit"]
+    max_turns: 6
+    max_budget_usd: 0.5

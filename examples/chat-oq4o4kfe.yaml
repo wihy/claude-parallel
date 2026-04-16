@@ -1,0 +1,119 @@
+Previous tasks all failed due to worktree issues (now fixed - repo has git). This is a research workspace. Let me produce the task YAML for the power consumption analysis.
+
+project:
+  repo: /Users/chunhaixu/Desktop/ai空间
+  max_workers: 3
+  default_max_turns: 6
+  default_max_budget_usd: 0.5
+  retry_count: 1
+
+tasks:
+  - id: audio-video-power
+    description: |
+      研究群聊派对房间中音视频相关的功耗影响点及优化方案。
+
+      需要通过 WebSearch 搜索以下内容并整理成报告:
+      1. iOS/Android 实时音频采集与播放的功耗影响（AudioUnit、AVAudioEngine、OpenSL ES）
+      2. RTC 音视频 SDK（如声网 Agora、腾讯 TRTC、Zego）的功耗优化最佳实践
+      3. 音频编解码器选择对功耗的影响（Opus vs AAC vs SILK）
+      4. 视频渲染（OpenGL ES / Metal / Vulkan）对 GPU 和电量的消耗
+      5. 多人连麦场景下的混音、降噪、回声消除的 CPU 占用
+      6. 后台音频播放与前台的功耗差异
+      7. 硬编码 vs 软编码对功耗的影响
+
+      输出文件: reports/audio-video-power.md
+      格式: Markdown，包含问题描述、影响程度评估（高/中/低）、优化建议
+    files: [reports/audio-video-power.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebSearch", "mcp__web-search-prime__web_search_prime"]
+    depends_on: []
+
+  - id: ui-animation-power
+    description: |
+      研究群聊派对房间中 UI 渲染与动画相关的功耗影响点及优化方案。
+
+      需要通过 WebSearch 搜索以下内容并整理成报告:
+      1. Lottie 动画的 CPU/GPU 功耗（礼物特效、进场动画、SVG 动画）
+      2. 粒子特效系统（CAEmitterLayer、SpriteKit）的功耗消耗
+      3. 高频 UI 刷新（弹幕、消息列表滚动、实时排行榜更新）的功耗
+      4. 图片加载与缓存（SDWebImage、大量头像加载）对内存和 CPU 的影响
+      5. 半透明视图叠加、高斯模糊、圆角裁剪等离屏渲染对 GPU 的影响
+      6. CADisplayLink 和帧率控制对功耗的影响
+      7. 暗黑模式 / OLED 屏幕优化对功耗的减少
+      8. 视图层级过深导致的布局计算开销
+
+      输出文件: reports/ui-animation-power.md
+      格式: Markdown，包含问题描述、影响程度评估（高/中/低）、优化建议
+    files: [reports/ui-animation-power.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebSearch", "mcp__web-search-prime__web_search_prime"]
+    depends_on: []
+
+  - id: network-timer-power
+    description: |
+      研究群聊派对房间中网络通信与定时器相关的功耗影响点及优化方案。
+
+      需要通过 WebSearch 搜索以下内容并整理成报告:
+      1. WebSocket/长连接保活（心跳包频率）对功耗的影响
+      2. 高频轮询接口（房间状态、在线人数、礼物排行）vs 推送的功耗对比
+      3. NSTimer / GCD Timer / CADisplayLink 不同定时器的功耗差异
+      4. 网络请求合并与批量化对功耗的优化
+      5. DNS 解析、TLS 握手的功耗开销
+      6. 后台网络活动（Background Task、BGProcessingTask）的功耗策略
+      7. 数据序列化格式（JSON vs Protobuf vs FlatBuffers）对 CPU 的影响
+      8. iOS Timer Coalescing 和 App Nap 机制的利用
+
+      输出文件: reports/network-timer-power.md
+      格式: Markdown，包含问题描述、影响程度评估（高/中/低）、优化建议
+    files: [reports/network-timer-power.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebSearch", "mcp__web-search-prime__web_search_prime"]
+    depends_on: []
+
+  - id: external-app-research
+    description: |
+      调研其他社交/语聊 App 和三方 SDK 在派对房间场景的功耗优化策略。
+
+      需要通过 WebSearch 搜索以下 App 和 SDK 的功耗优化实践:
+
+      竞品 App 调研:
+      1. Discord — 语音频道的功耗优化方案（VAD 语音检测、自适应码率）
+      2. Clubhouse / Twitter Spaces — 纯音频房间的省电策略
+      3. 抖音直播 / 快手直播 — 直播间动画与礼物特效的功耗优化
+      4. 微信 — 群语音/视频通话的功耗控制
+      5. Telegram — 群组语音聊天的轻量化实现
+      6. YY / 映客 / 花椒 — 语聊房的功耗优化经验
+
+      三方 SDK/工具调研:
+      1. 声网 Agora SDK 的功耗优化配置参数和最佳实践
+      2. 腾讯 TRTC 的省电模式和低功耗方案
+      3. Zego SDK 的功耗优化文档
+      4. Apple Instruments Energy Diagnostics 使用方法
+      5. Android Battery Historian 分析方法
+
+      输出文件: reports/external-app-research.md
+      格式: Markdown，按 App/SDK 分类，每项包含优化策略、技术细节、可借鉴点
+    files: [reports/external-app-research.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash", "WebSearch", "mcp__web-search-prime__web_search_prime"]
+    depends_on: []
+
+  - id: summary-report
+    description: |
+      汇总前面四个任务的研究结果，生成一份完整的功耗分析与优化总结报告。
+
+      步骤:
+      1. 读取以下四份报告:
+         - reports/audio-video-power.md
+         - reports/ui-animation-power.md
+         - reports/network-timer-power.md
+         - reports/external-app-research.md
+      2. 生成汇总报告，包含:
+         - 执行摘要（200字以内的核心结论）
+         - 功耗影响点优先级矩阵（按影响程度和优化难度分类）
+         - Top 10 高优先级优化建议（附预期收益和实施难度）
+         - 竞品对标分析表（我们 vs 竞品的功耗优化差距）
+         - 分阶段优化路线图（短期/中期/长期）
+         - 功耗测试方法论建议
+
+      输出文件: reports/summary-report.md
+      格式: Markdown，包含表格、优先级标注，便于向团队汇报
+    files: [reports/summary-report.md]
+    allowed_tools: ["Read", "Write", "Edit", "Bash"]
+    depends_on: [audio-video-power, ui-animation-power, network-timer-power, external-app-research]

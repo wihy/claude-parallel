@@ -1,0 +1,108 @@
+project:
+  repo: /Users/chunhaixu/Desktop/ai空间
+  max_workers: 3
+  default_max_turns: 6
+  default_max_budget_usd: 0.5
+  retry_count: 1
+
+tasks:
+  - id: ui-animation-power
+    description: |
+      分析群聊派对房间中 UI 渲染和动画相关的功耗影响点。
+      重点排查以下方面并输出分析报告到 docs/power-analysis-ui.md：
+
+      1. Lottie 动画：搜索房间内所有 Lottie 动画使用（LOTAnimationView、AnimationView），
+         统计动画数量、是否有不可见时仍在播放的情况
+      2. CADisplayLink / 帧率：搜索 CADisplayLink、SOHeadPortraitView 等高帧率组件，
+         分析是否有不必要的60fps刷新
+      3. 礼物特效：搜索礼物相关动画（SVGAPlayer、粒子效果、OpenGL/Metal渲染），
+         分析特效叠加时的GPU开销
+      4. 跑马灯/轮播：搜索 marquee、carousel、scroll 相关组件，分析持续滚动的功耗
+      5. 悬浮组件：搜索 FloatView、StatusView 等悬浮组件中的定时刷新逻辑
+      6. 圆角/阴影/模糊：搜索 cornerRadius、shadow、blur 等离屏渲染触发点
+
+      每个影响点需说明：所在文件、影响程度（高/中/低）、优化建议。
+    files: [docs/power-analysis-ui.md]
+    allowed_tools: ["Read", "Bash", "Grep", "Glob", "Write"]
+    depends_on: []
+
+  - id: audio-video-power
+    description: |
+      分析群聊派对房间中音视频和实时通信相关的功耗影响点。
+      输出分析报告到 docs/power-analysis-av.md：
+
+      1. 语音引擎：搜索 RTC、TRTC、Agora、声网、AudioSession 等关键词，
+         分析语音采集/播放的持续功耗，是否有静音时仍保持高功耗采集的情况
+      2. 视频流：搜索视频渲染、VideoView、摄像头相关代码，
+         分析视频分辨率、帧率配置是否合理
+      3. 音频处理：搜索音效、变声、降噪、AudioUnit 等，
+         分析音频DSP处理链的功耗
+      4. 媒体播放：搜索 AVPlayer、AudioPlayer 等，分析背景音乐/音效播放的功耗
+      5. 编解码：分析是否使用硬件编解码（VideoToolbox）而非软解
+
+      每个影响点需说明：所在文件、影响程度（高/中/低）、优化建议。
+    files: [docs/power-analysis-av.md]
+    allowed_tools: ["Read", "Bash", "Grep", "Glob", "Write"]
+    depends_on: []
+
+  - id: network-timer-power
+    description: |
+      分析群聊派对房间中网络通信和定时器相关的功耗影响点。
+      输出分析报告到 docs/power-analysis-network.md：
+
+      1. WebSocket/长连接：搜索 WebSocket、SocketIO、心跳(heartbeat/ping)，
+         分析心跳间隔是否过短、断线重连策略是否合理
+      2. HTTP轮询：搜索 NSTimer+网络请求、定时拉取、poll 相关逻辑，
+         分析是否有可以改为推送的轮询接口
+      3. 图片加载：搜索 SDWebImage、YYImage、图片下载队列，
+         分析是否有重复下载、缓存策略是否合理
+      4. 定时器泄漏：搜索 NSTimer、dispatch_source_t、CADisplayLink、DispatchTimer，
+         分析是否有页面退出后未销毁的定时器
+      5. 后台任务：搜索 beginBackgroundTask、Background fetch，
+         分析退出房间后是否有残留后台任务
+      6. 位置服务：搜索 CLLocationManager、GPS，分析定位精度和频率是否过高
+
+      每个影响点需说明：所在文件、影响程度（高/中/低）、优化建议。
+    files: [docs/power-analysis-network.md]
+    allowed_tools: ["Read", "Bash", "Grep", "Glob", "Write"]
+    depends_on: []
+
+  - id: external-app-research
+    description: |
+      调研其他社交/直播类 App 以及业界在类似场景下的功耗优化方案。
+      输出调研报告到 docs/power-optimization-research.md：
+
+      1. 微信/QQ语音房：搜索公开技术博客，总结其在语音房场景的功耗优化策略
+      2. 抖音/快手直播间：总结直播间场景的 GPU、CPU、网络功耗优化方案
+      3. Discord/Clubhouse：总结海外语音社交 App 的功耗管理策略
+      4. Apple 官方指南：总结 Energy Efficiency Guide for iOS Apps 中的关键建议，
+         包括 CPU、GPU、网络、定位、后台任务等维度
+      5. 三方SDK优化：总结 Agora/TRTC/Lottie/SVGA 等常用SDK的功耗优化配置项
+      6. 工具与度量：总结 Instruments Energy Log、MetricKit、Xcode Energy Gauge
+         等功耗分析工具的使用方法和关键指标
+
+      每个部分需包含：优化策略、预期收益、实施难度、参考链接（如有）。
+    files: [docs/power-optimization-research.md]
+    allowed_tools: ["Read", "Write", "Bash", "WebSearch", "WebFetch"]
+    depends_on: []
+
+  - id: summary-report
+    description: |
+      汇总所有分析结果，生成群聊派对房间功耗优化总报告。
+      读取以下文件：
+      - docs/power-analysis-ui.md
+      - docs/power-analysis-av.md
+      - docs/power-analysis-network.md
+      - docs/power-optimization-research.md
+
+      输出到 docs/power-optimization-summary.md，包含：
+      1. 执行摘要：整体功耗风险评估
+      2. 影响点全景表：按影响程度（高/中/低）排序的所有功耗影响点
+      3. 优化优先级矩阵：综合影响程度和实施难度，给出 P0/P1/P2 优先级
+      4. 快速见效项（Quick Wins）：实施简单且收益明显的优化项，前3-5项
+      5. 中长期优化路线图：需要较大改动的优化方向
+      6. 业界对标：与竞品的功耗优化策略对比
+      7. 建议的功耗监控指标和持续优化机制
+    files: [docs/power-optimization-summary.md]
+    allowed_tools: ["Read", "Write"]
+    depends_on: [ui-animation-power, audio-video-power, network-timer-power, external-app-research]
