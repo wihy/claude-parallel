@@ -64,6 +64,32 @@
 - **时间切片分析** — `perf callstack --from 60 --to 120` 只分析指定时间段的采样，定位"哪个时段的哪个方法导致高 CPU"
 - **systemtrace 自动识别** — systemtrace 模板含 time-profile schema，采集后直接可用 callstack 分析，无需单独跑 Time Profiler
 
+### 深度性能分析 (Phase 4.4 — 5 个新模块)
+
+- **dSYM 符号化** (`perf symbolicate`) — 自动从 Xcode DerivedData / Spotlight 查找 dSYM，批量 atos 符号化业务代码调用栈，Swift demangling，JSON 缓存避免重复解析
+- **syslog-xctrace 时序对齐** (`perf time-sync`) — 自动计算 syslog 与 xctrace 时间轴 offset，将日志事件与性能指标对齐到统一时间线，±N 秒窗口事件归因（OOM 前 CPU/内存/功耗变化）
+- **深度 Schema 采集** (`perf deep-export`) — 一键导出 GPU Frame Time / Network Flow / VM Tracking / Metal Performance 四维深度数据，自动探测可用 schema，iterparse 流式解析，P50/P95/P99 统计
+- **进程级功耗归因** (`perf power-attr`) — 按 CPU% 比例将 SystemPowerLevel 总功耗分摊到各进程，回答"到底是谁在耗电"，进程树跟踪 + 僵尸进程/功耗飙升/内存增长异常检测
+- **AI 辅助诊断** (`perf ai-diag`) — 全 session 数据喂 LLM 生成诊断报告，支持 5 种 focus (general/webkit/power/memory/gpu)，回归分析 (before vs after)，WebKit 专项报告，离线模式输出 prompt
+
+```bash
+# 符号化业务代码调用栈
+cpar perf symbolicate --repo ~/SoulApp --app-id com.soulapp.Soul
+
+# syslog 与 xctrace 时间对齐
+cpar perf time-sync --repo ~/SoulApp --tag perf --window 5
+
+# 导出 GPU/网络/内存/Metal 深度数据
+cpar perf deep-export --repo ~/SoulApp --tag perf --schemas gpu,network,vm,metal
+
+# 查看各进程功耗归因排行
+cpar perf power-attr --repo ~/SoulApp --tag perf
+
+# AI 诊断 (离线 prompt / 在线 LLM / WebKit 专项 / 回归分析)
+cpar perf ai-diag --repo ~/SoulApp --tag perf --focus webkit --offline
+cpar perf ai-diag --repo ~/SoulApp --tag after --baseline-tag before
+```
+
 ## 前置要求
 
 - Python 3.9+

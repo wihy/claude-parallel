@@ -2,12 +2,15 @@
 cpar perf 子包 — 真机性能采集、实时分析、报告生成。
 
 模块:
-- config:         PerfConfig 数据类
-- session:        PerfSessionManager 生命周期管理
-- live_log:       LiveLogAnalyzer 实时 syslog 流式分析
-- live_metrics:   LiveMetricsStreamer 实时 xctrace 指标流
-- templates:      TemplateLibrary Instruments 模板注册与扩展
-- integrator:     与 Orchestrator 的深度集成胶水
+- config:             PerfConfig 数据类
+- session:            PerfSessionManager 生命周期管理
+- live_log:           LiveLogAnalyzer 实时 syslog 流式分析
+- live_metrics:       LiveMetricsStreamer 实时 xctrace 指标流
+- templates:          TemplateLibrary Instruments 模板注册与扩展
+- integrator:         与 Orchestrator 的深度集成胶水
+- symbolicate:        dSYM 符号化 (atos / dsymutil / Swift demangle)
+- time_sync:          syslog-xctrace 时序对齐与事件归因
+- power_attribution:  进程级功耗归因与异常检测
 """
 
 from .config import PerfConfig
@@ -51,7 +54,63 @@ from .webcontent import (
     read_webcontent_hotspots,
     format_webcontent_hotspots,
 )
+from .deep_export import (
+    DEEP_SCHEMAS,
+    export_deep_schema,
+    parse_gpu_frame_time,
+    parse_network_stat,
+    parse_vm_tracking,
+    parse_metal_performance,
+    deep_export_all,
+    format_deep_report,
+    probe_trace_schemas,
+)
+from .symbolicate import (
+    find_dsym,
+    find_dsym_by_uuid,
+    symbolicate_addresses,
+    swift_demangle,
+    symbolicate_hotspots,
+    cache_dsym_map,
+    auto_symbolicate,
+)
+from .time_sync import (
+    SyslogEvent,
+    CorrelatedEvent,
+    get_device_uptime,
+    parse_syslog_timestamps,
+    parse_xctrace_timeline,
+    align_timelines,
+    correlate_events,
+    format_event_report,
+    run_time_sync,
+)
 from .integrator import PerfIntegrator
+from .power_attribution import (
+    ProcessPower,
+    ProcessLifecycleEvent,
+    AnomalyEvent,
+    parse_system_power,
+    parse_process_cpu,
+    attribute_power,
+    discover_process_tree,
+    track_process_lifecycle,
+    detect_anomalies,
+    format_attribution_report,
+    read_lifecycle_events,
+)
+from .ai_diagnosis import (
+    DiagnosisContext,
+    DiagnosisResult,
+    collect_diagnosis_context,
+    build_diagnosis_prompt,
+    call_llm,
+    parse_diagnosis_response,
+    generate_regression_analysis,
+    generate_webkit_report,
+    format_diagnosis_report,
+    run_diagnosis,
+)
 
 __all__ = [
     "PerfConfig",
@@ -84,4 +143,54 @@ __all__ = [
     "aggregate_top_n",
     "read_hotspots_jsonl",
     "format_hotspots_text",
+    "find_dsym",
+    "find_dsym_by_uuid",
+    "symbolicate_addresses",
+    "swift_demangle",
+    "symbolicate_hotspots",
+    "cache_dsym_map",
+    "auto_symbolicate",
+    # deep_export
+    "DEEP_SCHEMAS",
+    "export_deep_schema",
+    "parse_gpu_frame_time",
+    "parse_network_stat",
+    "parse_vm_tracking",
+    "parse_metal_performance",
+    "deep_export_all",
+    "format_deep_report",
+    "probe_trace_schemas",
+    # time_sync
+    "SyslogEvent",
+    "CorrelatedEvent",
+    "get_device_uptime",
+    "parse_syslog_timestamps",
+    "parse_xctrace_timeline",
+    "align_timelines",
+    "correlate_events",
+    "format_event_report",
+    "run_time_sync",
+    # power_attribution
+    "ProcessPower",
+    "ProcessLifecycleEvent",
+    "AnomalyEvent",
+    "parse_system_power",
+    "parse_process_cpu",
+    "attribute_power",
+    "discover_process_tree",
+    "track_process_lifecycle",
+    "detect_anomalies",
+    "format_attribution_report",
+    "read_lifecycle_events",
+    # ai_diagnosis
+    "DiagnosisContext",
+    "DiagnosisResult",
+    "collect_diagnosis_context",
+    "build_diagnosis_prompt",
+    "call_llm",
+    "parse_diagnosis_response",
+    "generate_regression_analysis",
+    "generate_webkit_report",
+    "format_diagnosis_report",
+    "run_diagnosis",
 ]

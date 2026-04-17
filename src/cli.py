@@ -1208,6 +1208,291 @@ async def cmd_perf_templates(args):
         print()
 
 
+async def cmd_perf_symbolicate(args):
+    """dSYM 符号化"""
+    from pathlib import Path
+    from src.perf.symbolicate import (
+        find_dsym, find_dsym_by_uuid, auto_symbolicate,
+    )
+    from src.perf.sampling import read_hotspots_jsonl
+
+    repo = Path(args.repo).expanduser().resolve()
+    tag = args.tag
+    logs_dir = repo / ".claude-parallel" / "perf" / tag / "logs"
+
+    # 查找 dSYM
+    dsym_path = args.dsym
+    if not dsym_path and args.uuid:
+        print(f"  [symbolicate] 通过 UUID 搜索: {args.uuid}")
+        dsym_path = find_dsym_by_uuid(args.uuid)
+        if dsym_path:
+            print(f"  找到: {dsym_path}")
+    if not dsym_path and args.app_id:
+        print(f"  [symbolicate] 通过 Bundle ID 搜索: {args.app_id}")
+        dsym_path = find_dsym(args.app_id)
+        if dsym_path:
+            print(f"  找到: {dsym_path}")
+
+    if not dsym_path:
+        print("  [symbolicate] 未找到 dSYM。请用 --dsym 或 --app-id 或 --uuid 指定")
+        return
+
+    # 读取热点
+    hotspots_file = logs_dir / "hotspots.jsonl"
+    if not hotspots_file.exists():
+        print(f"  [symbolicate] 未找到热点数据: {hotspots_file}")
+        print(f"  提示: 先运行 perf callstack 或 perf hotspots")
+        return
+
+    snapshots = read_hotspots_jsonl(hotspots_file)
+    if not snapshots:
+        print("  (无热点数据)")
+        return
+
+    # 符号化
+    all_hotspots = []
+    for snap in snapshots:
+        all_hotspots.extend(snap.get("top", []))
+
+    print(f"\n  符号化 {len(all_hotspots)} 个热点函数...")
+    result = auto_symbolicate(
+        hotspots=all_hotspots,
+        dsym_paths=[dsym_path] if isinstance(dsym_path, str) else [str(dsym_path)],
+        arch=args.arch,
+    )
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        for i, item in enumerate(result[:args.top], 1):
+            sym = item.get("symbol", "?")
+            if item.get("demangled"):
+                sym = item["demangled"]
+            pct = item.get("pct", 0)
+            samples = item.get("samples", 0)
+            bar = "█" * int(pct / 2)
+            print(f"  {i:2d}. {sym[:70]:<70s} {pct:5.1f}% ({samples}) {bar}")
+
+
+async def cmd_perf_time_sync(args):
+    """syslog-xctrace 时序对齐"""
+    from pathlib import Path
+    from src.perf.time_sync import (
+        parse_syslog_timestamps, parse_xctrace_timeline,
+        align_timelines, correlate_events, format_event_report,
+        run_time_sync,
+    )
+
+    repo = Path(args.repo).expanduser().resolve()
+    tag = args.tag
+    session_dir = repo / ".claude-parallel" / "perf" / tag
+
+    # 查找 syslog
+    syslog_path = args.syslog
+    if not syslog_path:
+        for candidate in [
+            session_dir / "logs" / "syslog.log",
+            session_dir / "logs" / "full_syslog.log",
+        ]:
+            if candidate.exists():
+                syslog_path = str(candidate)
+                break
+
+    if not syslog_path:
+        print(f"  [time-sync] 未找到 syslog 文件")
+        print(f"  提示: 用 --syslog 指定路径")
+        return
+
+    print(f"  [time-sync] syslog: {syslog_path}")
+    print(f"  [time-sync] session: {session_dir}")
+
+    result = run_time_sync(
+        session_dir=str(session_dir),
+        syslog_path=syslog_path,
+        window_seconds=args.window,
+    )
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    else:
+        text = format_event_report(result)
+        print(text)
+
+
+async def cmd_perf_deep_export(args):
+    """深度 Schema 采集"""
+    from pathlib import Path
+    from src.perf.deep_export import (
+        deep_export_all, format_deep_report, probe_trace_schemas,
+    )
+
+    repo = Path(args.repo).expanduser().resolve()
+    tag = args.tag
+    session_dir = repo / ".claude-parallel" / "perf" / tag
+    traces_dir = session_dir / "traces"
+    exports_dir = session_dir / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+
+    # 查找 trace 文件
+    trace_files = list(traces_dir.glob("*.trace"))
+    if not trace_files:
+        print(f"  [deep-export] 未找到 trace 文件: {traces_dir}")
+        return
+
+    # 先探测可用 schema
+    print(f"  [deep-export] 探测 {trace_files[0].name} 可用 schema...")
+    available = probe_trace_schemas(trace_files[0])
+    if available:
+        print(f"  可用: {', '.join(available[:10])}{'...' if len(available) > 10 else ''}")
+    else:
+        print("  (探测失败，将尝试全部)")
+
+    # 解析 schemas 参数
+    schema_arg = args.schemas
+    if schema_arg == "all":
+        schemas = None
+    else:
+        schemas = [s.strip() for s in schema_arg.split(",")]
+
+    print(f"\n  [deep-export] 批量导出...")
+    data = deep_export_all(trace_files[0], exports_dir, schemas=schemas)
+
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+    else:
+        for schema_name, schema_data in data.items():
+            if schema_data:
+                text = format_deep_report(schema_data, schema_name)
+                print(text)
+                print()
+            else:
+                print(f"  [{schema_name}] (无数据)\n")
+
+
+async def cmd_perf_power_attr(args):
+    """进程级功耗归因"""
+    from pathlib import Path
+    from src.perf.power_attribution import (
+        parse_system_power, parse_process_cpu,
+        attribute_power, format_attribution_report,
+    )
+
+    repo = Path(args.repo).expanduser().resolve()
+    tag = args.tag
+    session_dir = repo / ".claude-parallel" / "perf" / tag
+    exports_dir = session_dir / "exports"
+    logs_dir = session_dir / "logs"
+
+    # 查找功耗数据
+    power_xml = None
+    for candidate in exports_dir.glob("*SystemPowerLevel*"):
+        power_xml = candidate
+        break
+
+    if not power_xml:
+        print("  [power-attr] 未找到 SystemPowerLevel 数据")
+        print("  提示: 需要 Power Profiler trace + export")
+        return
+
+    # 查找进程 CPU 数据
+    process_cpu_path = logs_dir / "process_metrics.jsonl"
+    if not process_cpu_path.exists():
+        # 尝试 time-profile XML
+        for candidate in exports_dir.glob("*time-profile*"):
+            process_cpu_path = candidate
+            break
+
+    print(f"  [power-attr] 功耗数据: {power_xml.name}")
+    print(f"  [power-attr] 进程数据: {process_cpu_path.name if hasattr(process_cpu_path, 'name') else process_cpu_path}")
+
+    power_samples = parse_system_power(power_xml)
+    process_cpu = parse_process_cpu(process_cpu_path)
+
+    if not power_samples:
+        print("  (功耗数据解析失败)")
+        return
+    if not process_cpu:
+        print("  (进程 CPU 数据解析失败)")
+        return
+
+    attribution = attribute_power(power_samples, process_cpu)
+
+    if args.json:
+        print(json.dumps(attribution, ensure_ascii=False, indent=2, default=str))
+    else:
+        text = format_attribution_report(attribution, anomalies=[], power_samples=power_samples)
+        print(text)
+
+
+async def cmd_perf_ai_diag(args):
+    """AI 辅助诊断"""
+    from pathlib import Path
+    from src.perf.ai_diagnosis import (
+        collect_diagnosis_context, build_diagnosis_prompt,
+        call_llm, parse_diagnosis_response, format_diagnosis_report,
+        run_diagnosis, generate_regression_analysis, generate_webkit_report,
+    )
+
+    repo = Path(args.repo).expanduser().resolve()
+    tag = args.tag
+    session_dir = repo / ".claude-parallel" / "perf" / tag
+
+    print(f"  [ai-diag] 收集诊断上下文...")
+    context = collect_diagnosis_context(str(session_dir))
+
+    if args.offline:
+        # 离线模式: 只输出 prompt
+        prompt = build_diagnosis_prompt(context, focus_area=args.focus)
+        print(f"\n{'='*60}")
+        print(f"  AI 诊断 Prompt (离线模式)")
+        print(f"{'='*60}\n")
+        print(prompt)
+        print(f"\n  提示: 设置 OPENAI_API_KEY 环境变量后可自动调用 LLM")
+        return
+
+    # 在线模式
+    if args.focus == "webkit":
+        print(f"  [ai-diag] 生成 WebKit 专项报告...")
+        result = generate_webkit_report(str(session_dir))
+        if result:
+            text = format_diagnosis_report(result)
+            print(text)
+        else:
+            print("  (WebKit 数据不足)")
+        return
+
+    if args.baseline_tag:
+        # 回归分析
+        baseline_dir = repo / ".claude-parallel" / "perf" / args.baseline_tag
+        print(f"  [ai-diag] 回归分析: {args.baseline_tag} vs {tag}...")
+        result = generate_regression_analysis(str(baseline_dir), str(session_dir))
+        if result:
+            text = format_diagnosis_report(result)
+            print(text)
+        return
+
+    # 通用诊断
+    print(f"  [ai-diag] 生成诊断 (focus: {args.focus})...")
+    result = run_diagnosis(
+        session_dir=str(session_dir),
+        focus_area=args.focus,
+        model=args.model or None,
+    )
+
+    if args.json:
+        # 输出结构化 JSON
+        out = {
+            "problems": result.problems,
+            "recommendations": result.recommendations,
+            "priority": result.priority,
+            "offline": result.offline,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        text = format_diagnosis_report(result)
+        print(text)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="claude-parallel",
@@ -1445,6 +1730,50 @@ def main():
     perf_tpl.add_argument("--attach", default="", help="进程名 (配合 --build-cmd)")
     perf_tpl.add_argument("--duration", type=int, default=0, help="录制时长(秒) (配合 --build-cmd)")
 
+    # ── perf symbolicate (dSYM 符号化) ──
+    perf_sym = perf_sub.add_parser("symbolicate", help="dSYM 符号化调用栈地址")
+    perf_sym.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_sym.add_argument("--tag", default="perf", help="会话标签")
+    perf_sym.add_argument("--app-id", default="", help="App Bundle ID (用于查找 dSYM)")
+    perf_sym.add_argument("--dsym", default="", help="指定 dSYM 路径")
+    perf_sym.add_argument("--uuid", default="", help="dSYM UUID (Spotlight 搜索)")
+    perf_sym.add_argument("--arch", default="arm64", help="架构 (默认 arm64)")
+    perf_sym.add_argument("--top", type=int, default=20, help="符号化 Top N 热点")
+    perf_sym.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    # ── perf time-sync (syslog-xctrace 时序对齐) ──
+    perf_ts = perf_sub.add_parser("time-sync", help="syslog-xctrace 时序对齐 + 事件归因")
+    perf_ts.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_ts.add_argument("--tag", default="perf", help="会话标签")
+    perf_ts.add_argument("--syslog", default="", help="syslog 文件路径 (空=自动查找)")
+    perf_ts.add_argument("--window", type=int, default=5, help="事件关联窗口(秒)")
+    perf_ts.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    # ── perf deep-export (深度 Schema 采集) ──
+    perf_de = perf_sub.add_parser("deep-export", help="深度 Schema 采集 (GPU/Network/VM/Metal)")
+    perf_de.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_de.add_argument("--tag", default="perf", help="会话标签")
+    perf_de.add_argument("--schemas", default="all", help="Schema 列表 (逗号分隔: gpu,network,vm,metal 或 all)")
+    perf_de.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    # ── perf power-attr (进程级功耗归因) ──
+    perf_pa = perf_sub.add_parser("power-attr", help="进程级功耗归因分析")
+    perf_pa.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_pa.add_argument("--tag", default="perf", help="会话标签")
+    perf_pa.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    # ── perf ai-diag (AI 辅助诊断) ──
+    perf_ai = perf_sub.add_parser("ai-diag", help="AI 辅助性能诊断")
+    perf_ai.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_ai.add_argument("--tag", default="perf", help="会话标签")
+    perf_ai.add_argument("--focus", default="general",
+                         choices=["general", "webkit", "power", "memory", "gpu"],
+                         help="分析重点")
+    perf_ai.add_argument("--baseline-tag", default="", help="基线标签 (对比分析)")
+    perf_ai.add_argument("--offline", action="store_true", help="离线模式 (只生成 prompt)")
+    perf_ai.add_argument("--model", default="", help="LLM 模型 (覆盖环境变量)")
+    perf_ai.add_argument("--json", action="store_true", help="JSON 格式输出")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1505,8 +1834,18 @@ def main():
             asyncio.run(cmd_perf_battery(args))
         elif args.perf_cmd == "templates":
             asyncio.run(cmd_perf_templates(args))
+        elif args.perf_cmd == "symbolicate":
+            asyncio.run(cmd_perf_symbolicate(args))
+        elif args.perf_cmd == "time-sync":
+            asyncio.run(cmd_perf_time_sync(args))
+        elif args.perf_cmd == "deep-export":
+            asyncio.run(cmd_perf_deep_export(args))
+        elif args.perf_cmd == "power-attr":
+            asyncio.run(cmd_perf_power_attr(args))
+        elif args.perf_cmd == "ai-diag":
+            asyncio.run(cmd_perf_ai_diag(args))
         else:
-            print("  用法: cpar perf <start|stop|tail|report|devices|live|rules|stream|snapshot|callstack|hotspots|metrics|battery|templates> ...")
+            print("  用法: cpar perf <start|stop|tail|report|devices|live|rules|stream|snapshot|callstack|hotspots|metrics|battery|templates|symbolicate|time-sync|deep-export|power-attr|ai-diag> ...")
 
 
 if __name__ == "__main__":
