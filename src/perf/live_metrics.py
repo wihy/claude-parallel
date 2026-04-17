@@ -212,30 +212,59 @@ def _parse_exported_xml_strings(xml_path: Path) -> Dict[str, List[str]]:
     return result
 
 
+def _export_one_schema(
+    schema: str, trace_file: Path, exports_dir: Path,
+) -> Optional[Path]:
+    """单个 schema 的 xctrace export（用于并行调度）。"""
+    xml_out = exports_dir / f"{schema}.xml"
+    try:
+        cmd = [
+            "xcrun", "xctrace", "export",
+            "--input", str(trace_file),
+            "--xpath", f'/trace-toc/run/data/table[@schema="{schema}"]',
+            "--output", str(xml_out),
+        ]
+        subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False, text=True, timeout=30,
+        )
+        return xml_out if xml_out.exists() else None
+    except Exception:
+        return None
+
+
 def build_snapshot_from_exports(
     exports_dir: Path,
     trace_file: Path,
 ) -> MetricSnapshot:
     """
-    从 trace 文件导出所有已知 schema，合并为单次快照。
+    从 trace 文件并行导出所有已知 schema，合并为单次快照。
+    使用 ThreadPoolExecutor 并行调用 xctrace export（I/O 密集）。
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     snap = MetricSnapshot(ts=time.time())
 
-    # 逐 schema 导出+解析
+    # 并行导出所有 schema
+    schema_results: Dict[str, Optional[Path]] = {}
+    schemas = list(SCHEMA_COLUMNS.keys())
+
+    with ThreadPoolExecutor(max_workers=min(len(schemas), 4)) as pool:
+        futures = {
+            pool.submit(_export_one_schema, schema, trace_file, exports_dir): schema
+            for schema in schemas
+        }
+        for future in as_completed(futures):
+            schema = futures[future]
+            try:
+                schema_results[schema] = future.result()
+            except Exception:
+                schema_results[schema] = None
+
+    # 解析并合并到 snapshot
     for schema, col_map in SCHEMA_COLUMNS.items():
-        xml_out = exports_dir / f"{schema}.xml"
-        try:
-            cmd = [
-                "xcrun", "xctrace", "export",
-                "--input", str(trace_file),
-                "--xpath", f'/trace-toc/run/data/table[@schema="{schema}"]',
-                "--output", str(xml_out),
-            ]
-            subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                check=False, text=True, timeout=30,
-            )
-        except Exception:
+        xml_out = schema_results.get(schema)
+        if not xml_out:
             continue
 
         parsed = _parse_exported_xml(xml_out)
@@ -243,11 +272,10 @@ def build_snapshot_from_exports(
             f.startswith("_") for f in col_map.values()
         ) else {}
 
-        # 对每个列，取最近一个值 (精确匹配优先，子串匹配兜底)
         for col_name, field_name in col_map.items():
             # 字符串字段（以 _ 开头标记）
             if field_name.startswith("_"):
-                real_field = field_name[1:]  # "_thermal_state" → "thermal_state"
+                real_field = field_name[1:]
                 for key, vals in parsed_str.items():
                     if col_name.lower() in key.lower() and vals:
                         setattr(snap, real_field, vals[-1])
@@ -255,20 +283,16 @@ def build_snapshot_from_exports(
                 continue
 
             matched = False
-            # 1. 精确匹配 (忽略大小写)
             for key, vals in parsed.items():
                 if key.lower().strip() == col_name.lower().strip() and vals:
-                    val = vals[-1]
-                    setattr(snap, field_name, val)
+                    setattr(snap, field_name, vals[-1])
                     matched = True
                     break
             if matched:
                 continue
-            # 2. 子串兜底
             for key, vals in parsed.items():
                 if col_name.lower() in key.lower() and vals:
-                    val = vals[-1]  # 最近一次采样
-                    setattr(snap, field_name, val)
+                    setattr(snap, field_name, vals[-1])
                     break
 
     return snap

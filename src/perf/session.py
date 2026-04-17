@@ -325,19 +325,32 @@ class PerfSessionManager:
 
     # ---------- analysis ----------
     def report(self, with_callstack: bool = False, callstack_top_n: int = 20) -> Dict[str, Any]:
+        from concurrent.futures import ThreadPoolExecutor
+
         meta = self._load_meta()
+
+        # 并行执行独立的分析任务
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            f_syslog = pool.submit(self._syslog_stats, meta)
+            f_timeline = pool.submit(self._timeline_stats)
+            f_metrics = pool.submit(self._trace_metrics, meta)
+            f_callstack = (
+                pool.submit(self.callstack, top_n=callstack_top_n)
+                if with_callstack else None
+            )
+
         report = {
             "tag": self.config.tag,
             "status": meta.get("status", "unknown"),
-            "syslog": self._syslog_stats(meta),
-            "timeline": self._timeline_stats(),
-            "metrics": self._trace_metrics(meta),
+            "syslog": f_syslog.result(),
+            "timeline": f_timeline.result(),
+            "metrics": f_metrics.result(),
             "baseline": {},
             "gate": {"checked": False, "passed": True, "reason": ""},
         }
 
-        if with_callstack:
-            report["callstack"] = self.callstack(top_n=callstack_top_n)
+        if f_callstack:
+            report["callstack"] = f_callstack.result()
 
         if self.config.baseline_tag:
             baseline = PerfSessionManager(str(self.repo), self.coordination_dir, PerfConfig(tag=self.config.baseline_tag))
@@ -356,6 +369,8 @@ class PerfSessionManager:
 
     # ---------- internals ----------
     def _trace_metrics(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+        from concurrent.futures import ThreadPoolExecutor
+
         trace_str = meta.get("xctrace", {}).get("trace", "")
         if not trace_str:
             return {"source": "none", "display_avg": None, "cpu_avg": None, "networking_avg": None}
@@ -366,8 +381,10 @@ class PerfSessionManager:
         power_xml = self.exports_dir / "SystemPowerLevel.xml"
         proc_xml = self.exports_dir / "ProcessSubsystemPowerImpact.xml"
 
-        self._export_schema(trace_file, "SystemPowerLevel", power_xml)
-        self._export_schema(trace_file, "ProcessSubsystemPowerImpact", proc_xml)
+        # 并行导出两个 schema
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pool.submit(self._export_schema, trace_file, "SystemPowerLevel", power_xml)
+            pool.submit(self._export_schema, trace_file, "ProcessSubsystemPowerImpact", proc_xml)
 
         display_vals = self._extract_column_values(power_xml, "Display")
         cpu_vals = self._extract_column_values(proc_xml, "CPU")
@@ -593,19 +610,27 @@ class PerfSessionManager:
         if not trace_files:
             return {"error": "未找到 Time Profiler trace (录制时需要 --templates time)", "hot_functions": [], "call_paths": []}
 
-        # 导出并解析
-        all_samples = []
-        for trace_file in trace_files:
-            # Try new Xcode 16+ schema first, then legacy
+        # 并行导出所有 trace 文件的 Time Profiler schema
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _export_and_parse(trace_file: Path) -> list:
             xml_path = self.exports_dir / f"time_profile_{trace_file.stem}.xml"
             self._export_schema(trace_file, "time-profile", xml_path)
             if not xml_path.exists() or xml_path.stat().st_size < 100:
                 xml_path = self.exports_dir / f"TimeProfiler_{trace_file.stem}.xml"
                 self._export_schema(trace_file, "TimeProfiler", xml_path)
             if not xml_path.exists():
-                continue
-            samples = self._parse_timeprofiler_xml(xml_path)
-            all_samples.extend(samples)
+                return []
+            return parse_timeprofiler_xml(xml_path)
+
+        all_samples = []
+        with ThreadPoolExecutor(max_workers=min(len(trace_files), 4)) as pool:
+            futures = [pool.submit(_export_and_parse, tf) for tf in trace_files]
+            for f in futures:
+                try:
+                    all_samples.extend(f.result())
+                except Exception:
+                    pass
 
         if not all_samples:
             return {"error": "TimeProfiler XML 中无采样数据", "hot_functions": [], "call_paths": [], "total_samples": 0}
