@@ -885,6 +885,9 @@ async def cmd_perf_callstack(args):
         top_n=args.top,
         min_weight=args.min_weight,
         flatten=not args.no_flatten,
+        full_stack=getattr(args, "full_stack", False),
+        time_from=getattr(args, "time_from", 0) or 0,
+        time_to=getattr(args, "time_to", 0) or 0,
     )
 
     if getattr(args, "json", False):
@@ -1392,6 +1395,9 @@ def main():
     perf_cs.add_argument("--min-weight", type=float, default=0.5, help="最小权重百分比")
     perf_cs.add_argument("--max-depth", type=int, default=8, help="调用路径最大显示深度")
     perf_cs.add_argument("--no-flatten", action="store_true", help="不聚合函数(保留完整路径)")
+    perf_cs.add_argument("--full-stack", action="store_true", help="保留完整调用链（含所有 frame）")
+    perf_cs.add_argument("--from", dest="time_from", type=float, default=0, help="时间切片起点（秒）")
+    perf_cs.add_argument("--to", dest="time_to", type=float, default=0, help="时间切片终点（秒）")
     perf_cs.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     # ── perf templates (模板管理) ──

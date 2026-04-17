@@ -589,6 +589,9 @@ class PerfSessionManager:
         top_n: int = 20,
         min_weight: float = 0.5,
         flatten: bool = True,
+        full_stack: bool = False,
+        time_from: float = 0,
+        time_to: float = 0,
     ) -> Dict[str, Any]:
         """
         解析 Time Profiler 调用栈，返回热点函数排名。
@@ -597,6 +600,9 @@ class PerfSessionManager:
             top_n:       返回前 N 个热点
             min_weight:  最小权重百分比 (低于此值忽略)
             flatten:     True=按函数聚合(火焰图风格), False=保留完整调用路径
+            full_stack:  True=保留完整调用链, False=只取叶子函数
+            time_from:   时间切片起点（秒，0=不限）
+            time_to:     时间切片终点（秒，0=不限）
 
         Returns:
             dict 包含 hot_functions / call_paths / summary
@@ -613,6 +619,10 @@ class PerfSessionManager:
         # 并行导出所有 trace 文件的 Time Profiler schema
         from concurrent.futures import ThreadPoolExecutor
 
+        t_range = None
+        if time_from > 0 or time_to > 0:
+            t_range = (time_from, time_to if time_to > 0 else float("inf"))
+
         def _export_and_parse(trace_file: Path) -> list:
             xml_path = self.exports_dir / f"time_profile_{trace_file.stem}.xml"
             self._export_schema(trace_file, "time-profile", xml_path)
@@ -621,7 +631,11 @@ class PerfSessionManager:
                 self._export_schema(trace_file, "TimeProfiler", xml_path)
             if not xml_path.exists():
                 return []
-            return parse_timeprofiler_xml(xml_path)
+            return parse_timeprofiler_xml(
+                xml_path,
+                keep_full_stack=full_stack,
+                time_range=t_range,
+            )
 
         all_samples = []
         with ThreadPoolExecutor(max_workers=min(len(trace_files), 4)) as pool:
@@ -737,13 +751,14 @@ class PerfSessionManager:
     # ── callstack 内部辅助 ──
 
     def _find_timeprofiler_traces(self, meta: Dict[str, Any]) -> List[Path]:
-        """查找 TimeProfiler 相关的 trace 文件"""
+        """查找含 Time Profiler 数据的 trace 文件（包括 systemtrace）。"""
         traces = []
+        _TIME_TEMPLATES = ("time", "time profiler", "systrace", "systemtrace", "system trace")
 
         # 单模板场景
         tpl_name = meta.get("xctrace", {}).get("template", "")
         trace_str = meta.get("xctrace", {}).get("trace", "")
-        if tpl_name.lower() in ("time", "time profiler") and trace_str:
+        if tpl_name.lower() in _TIME_TEMPLATES and trace_str:
             p = Path(trace_str)
             if p.exists():
                 traces.append(p)
@@ -752,16 +767,17 @@ class PerfSessionManager:
         for entry in meta.get("xctrace_multi", []):
             tpl = entry.get("template", "")
             trace_str = entry.get("trace", "")
-            if tpl.lower() in ("time", "time profiler") and trace_str:
+            if tpl.lower() in _TIME_TEMPLATES and trace_str:
                 p = Path(trace_str)
                 if p.exists():
                     traces.append(p)
 
-        # 兜底: 在 traces_dir 中搜索含 time_profiler 的文件
+        # 兜底: 在 traces_dir 中搜索含 time 或 systrace 的文件
         if not traces and self.traces_dir.exists():
-            for f in self.traces_dir.glob("*time*.trace"):
-                if f not in traces:
-                    traces.append(f)
+            for pattern in ("*time*.trace", "*systrace*.trace"):
+                for f in self.traces_dir.glob(pattern):
+                    if f not in traces:
+                        traces.append(f)
 
         return traces
 

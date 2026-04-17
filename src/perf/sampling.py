@@ -66,7 +66,11 @@ def extract_mnemonic_value(
     return default
 
 
-def parse_timeprofiler_xml(xml_path: Path) -> List[Tuple[str, float]]:
+def parse_timeprofiler_xml(
+    xml_path: Path,
+    keep_full_stack: bool = False,
+    time_range: Optional[Tuple[float, float]] = None,
+) -> List[Any]:
     """
     解析 xctrace export 的 Time Profiler XML。
 
@@ -74,16 +78,32 @@ def parse_timeprofiler_xml(xml_path: Path) -> List[Tuple[str, float]]:
     - Xcode 16+: schema="time-profile", 含 <backtrace><frame name="...">
     - Legacy: schema="TimeProfiler", 含 <symbol-name>/<sample-count>
 
+    Args:
+        keep_full_stack: True 返回完整调用链 dict，False 返回 (leaf, weight) tuple
+        time_range: (from_sec, to_sec) 只保留此时间段内的采样
+
     Returns:
-        [(frame_string, weight), ...]
+        keep_full_stack=False: [(frame_string, weight), ...]
+        keep_full_stack=True:  [{"ts_offset_ms": float, "stack": [...], "weight": float}, ...]
     """
+    if not xml_path.exists():
+        return []
+
+    # 快速检测格式（只读前 2KB）
+    try:
+        with open(xml_path, "r", errors="replace") as f:
+            head = f.read(2048)
+    except Exception:
+        return []
+
+    if "<backtrace" in head or "<tagged-backtrace" in head:
+        return _parse_time_profile_iterparse(xml_path, keep_full_stack, time_range)
+
+    # Legacy 格式回退到正则（文件通常很小）
     try:
         text = xml_path.read_text(errors="replace")
     except Exception:
         return []
-
-    if "<backtrace" in text:
-        return _parse_time_profile_format(text)
     return _parse_legacy_timeprofiler_format(text)
 
 
@@ -103,100 +123,151 @@ def _parse_weight_ms(fmt_str: str) -> float:
         return 1.0
 
 
-def _parse_time_profile_format(text: str) -> List[Tuple[str, float]]:
-    """Parse Xcode 16+ time-profile schema with backtrace frames."""
-    # Pass 1: build id → value maps
-    # frame id → name
-    frame_map: Dict[str, str] = {}
-    for m in re.finditer(r'<frame\s+id="(\d+)"\s+name="([^"]*)"', text):
-        frame_map[m.group(1)] = m.group(2)
+def _parse_sample_time_sec(fmt_str: str) -> float:
+    """Parse sample-time fmt like '00:05.123.456' → 5.123 seconds."""
+    try:
+        parts = fmt_str.split(":")
+        if len(parts) == 2:
+            mins = int(parts[0])
+            sec_parts = parts[1].split(".")
+            secs = int(sec_parts[0])
+            ms = int(sec_parts[1]) if len(sec_parts) > 1 else 0
+            return mins * 60 + secs + ms / 1000.0
+        return float(fmt_str)
+    except (ValueError, IndexError):
+        return 0.0
 
-    # weight id → ms
-    weight_map: Dict[str, float] = {}
-    for m in re.finditer(r'<weight\s+id="(\d+)"\s+fmt="([^"]*)"', text):
-        weight_map[m.group(1)] = _parse_weight_ms(m.group(2))
 
-    # tagged-backtrace id → list of frame names (ordered)
-    bt_map: Dict[str, List[str]] = {}
-    bt_pat = re.compile(
-        r'<tagged-backtrace\s+id="(\d+)"[^>]*>(.*?)</tagged-backtrace>',
-        re.S,
+def _is_symbolicated(name: str) -> bool:
+    """判断 frame name 是否已符号化。"""
+    return bool(
+        name
+        and not name.startswith("0x")
+        and name != "?"
+        and not name.startswith("<")
     )
-    frame_inline_pat = re.compile(r'<frame\s+id="(\d+)"\s+name="([^"]*)"')
-    frame_ref_pat = re.compile(r'<frame\s+ref="(\d+)"')
 
-    for bt_m in bt_pat.finditer(text):
-        bt_id = bt_m.group(1)
-        bt_body = bt_m.group(2)
-        frames: List[str] = []
-        # Parse frames in document order (match both inline and ref)
-        pos = 0
-        while pos < len(bt_body):
-            inline = frame_inline_pat.search(bt_body, pos)
-            ref = frame_ref_pat.search(bt_body, pos)
-            # Pick whichever comes first
-            if inline and (not ref or inline.start() <= ref.start()):
-                frames.append(inline.group(2))
-                pos = inline.end()
-            elif ref:
-                name = frame_map.get(ref.group(1), "")
-                if name:
-                    frames.append(name)
-                pos = ref.end()
-            else:
-                break
-        bt_map[bt_id] = frames
 
-    # Pass 2: iterate rows → (symbol, weight)
-    row_pat = re.compile(r"<row>(.*?)</row>", re.S)
-    samples: List[Tuple[str, float]] = []
+def _parse_time_profile_iterparse(
+    xml_path: Path,
+    keep_full_stack: bool = False,
+    time_range: Optional[Tuple[float, float]] = None,
+) -> List[Any]:
+    """
+    单遍 iterparse 解析 Xcode 16+ time-profile XML。
+    内存恒定（每行处理后 clear）。
+    """
+    from xml.etree.ElementTree import iterparse
 
-    for row_m in row_pat.finditer(text):
-        row_text = row_m.group(1)
+    # id → value 映射（渐进构建）
+    frame_map: Dict[str, str] = {}    # frame id → name
+    weight_map: Dict[str, float] = {} # weight id → ms
+    bt_map: Dict[str, List[str]] = {} # tagged-backtrace id → [frame names]
 
-        # Resolve weight
-        wt_inline = re.search(r'<weight\s+id="(\d+)"', row_text)
-        wt_ref = re.search(r'<weight\s+ref="(\d+)"', row_text)
-        if wt_inline:
-            weight = weight_map.get(wt_inline.group(1), 1.0)
-        elif wt_ref:
-            weight = weight_map.get(wt_ref.group(1), 1.0)
-        else:
-            weight = 1.0
+    samples: List[Any] = []
+    # 当前 row 的临时状态
+    in_row = False
+    row_weight: float = 1.0
+    row_frames: List[str] = []
+    row_ts: float = 0.0
+    current_bt_id: Optional[str] = None
+    current_bt_frames: List[str] = []
+    in_backtrace = False
 
-        # Resolve backtrace frames
-        bt_inline = re.search(
-            r'<tagged-backtrace\s+id="(\d+)"', row_text,
-        )
-        bt_ref = re.search(
-            r'<tagged-backtrace\s+ref="(\d+)"', row_text,
-        )
-        if bt_inline:
-            frames = bt_map.get(bt_inline.group(1), [])
-        elif bt_ref:
-            frames = bt_map.get(bt_ref.group(1), [])
-        else:
-            continue
+    try:
+        for event, elem in iterparse(str(xml_path), events=("start", "end")):
+            tag = elem.tag
 
-        if not frames:
-            continue
+            if event == "start":
+                if tag == "row":
+                    in_row = True
+                    row_weight = 1.0
+                    row_frames = []
+                    row_ts = 0.0
+                elif tag == "tagged-backtrace" and in_row:
+                    bt_id = elem.get("id")
+                    bt_ref = elem.get("ref")
+                    if bt_ref and bt_ref in bt_map:
+                        row_frames = list(bt_map[bt_ref])
+                    elif bt_id:
+                        current_bt_id = bt_id
+                        current_bt_frames = []
+                        in_backtrace = True
+                elif tag == "backtrace":
+                    pass  # 进入 backtrace 容器
+                continue
 
-        # Find first symbolicated frame (skip bare addresses and XML artifacts)
-        symbol = None
-        for f in frames:
-            if (
-                f
-                and not f.startswith("0x")
-                and f != "?"
-                and not f.startswith("<")
-            ):
-                symbol = f
-                break
+            # event == "end"
+            if tag == "frame":
+                fid = elem.get("id")
+                fref = elem.get("ref")
+                name = elem.get("name", "")
+                if fid and name:
+                    frame_map[fid] = name
+                if fref:
+                    name = frame_map.get(fref, "")
+                if in_backtrace and name:
+                    current_bt_frames.append(name)
 
-        if not symbol:
-            continue
+            elif tag == "weight":
+                wid = elem.get("id")
+                wref = elem.get("ref")
+                fmt = elem.get("fmt", "")
+                if wid and fmt:
+                    weight_map[wid] = _parse_weight_ms(fmt)
+                if in_row:
+                    if wid:
+                        row_weight = weight_map.get(wid, 1.0)
+                    elif wref:
+                        row_weight = weight_map.get(wref, 1.0)
 
-        samples.append((symbol, weight))
+            elif tag == "sample-time":
+                if in_row:
+                    fmt = elem.get("fmt", "")
+                    if fmt:
+                        row_ts = _parse_sample_time_sec(fmt)
+
+            elif tag == "tagged-backtrace":
+                if in_backtrace and current_bt_id:
+                    bt_map[current_bt_id] = current_bt_frames
+                    if in_row and not row_frames:
+                        row_frames = list(current_bt_frames)
+                in_backtrace = False
+                current_bt_id = None
+
+            elif tag == "row":
+                in_row = False
+                if row_frames:
+                    # 时间段过滤
+                    if time_range:
+                        from_s, to_s = time_range
+                        if row_ts < from_s or row_ts > to_s:
+                            elem.clear()
+                            continue
+
+                    if keep_full_stack:
+                        # 过滤出符号化的 frames
+                        sym_frames = [f for f in row_frames if _is_symbolicated(f)]
+                        if sym_frames:
+                            samples.append({
+                                "ts_offset_s": round(row_ts, 3),
+                                "stack": sym_frames,
+                                "weight": row_weight,
+                            })
+                    else:
+                        # 只取叶子（第一个符号化 frame）
+                        symbol = None
+                        for f in row_frames:
+                            if _is_symbolicated(f):
+                                symbol = f
+                                break
+                        if symbol:
+                            samples.append((symbol, row_weight))
+
+                elem.clear()  # 释放内存
+
+    except Exception:
+        pass
 
     return samples
 
@@ -425,7 +496,7 @@ class SamplingProfilerSidecar:
     与主 xctrace 长录制通道并行，cycle trace 用完即删。
     """
 
-    MIN_INTERVAL = 5
+    MIN_INTERVAL = 3
     MAX_CONSECUTIVE_FAILURES = 3
 
     def __init__(
@@ -594,28 +665,120 @@ class SamplingProfilerSidecar:
     # ── internal ──
 
     def _cycle_loop(self):
-        consecutive_failures = 0
+        """Pipeline cycle loop: record 与上一轮 export+parse 重叠执行。"""
+        from concurrent.futures import ThreadPoolExecutor, Future
 
-        while not self._stop_event.is_set():
-            cycle_num = self._cycle_count + 1
-            try:
-                snapshot = self._run_one_cycle(cycle_num)
-                if snapshot:
-                    self._append_snapshot(snapshot)
-                    self._rotate_if_needed()
-                    consecutive_failures = 0
-                    self._cycle_count = cycle_num
+        consecutive_failures = 0
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="export")
+        pending_future: Optional[Future] = None
+
+        try:
+            while not self._stop_event.is_set():
+                cycle_num = self._cycle_count + 1
+
+                # Phase 1: record（阻塞，等 xctrace 完成）
+                trace_path = self._record_phase(cycle_num)
+
+                # 等上一轮 export 完成（如果有）
+                if pending_future:
+                    try:
+                        result = pending_future.result(timeout=30)
+                        if result:
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+                    except Exception as e:
+                        consecutive_failures += 1
+                        self._log_error(f"export future exception: {e}")
+
+                if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                    self._log_error(
+                        f"auto-stop: {consecutive_failures} consecutive failures"
+                    )
+                    break
+
+                # Phase 2: 提交本轮 export（非阻塞，后台执行）
+                if trace_path and not self._stop_event.is_set():
+                    pending_future = pool.submit(
+                        self._export_and_append, cycle_num, trace_path,
+                    )
                 else:
                     consecutive_failures += 1
-            except Exception as e:
-                consecutive_failures += 1
-                self._log_error(f"cycle {cycle_num} exception: {e}")
+                    pending_future = None
 
-            if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
-                self._log_error(
-                    f"auto-stop: {consecutive_failures} consecutive failures"
-                )
-                break
+                self._cycle_count = cycle_num
+
+            # 等最后一轮 export
+            if pending_future:
+                try:
+                    pending_future.result(timeout=30)
+                except Exception:
+                    pass
+        finally:
+            pool.shutdown(wait=False)
+
+    def _record_phase(self, cycle_num: int) -> Optional[Path]:
+        """只做 xctrace record，返回 trace_path 或 None。"""
+        if self._stop_event.is_set():
+            return None
+
+        trace_path = self._traces_tmp / f"cycle_{cycle_num}.trace"
+        tpl = BUILTIN_TEMPLATES["time"]
+        cmd = build_xctrace_record_cmd(
+            template=tpl,
+            device=self.device_udid,
+            attach=self.process,
+            duration_sec=self.interval_sec,
+            output_path=str(trace_path),
+        )
+
+        rc = self._record(cmd, cycle_num)
+        if rc is None or self._stop_event.is_set():
+            self._cleanup_path(trace_path)
+            return None
+
+        if not trace_path.exists():
+            self._log_error(f"cycle {cycle_num}: trace not found at {trace_path}")
+            return None
+
+        return trace_path
+
+    def _export_and_append(
+        self, cycle_num: int, trace_path: Path,
+    ) -> bool:
+        """后台线程：export → parse → aggregate → append JSONL → cleanup。"""
+        xml_path = self._exports_tmp / f"cycle_{cycle_num}.xml"
+        try:
+            export_xctrace_schema(trace_path, "time-profile", xml_path)
+
+            if not xml_path.exists() or xml_path.stat().st_size < 50:
+                self._log_error(f"cycle {cycle_num}: xml empty or missing")
+                return False
+
+            samples = parse_timeprofiler_xml(xml_path)
+            if not samples:
+                return False
+
+            top = aggregate_top_n(samples, self.top_n)
+            total = sum(w for _, w in samples)
+
+            snapshot = HotspotSnapshot(
+                ts=time.time(),
+                cycle=cycle_num,
+                duration_s=self.interval_sec,
+                sample_count=int(total),
+                top=top,
+            )
+            self._append_snapshot(snapshot)
+            self._rotate_if_needed()
+            return True
+
+        except Exception as e:
+            self._log_error(f"cycle {cycle_num}: export_and_append failed — {e}")
+            return False
+        finally:
+            self._cleanup_path(trace_path)
+            self._cleanup_path(xml_path)
 
     def _run_one_cycle(
         self, cycle_num: int,

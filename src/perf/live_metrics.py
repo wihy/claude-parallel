@@ -136,19 +136,91 @@ def _parse_exported_xml(xml_path: Path) -> Dict[str, List[float]]:
     解析 xctrace export 输出的 XML 文件，提取所有数值列。
     返回 {列名: [值列表]}
 
-    兼容两种 XML 格式:
-    - Legacy: <col name="Display"/>  +  <row><c>570</c></row>
-    - Xcode 16+: <col><mnemonic>display</mnemonic><name>Display</name></col>
-                 + <row><display id="1" fmt="570">570</display></row>
+    优先使用 iterparse 流式解析（内存恒定），fallback 到正则。
     """
     if not xml_path.exists():
         return {}
+
+    # 尝试 iterparse
+    try:
+        return _parse_xml_iterparse(xml_path)
+    except Exception:
+        pass
+
+    # Fallback: 正则解析
     try:
         text = xml_path.read_text(errors="replace")
     except Exception:
         return {}
 
-    # ── 提取列名 (两种格式) ──
+    return _parse_xml_regex(text)
+
+
+def _parse_xml_iterparse(xml_path: Path) -> Dict[str, List[float]]:
+    """iterparse 流式解析指标 XML。"""
+    from xml.etree.ElementTree import iterparse
+
+    columns: List[str] = []
+    result: Dict[str, List[float]] = {}
+    row_values: List[Optional[float]] = []
+    in_row = False
+    in_schema = False
+
+    for event, elem in iterparse(str(xml_path), events=("start", "end")):
+        tag = elem.tag
+
+        if event == "start":
+            if tag == "row":
+                in_row = True
+                row_values = []
+            elif tag in ("schema", "row-schema"):
+                in_schema = True
+            continue
+
+        # event == "end"
+        if tag == "name" and in_schema:
+            col_name = (elem.text or "").strip()
+            if col_name and col_name not in result:
+                columns.append(col_name)
+                result[col_name] = []
+
+        elif tag in ("schema", "row-schema"):
+            in_schema = False
+
+        elif tag == "col" and not columns:
+            # Format: <col name="Display"/>
+            col_name = elem.get("name", "")
+            if col_name and col_name not in result:
+                columns.append(col_name)
+                result[col_name] = []
+
+        elif in_row:
+            # 提取数值：优先 fmt 属性，否则 text
+            fmt = elem.get("fmt", "")
+            if fmt and columns:
+                try:
+                    val = _parse_fmt_number(fmt)
+                    row_values.append(val)
+                except (ValueError, IndexError):
+                    row_values.append(None)
+            elif tag == "c" and elem.text:
+                try:
+                    row_values.append(float(elem.text.strip()))
+                except (ValueError, TypeError):
+                    row_values.append(None)
+
+        if tag == "row":
+            in_row = False
+            for i, col_name in enumerate(columns):
+                if i < len(row_values) and row_values[i] is not None:
+                    result[col_name].append(row_values[i])
+            elem.clear()
+
+    return result
+
+
+def _parse_xml_regex(text: str) -> Dict[str, List[float]]:
+    """正则 fallback 解析。"""
     columns = []
     for m in _RE_COL_NAME_ATTR.finditer(text):
         columns.append(m.group(1))
@@ -158,12 +230,9 @@ def _parse_exported_xml(xml_path: Path) -> Dict[str, List[float]]:
     if not columns:
         return {}
 
-    # ── 提取行数据 (两种格式) ──
     result: Dict[str, List[float]] = {name: [] for name in columns}
     for row_m in _RE_ROW.finditer(text):
         row = row_m.group(1)
-
-        # Try Format 1 first
         cells = _RE_CELL.findall(row)
         if cells:
             for i, name in enumerate(columns):
@@ -173,7 +242,6 @@ def _parse_exported_xml(xml_path: Path) -> Dict[str, List[float]]:
                     except (ValueError, TypeError):
                         continue
         else:
-            # Format 2: extract fmt values from any tag with fmt attribute
             fmt_vals = _RE_FMT.findall(row)
             for i, name in enumerate(columns):
                 if i < len(fmt_vals):
