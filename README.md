@@ -55,6 +55,7 @@
 - **渐进降频容错** — xctrace export 连续失败时自动降频（3→5→10 次自停），避免 CPU 空转
 - **正则预编译** — 6 个高频正则编译为模块常量，减少解析开销
 - **读写锁保护** — `fcntl.LOCK_SH` / `LOCK_EX` 防止 JSONL 读写竞争
+- **并发分析** — `ThreadPoolExecutor` 并行 xctrace export/parse，报告生成 4 路并行，多 trace 调用栈并行解析
 
 ## 前置要求
 
