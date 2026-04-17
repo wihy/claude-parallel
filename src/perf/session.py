@@ -160,13 +160,16 @@ class PerfSessionManager:
                     meta["xctrace_multi"].append(entry)
 
         # Sampling Profiler 旁路
+        # iOS 设备同一时刻只允许一个 xctrace 录制，
+        # 因此 sampling 与主链路 xctrace 互斥。
         if self.config.sampling_enabled and self.config.device and self.config.attach:
+            main_has_xctrace = meta.get("xctrace", {}).get("enabled", False) or bool(meta.get("xctrace_multi"))
             main_has_time = self._main_has_timeprofiler(meta)
-            if main_has_time:
+            if main_has_xctrace:
                 meta.setdefault("errors", []).append(
-                    "sampling_skipped: main xctrace already includes Time Profiler"
+                    "sampling_skipped: iOS device allows only one xctrace session"
                 )
-                meta["sampling"] = {"enabled": False, "reason": "main_timeprofiler_conflict"}
+                meta["sampling"] = {"enabled": False, "reason": "xctrace_exclusive"}
             else:
                 try:
                     self.sampling_sidecar = SamplingProfilerSidecar(
