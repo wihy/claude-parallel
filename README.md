@@ -57,6 +57,13 @@
 - **读写锁保护** — `fcntl.LOCK_SH` / `LOCK_EX` 防止 JSONL 读写竞争
 - **并发分析** — `ThreadPoolExecutor` 并行 xctrace export/parse，报告生成 4 路并行，多 trace 调用栈并行解析
 
+### 性能与分析深度 (Phase 4.3)
+- **iterparse 流式解析** — XML 解析从正则 3 遍全文扫描改为 `xml.etree.ElementTree.iterparse` 单遍流式，内存恒定
+- **Pipeline 重叠采集** — record 与上一轮 export+parse 并行执行，cycle 延迟从 ~20s 降至 ~8s，MIN_INTERVAL 降至 3s
+- **完整调用树** — `perf callstack --full-stack` 保留全部 frame（而非仅叶子函数），可回溯调用链
+- **时间切片分析** — `perf callstack --from 60 --to 120` 只分析指定时间段的采样，定位"哪个时段的哪个方法导致高 CPU"
+- **systemtrace 自动识别** — systemtrace 模板含 time-profile schema，采集后直接可用 callstack 分析，无需单独跑 Time Profiler
+
 ## 前置要求
 
 - Python 3.9+
@@ -222,7 +229,7 @@ perf 子命令 (15 个):
   perf rules       列出/管理告警规则 (13 条内置)
   perf stream      实时 xctrace 指标流
   perf snapshot    导出指标快照
-  perf callstack   调用栈分析 (--top N)
+  perf callstack   调用栈分析 (--top N, --full-stack, --from/--to 时间切片)
   perf hotspots    运行时热点函数 (--follow, --aggregate, --last N)
   perf dashboard   全指标仪表盘 (时序表+汇总, --json/--csv)
   perf metrics     Per-process CPU/内存指标
