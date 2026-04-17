@@ -90,7 +90,31 @@ cpar perf start --repo ~/SoulApp --tag webview-opt-full \
   --sampling --metrics-source device --battery-interval 5
 ```
 
-### 3.3 纯功耗分析（Power Profiler）
+### 3.3 全指标仪表盘（systemtrace + 电池）
+
+```bash
+# systemtrace 一轮拿到：CPU 负载 + 温度状态 + 热点函数 + 电池
+cpar perf start --repo REPO --tag TAG \
+  --device UDID --attach PROCESS \
+  --templates systemtrace --duration 300 \
+  --battery-interval 5
+
+# 录制完成后查看 dashboard
+cpar perf stop --repo REPO --tag TAG
+cpar perf dashboard --repo REPO --tag TAG
+cpar perf dashboard --repo REPO --tag TAG --csv > metrics.csv
+```
+
+**SoulApp 示例**：
+```bash
+cpar perf start --repo ~/SoulApp --tag game-dashboard \
+  --device 00008120-00164C893AEB401E --attach Soul_New \
+  --templates systemtrace --duration 300 --battery-interval 5
+```
+
+> 注意：systemtrace 自带 time-profile schema，录制完成后可直接用 `cpar perf callstack` 分析热点函数。
+
+### 3.4 纯功耗分析（Power Profiler）
 
 ```bash
 cpar perf start --repo REPO --tag TAG \
@@ -103,7 +127,7 @@ cpar perf report --repo REPO --tag TAG
 
 **注意**：功耗模式与 sampling 互斥（iOS 只允许一个 xctrace），不要同时加 `--sampling`。
 
-### 3.4 调用栈分析（事后分析）
+### 3.5 调用栈分析（事后分析）
 
 ```bash
 # 需要先完成一次含 Time Profiler 模板的采集
@@ -115,7 +139,7 @@ cpar perf stop --repo REPO --tag TAG
 cpar perf callstack --repo REPO --tag TAG --top 20
 ```
 
-### 3.5 基线对比 + 性能门禁
+### 3.6 基线对比 + 性能门禁
 
 ```bash
 # 先录 baseline
@@ -128,13 +152,13 @@ cpar perf report --repo REPO --tag current \
   --baseline baseline --threshold-pct 10.0
 ```
 
-### 3.6 实时 Syslog 告警
+### 3.7 实时 Syslog 告警
 
 ```bash
 cpar perf live --device UDID --tag syslog-watch
 ```
 
-### 3.7 查看已有数据
+### 3.8 查看已有数据
 
 ```bash
 # 热点快照

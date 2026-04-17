@@ -45,6 +45,17 @@
 - **`hotspots --follow`** — tail -f 式实时追踪热点变化
 - **真机验证** — iPhone 14 Pro (iOS 26.3) 端到端验证通过，业务符号可见（SOAnimationBatchHandler 等）
 
+### Dashboard 全指标仪表盘 + 稳定性加固 (Phase 4.2)
+- **`perf dashboard`** — 统一时序表 + 汇总统计（avg/peak/min/jitter），支持 `--json` / `--csv` 导出
+- **systemtrace 真机适配** — 适配 Xcode 16+ 真实 schema（`system-load` / `device-thermal-state-intervals` / `time-profile`）
+- **温度状态采集** — 从 systemtrace 提取设备热状态（Nominal/Fair/Serious/Critical）
+- **电池始终采集** — BatteryPoller 不受 `metrics_source` 限制，与任何 xctrace 模板并行
+- **JSONL 原子轮转** — `fcntl.flock` 加锁 + 原子 rename，消除竞态写数据丢失
+- **PID 文件持久化** — `.sampling_daemon.pid` 防止崩溃后孤儿进程泄漏
+- **渐进降频容错** — xctrace export 连续失败时自动降频（3→5→10 次自停），避免 CPU 空转
+- **正则预编译** — 6 个高频正则编译为模块常量，减少解析开销
+- **读写锁保护** — `fcntl.LOCK_SH` / `LOCK_EX` 防止 JSONL 读写竞争
+
 ## 前置要求
 
 - Python 3.9+
@@ -200,7 +211,7 @@ clean     清理 worktree 和协调文件
 logs      查看任务日志
 chat      对话模式 (自然语言生成任务 YAML)
 
-perf 子命令 (14 个):
+perf 子命令 (15 个):
   perf start       启动采集 (--sampling, --metrics-source device|xctrace|auto)
   perf stop        停止采集
   perf tail        实时查看 syslog
@@ -212,6 +223,7 @@ perf 子命令 (14 个):
   perf snapshot    导出指标快照
   perf callstack   调用栈分析 (--top N)
   perf hotspots    运行时热点函数 (--follow, --aggregate, --last N)
+  perf dashboard   全指标仪表盘 (时序表+汇总, --json/--csv)
   perf metrics     Per-process CPU/内存指标
   perf battery     电池功耗趋势
   perf templates   Instruments 模板管理 (10 个内置)
