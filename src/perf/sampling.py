@@ -11,9 +11,12 @@ PerfSessionManager.callstack() 复用。
 
 import json
 import logging
+import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -450,9 +453,57 @@ class SamplingProfilerSidecar:
         self._cycle_count = 0
         self._current_proc: Optional[subprocess.Popen] = None
         self._proc_lock = threading.Lock()
+        # subprocess-mode state (for standalone cpar perf start)
+        self._daemon_proc: Optional[subprocess.Popen] = None
+        self._daemon_pid: int = 0
 
-    def start(self) -> bool:
-        """启动旁路后台线程。返回 True 表示成功。"""
+    def start(self, as_subprocess: bool = True) -> bool:
+        """
+        启动旁路采集。
+
+        Args:
+            as_subprocess: True=独立子进程（cpar perf start 场景），
+                          False=in-process 线程（Orchestrator 场景）。
+        """
+        if as_subprocess:
+            return self._start_subprocess()
+        return self._start_thread()
+
+    def _start_subprocess(self) -> bool:
+        """以独立子进程启动 sampling daemon，进程退出后仍运行。"""
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self._traces_tmp.mkdir(parents=True, exist_ok=True)
+        self._exports_tmp.mkdir(parents=True, exist_ok=True)
+
+        daemon_code = (
+            "import sys, signal; "
+            "from src.perf.sampling import SamplingProfilerSidecar; "
+            "from pathlib import Path; "
+            f"s=SamplingProfilerSidecar(Path({str(self.session_root)!r}),"
+            f"{self.device_udid!r},{self.process!r},"
+            f"interval_sec={self.interval_sec},"
+            f"top_n={self.top_n},retention={self.retention}); "
+            "signal.signal(signal.SIGTERM,"
+            "lambda *_:(s._stop_event.set(),s._kill_current_proc())); "
+            "s.logs_dir.mkdir(parents=True,exist_ok=True); "
+            "s._traces_tmp.mkdir(parents=True,exist_ok=True); "
+            "s._exports_tmp.mkdir(parents=True,exist_ok=True); "
+            "s._cycle_loop()"
+        )
+        cmd = [sys.executable, "-c", daemon_code]
+        log_f = open(self.stderr_file, "a", encoding="utf-8")
+        self._daemon_proc = subprocess.Popen(
+            cmd,
+            stdout=log_f,
+            stderr=log_f,
+            start_new_session=True,  # 脱离父进程
+        )
+        log_f.close()
+        self._daemon_pid = self._daemon_proc.pid
+        return True
+
+    def _start_thread(self) -> bool:
+        """以 in-process 线程启动（Orchestrator 长运行场景）。"""
         if self._thread and self._thread.is_alive():
             return True
 
@@ -471,11 +522,34 @@ class SamplingProfilerSidecar:
         return True
 
     def stop(self, timeout: float = 15.0) -> Dict[str, Any]:
-        """通知退出并等待收尾。"""
-        self._stop_event.set()
-        self._kill_current_proc()
+        """停止旁路采集（兼容子进程和线程两种模式）。"""
+        # 子进程模式
+        if self._daemon_pid:
+            try:
+                os.kill(self._daemon_pid, signal.SIGTERM)
+                # 等待退出
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    try:
+                        os.kill(self._daemon_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.3)
+                else:
+                    try:
+                        os.kill(self._daemon_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            self._daemon_pid = 0
 
+        # 线程模式
         if self._thread:
+            self._stop_event.set()
+            self._kill_current_proc()
             self._thread.join(timeout=timeout)
 
         shutil.rmtree(self._traces_tmp, ignore_errors=True)
@@ -487,6 +561,12 @@ class SamplingProfilerSidecar:
         }
 
     def is_alive(self) -> bool:
+        if self._daemon_pid:
+            try:
+                os.kill(self._daemon_pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
         return self._thread is not None and self._thread.is_alive()
 
     # ── internal ──
@@ -539,12 +619,18 @@ class SamplingProfilerSidecar:
             return None
 
         if not trace_path.exists():
+            self._log_error(f"cycle {cycle_num}: trace not found at {trace_path}")
             return None
 
         try:
             export_xctrace_schema(trace_path, "time-profile", xml_path)
         except Exception as e:
             self._log_error(f"cycle {cycle_num}: export failed — {e}")
+            self._cleanup_path(trace_path)
+            return None
+
+        if not xml_path.exists() or xml_path.stat().st_size < 50:
+            self._log_error(f"cycle {cycle_num}: xml empty or missing")
             self._cleanup_path(trace_path)
             return None
 
@@ -596,6 +682,10 @@ class SamplingProfilerSidecar:
                     )
                     return None
 
+            if proc.returncode != 0:
+                self._log_error(
+                    f"cycle {cycle_num}: xctrace exit={proc.returncode}"
+                )
             return proc.returncode
 
         except subprocess.TimeoutExpired:
@@ -671,3 +761,50 @@ class SamplingProfilerSidecar:
                 f.write(f"{time.time():.0f} {msg}\n")
         except Exception:
             pass
+
+
+# ── Subprocess daemon entry point ──
+
+
+def _run_daemon():
+    """当以 python -m src.perf.sampling 启动时，运行 cycle loop 直到 SIGTERM。"""
+    import argparse as _ap
+
+    p = _ap.ArgumentParser()
+    p.add_argument("--session-root", required=True)
+    p.add_argument("--device", required=True)
+    p.add_argument("--process", required=True)
+    p.add_argument("--interval", type=int, default=10)
+    p.add_argument("--top-n", type=int, default=10)
+    p.add_argument("--retention", type=int, default=30)
+    args = p.parse_args()
+
+    sidecar = SamplingProfilerSidecar(
+        session_root=Path(args.session_root),
+        device_udid=args.device,
+        process=args.process,
+        interval_sec=args.interval,
+        top_n=args.top_n,
+        retention=args.retention,
+    )
+
+    # SIGTERM → graceful shutdown
+    def _on_sigterm(signum, frame):
+        sidecar._stop_event.set()
+        sidecar._kill_current_proc()
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+    # Run cycle loop in-process (blocking)
+    sidecar.logs_dir.mkdir(parents=True, exist_ok=True)
+    sidecar._traces_tmp.mkdir(parents=True, exist_ok=True)
+    sidecar._exports_tmp.mkdir(parents=True, exist_ok=True)
+    sidecar._cycle_loop()
+
+    # Cleanup
+    shutil.rmtree(sidecar._traces_tmp, ignore_errors=True)
+    shutil.rmtree(sidecar._exports_tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    _run_daemon()

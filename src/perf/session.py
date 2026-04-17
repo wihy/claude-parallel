@@ -177,9 +177,10 @@ class PerfSessionManager:
                         top_n=self.config.sampling_top_n,
                         retention=self.config.sampling_retention,
                     )
-                    started = self.sampling_sidecar.start()
+                    started = self.sampling_sidecar.start(as_subprocess=True)
                     meta["sampling"] = {
                         "enabled": started,
+                        "pid": self.sampling_sidecar._daemon_pid,
                         "interval_sec": self.config.sampling_interval_sec,
                         "top_n": self.config.sampling_top_n,
                         "retention": self.config.sampling_retention,
@@ -200,10 +201,14 @@ class PerfSessionManager:
         if not meta:
             return {}
 
-        # 先停旁路
+        # 先停旁路 (in-process sidecar 或从 meta 恢复的 daemon PID)
+        sampling_pid = meta.get("sampling", {}).get("pid", 0)
         if self.sampling_sidecar:
             sampling_result = self.sampling_sidecar.stop()
             meta["sampling_result"] = sampling_result
+        elif sampling_pid:
+            self._kill_pid(sampling_pid)
+            meta["sampling_result"] = {"stopped_pid": sampling_pid}
 
         self._kill_pid(meta.get("syslog", {}).get("pid", 0))
         self._kill_pid(meta.get("xctrace", {}).get("pid", 0))

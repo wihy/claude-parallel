@@ -138,7 +138,7 @@ round1() {
     wait_cycles
 
     # Check 2: hotspots 输出
-    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --last 3 --json 2>&1 | grep '^\[' || echo "[]")
+    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --last 3 --json 2>&1 | python3 -c "import sys; t=sys.stdin.read(); i=t.find('['); print(t[i:] if i>=0 else '[]')" || echo "[]")
     SNAP_COUNT=$(echo "$HOTSPOTS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "0")
     check "hotspots 至少 1 个 cycle" "$([ "$SNAP_COUNT" -ge 1 ] 2>/dev/null && echo PASS || echo FAIL)"
 
@@ -203,7 +203,7 @@ round2() {
     check "Power trace 文件已生成" "$([ -n "$POWER_TRACE" ] && echo PASS || echo FAIL)"
 
     # hotspots 正常
-    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --last 1 --json 2>&1 | grep '^\[' || echo "[]")
+    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --last 1 --json 2>&1 | python3 -c "import sys; t=sys.stdin.read(); i=t.find('['); print(t[i:] if i>=0 else '[]')" || echo "[]")
     SNAP_COUNT=$(echo "$HOTSPOTS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "0")
     check "sampling hotspots 正常输出" "$([ "$SNAP_COUNT" -ge 1 ] 2>/dev/null && echo PASS || echo FAIL)"
 
@@ -280,7 +280,7 @@ round3() {
     echo ""
 
     # 检查业务符号
-    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --aggregate --json 2>&1 | grep '^\[' || echo "[]")
+    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --aggregate --json 2>&1 | python3 -c "import sys; t=sys.stdin.read(); i=t.find('['); print(t[i:] if i>=0 else '[]')" || echo "[]")
     HAS_BUSINESS=$(echo "$HOTSPOTS" | python3 -c "
 import sys, json
 try:
