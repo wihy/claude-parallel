@@ -513,8 +513,12 @@ class PerfSessionManager:
         # 导出并解析
         all_samples = []
         for trace_file in trace_files:
-            xml_path = self.exports_dir / f"TimeProfiler_{trace_file.stem}.xml"
-            self._export_schema(trace_file, "TimeProfiler", xml_path)
+            # Try new Xcode 16+ schema first, then legacy
+            xml_path = self.exports_dir / f"time_profile_{trace_file.stem}.xml"
+            self._export_schema(trace_file, "time-profile", xml_path)
+            if not xml_path.exists() or xml_path.stat().st_size < 100:
+                xml_path = self.exports_dir / f"TimeProfiler_{trace_file.stem}.xml"
+                self._export_schema(trace_file, "TimeProfiler", xml_path)
             if not xml_path.exists():
                 continue
             samples = self._parse_timeprofiler_xml(xml_path)

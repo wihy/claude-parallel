@@ -50,7 +50,7 @@ BUILTIN_TEMPLATES: Dict[str, InstrumentTemplate] = {
         name="Time Profiler",
         template_arg="Time Profiler",
         alias="time",
-        schemas=["TimeProfiler"],
+        schemas=["time-profile", "TimeProfiler"],
         description="CPU 时间分析: 函数调用热点",
     ),
     "network": InstrumentTemplate(

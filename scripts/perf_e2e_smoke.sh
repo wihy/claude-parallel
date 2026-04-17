@@ -34,16 +34,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Auto-detect device UDID if not provided
+# Auto-detect iOS device UDID (skip Mac, skip Simulators, skip Offline)
 if [[ -z "$DEVICE" ]]; then
     DEVICE=$(xcrun xctrace list devices 2>/dev/null \
-        | grep -v "^==" | grep -v "^$" | grep -v "Simulator" \
-        | head -1 | sed 's/.*(\([^)]*\)).*/\1/' || true)
+        | sed -n '/^== Devices ==/,/^== /p' \
+        | grep -i "iphone\|ipad" \
+        | head -1 \
+        | sed 's/.*(\([0-9A-Fa-f-]*\))$/\1/' || true)
     if [[ -z "$DEVICE" ]]; then
-        echo "ERROR: 未检测到 iOS 真机。请用 --device UDID 指定。"
+        echo "ERROR: 未检测到在线 iOS 真机。请用 --device UDID 指定。"
+        echo "  已连接设备:"
+        xcrun xctrace list devices 2>/dev/null | head -10
         exit 1
     fi
-    echo "Auto-detected device: $DEVICE"
+    echo "Auto-detected iOS device: $DEVICE"
 fi
 
 CPAR="python -m src.cli"
@@ -52,6 +56,33 @@ FAIL=0
 SKIP=0
 
 # ── Helpers ──
+
+# Extract JSON object from mixed output (banner + JSON)
+extract_json() {
+    python3 -c "
+import sys, json, re
+text = sys.stdin.read()
+# Find the first '{' and last '}' to extract JSON
+start = text.find('{')
+if start == -1:
+    print('{}')
+else:
+    # Find matching closing brace
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == '{': depth += 1
+        elif text[i] == '}': depth -= 1
+        if depth == 0:
+            try:
+                obj = json.loads(text[start:i+1])
+                print(json.dumps(obj))
+            except json.JSONDecodeError:
+                print('{}')
+            break
+    else:
+        print('{}')
+"
+}
 
 check() {
     local desc="$1"
@@ -93,11 +124,12 @@ round1() {
     cleanup_tag "$TAG"
 
     echo "  启动 sampling-only (无主 xctrace)..."
-    META=$($CPAR perf start --repo "$REPO_DIR" --tag "$TAG" \
+    RAW=$($CPAR perf start --repo "$REPO_DIR" --tag "$TAG" \
         --device "$DEVICE" --attach "$PROCESS" \
         --templates power \
         --sampling --sampling-interval 10 2>&1)
-    echo "$META" | head -5
+    META=$(echo "$RAW" | extract_json)
+    echo "  meta: $META" | head -3
 
     # Check 1: sampling.enabled
     SAMPLING_ENABLED=$(echo "$META" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sampling',{}).get('enabled', False))" 2>/dev/null || echo "False")
@@ -106,17 +138,19 @@ round1() {
     wait_cycles
 
     # Check 2: hotspots 输出
-    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --last 3 --json 2>&1)
+    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --last 3 --json 2>&1 | grep '^\[' || echo "[]")
     SNAP_COUNT=$(echo "$HOTSPOTS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "0")
     check "hotspots 至少 1 个 cycle" "$([ "$SNAP_COUNT" -ge 1 ] 2>/dev/null && echo PASS || echo FAIL)"
 
     # Check 3: 有符号名 (非纯地址)
     HAS_SYMBOLS=$(echo "$HOTSPOTS" | python3 -c "
 import sys, json
-d = json.load(sys.stdin)
-syms = [e['symbol'] for snap in d for e in snap.get('top',[])]
-has = any(not s.startswith('0x') for s in syms)
-print('yes' if has else 'no')
+try:
+    d = json.load(sys.stdin)
+    syms = [e['symbol'] for snap in d for e in snap.get('top',[])]
+    has = any(not s.startswith('0x') for s in syms)
+    print('yes' if has else 'no')
+except: print('no')
 " 2>/dev/null || echo "no")
     check "热点列表包含符号名 (非纯地址)" "$([ "$HAS_SYMBOLS" = "yes" ] && echo PASS || echo FAIL)"
 
@@ -152,10 +186,11 @@ round2() {
     cleanup_tag "$TAG"
 
     echo "  启动 Power + sampling..."
-    META=$($CPAR perf start --repo "$REPO_DIR" --tag "$TAG" \
+    RAW=$($CPAR perf start --repo "$REPO_DIR" --tag "$TAG" \
         --device "$DEVICE" --attach "$PROCESS" \
         --templates power \
         --sampling --sampling-interval 10 2>&1)
+    META=$(echo "$RAW" | extract_json)
 
     SAMPLING_ENABLED=$(echo "$META" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sampling',{}).get('enabled', False))" 2>/dev/null || echo "False")
     check "sampling.enabled == True (Power 不冲突)" "$([ "$SAMPLING_ENABLED" = "True" ] && echo PASS || echo FAIL)"
@@ -168,7 +203,7 @@ round2() {
     check "Power trace 文件已生成" "$([ -n "$POWER_TRACE" ] && echo PASS || echo FAIL)"
 
     # hotspots 正常
-    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --last 1 --json 2>&1)
+    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --last 1 --json 2>&1 | grep '^\[' || echo "[]")
     SNAP_COUNT=$(echo "$HOTSPOTS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "0")
     check "sampling hotspots 正常输出" "$([ "$SNAP_COUNT" -ge 1 ] 2>/dev/null && echo PASS || echo FAIL)"
 
@@ -188,10 +223,11 @@ round2b() {
     cleanup_tag "$TAG"
 
     echo "  启动 Time Profiler 主链路 + sampling..."
-    META=$($CPAR perf start --repo "$REPO_DIR" --tag "$TAG" \
+    RAW=$($CPAR perf start --repo "$REPO_DIR" --tag "$TAG" \
         --device "$DEVICE" --attach "$PROCESS" \
         --templates time \
         --sampling 2>&1)
+    META=$(echo "$RAW" | extract_json)
 
     SAMPLING_ENABLED=$(echo "$META" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sampling',{}).get('enabled', False))" 2>/dev/null || echo "True")
     check "sampling.enabled == False (冲突自动跳过)" "$([ "$SAMPLING_ENABLED" = "False" ] && echo PASS || echo FAIL)"
@@ -244,13 +280,15 @@ round3() {
     echo ""
 
     # 检查业务符号
-    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --aggregate --json 2>&1)
+    HOTSPOTS=$($CPAR perf hotspots --repo "$REPO_DIR" --tag "$TAG" --aggregate --json 2>&1 | grep '^\[' || echo "[]")
     HAS_BUSINESS=$(echo "$HOTSPOTS" | python3 -c "
 import sys, json
-d = json.load(sys.stdin)
-syms = [e['symbol'] for snap in d for e in snap.get('top',[])]
-has = any('SO' in s or 'Soul' in s or 'soul' in s.lower() for s in syms)
-print('yes' if has else 'no')
+try:
+    d = json.load(sys.stdin)
+    syms = [e['symbol'] for snap in d for e in snap.get('top',[])]
+    has = any('SO' in s or 'Soul' in s or 'soul' in s.lower() for s in syms)
+    print('yes' if has else 'no')
+except: print('no')
 " 2>/dev/null || echo "no")
     check "聚合 Top 中包含业务符号 (SO/Soul 前缀)" "$([ "$HAS_BUSINESS" = "yes" ] && echo PASS || echo FAIL)"
 

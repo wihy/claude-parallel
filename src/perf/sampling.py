@@ -65,18 +65,144 @@ def extract_mnemonic_value(
 
 def parse_timeprofiler_xml(xml_path: Path) -> List[Tuple[str, float]]:
     """
-    解析 xctrace export 的 TimeProfiler XML。
+    解析 xctrace export 的 Time Profiler XML。
+
+    自动检测两种格式:
+    - Xcode 16+: schema="time-profile", 含 <backtrace><frame name="...">
+    - Legacy: schema="TimeProfiler", 含 <symbol-name>/<sample-count>
 
     Returns:
         [(frame_string, weight), ...]
-        frame_string 格式: "caller → callee → leaf"
     """
     try:
         text = xml_path.read_text(errors="replace")
     except Exception:
         return []
 
-    col_names = [m.group(1) for m in re.finditer(r'<col><name>([^<]+)</name>', text)]
+    if "<backtrace" in text:
+        return _parse_time_profile_format(text)
+    return _parse_legacy_timeprofiler_format(text)
+
+
+def _parse_weight_ms(fmt_str: str) -> float:
+    """Parse weight fmt like '1.00 ms' / '500 µs' / '2.00 s' → ms."""
+    try:
+        parts = fmt_str.strip().split()
+        val = float(parts[0])
+        if len(parts) > 1:
+            unit = parts[1].lower()
+            if "µ" in unit or unit == "us":
+                val /= 1000.0
+            elif unit == "s":
+                val *= 1000.0
+        return val
+    except (ValueError, IndexError):
+        return 1.0
+
+
+def _parse_time_profile_format(text: str) -> List[Tuple[str, float]]:
+    """Parse Xcode 16+ time-profile schema with backtrace frames."""
+    # Pass 1: build id → value maps
+    # frame id → name
+    frame_map: Dict[str, str] = {}
+    for m in re.finditer(r'<frame\s+id="(\d+)"\s+name="([^"]*)"', text):
+        frame_map[m.group(1)] = m.group(2)
+
+    # weight id → ms
+    weight_map: Dict[str, float] = {}
+    for m in re.finditer(r'<weight\s+id="(\d+)"\s+fmt="([^"]*)"', text):
+        weight_map[m.group(1)] = _parse_weight_ms(m.group(2))
+
+    # tagged-backtrace id → list of frame names (ordered)
+    bt_map: Dict[str, List[str]] = {}
+    bt_pat = re.compile(
+        r'<tagged-backtrace\s+id="(\d+)"[^>]*>(.*?)</tagged-backtrace>',
+        re.S,
+    )
+    frame_inline_pat = re.compile(r'<frame\s+id="(\d+)"\s+name="([^"]*)"')
+    frame_ref_pat = re.compile(r'<frame\s+ref="(\d+)"')
+
+    for bt_m in bt_pat.finditer(text):
+        bt_id = bt_m.group(1)
+        bt_body = bt_m.group(2)
+        frames: List[str] = []
+        # Parse frames in document order (match both inline and ref)
+        pos = 0
+        while pos < len(bt_body):
+            inline = frame_inline_pat.search(bt_body, pos)
+            ref = frame_ref_pat.search(bt_body, pos)
+            # Pick whichever comes first
+            if inline and (not ref or inline.start() <= ref.start()):
+                frames.append(inline.group(2))
+                pos = inline.end()
+            elif ref:
+                name = frame_map.get(ref.group(1), "")
+                if name:
+                    frames.append(name)
+                pos = ref.end()
+            else:
+                break
+        bt_map[bt_id] = frames
+
+    # Pass 2: iterate rows → (symbol, weight)
+    row_pat = re.compile(r"<row>(.*?)</row>", re.S)
+    samples: List[Tuple[str, float]] = []
+
+    for row_m in row_pat.finditer(text):
+        row_text = row_m.group(1)
+
+        # Resolve weight
+        wt_inline = re.search(r'<weight\s+id="(\d+)"', row_text)
+        wt_ref = re.search(r'<weight\s+ref="(\d+)"', row_text)
+        if wt_inline:
+            weight = weight_map.get(wt_inline.group(1), 1.0)
+        elif wt_ref:
+            weight = weight_map.get(wt_ref.group(1), 1.0)
+        else:
+            weight = 1.0
+
+        # Resolve backtrace frames
+        bt_inline = re.search(
+            r'<tagged-backtrace\s+id="(\d+)"', row_text,
+        )
+        bt_ref = re.search(
+            r'<tagged-backtrace\s+ref="(\d+)"', row_text,
+        )
+        if bt_inline:
+            frames = bt_map.get(bt_inline.group(1), [])
+        elif bt_ref:
+            frames = bt_map.get(bt_ref.group(1), [])
+        else:
+            continue
+
+        if not frames:
+            continue
+
+        # Find first symbolicated frame (skip bare addresses and XML artifacts)
+        symbol = None
+        for f in frames:
+            if (
+                f
+                and not f.startswith("0x")
+                and f != "?"
+                and not f.startswith("<")
+            ):
+                symbol = f
+                break
+
+        if not symbol:
+            continue
+
+        samples.append((symbol, weight))
+
+    return samples
+
+
+def _parse_legacy_timeprofiler_format(text: str) -> List[Tuple[str, float]]:
+    """Parse legacy TimeProfiler schema with symbol-name/sample-count columns."""
+    col_names = [
+        m.group(1) for m in re.finditer(r"<col><name>([^<]+)</name>", text)
+    ]
     if not col_names:
         return []
 
@@ -102,7 +228,8 @@ def parse_timeprofiler_xml(xml_path: Path) -> List[Tuple[str, float]]:
         row_text = row_m.group(1)
 
         symbol = extract_mnemonic_value(
-            row_text, "symbol-name",
+            row_text,
+            "symbol-name",
             extract_mnemonic_value(row_text, "symbol", ""),
         )
         if not symbol:
@@ -119,9 +246,11 @@ def parse_timeprofiler_xml(xml_path: Path) -> List[Tuple[str, float]]:
         weight = 1.0
         if weight_idx != -1:
             w_str = extract_mnemonic_value(
-                row_text, "sample-count",
+                row_text,
+                "sample-count",
                 extract_mnemonic_value(
-                    row_text, "weight",
+                    row_text,
+                    "weight",
                     extract_mnemonic_value(row_text, "count", ""),
                 ),
             )
@@ -413,7 +542,7 @@ class SamplingProfilerSidecar:
             return None
 
         try:
-            export_xctrace_schema(trace_path, "TimeProfiler", xml_path)
+            export_xctrace_schema(trace_path, "time-profile", xml_path)
         except Exception as e:
             self._log_error(f"cycle {cycle_num}: export failed — {e}")
             self._cleanup_path(trace_path)
