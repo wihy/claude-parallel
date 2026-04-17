@@ -305,11 +305,21 @@ def read_hotspots_jsonl(
     last_n: int = 0,
     aggregate: bool = False,
 ) -> List[Dict[str, Any]]:
-    """读取 hotspots.jsonl 并返回快照列表。"""
+    """读取 hotspots.jsonl 并返回快照列表（加锁防止读写竞争）。"""
     if not hotspots_file.exists():
         return []
 
-    lines = hotspots_file.read_text(encoding="utf-8").strip().splitlines()
+    import fcntl
+
+    try:
+        with open(hotspots_file, "r", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)  # 共享读锁
+            try:
+                lines = f.read().strip().splitlines()
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception:
+        lines = hotspots_file.read_text(encoding="utf-8").strip().splitlines()
     snapshots = []
     for line in lines:
         try:
@@ -445,6 +455,7 @@ class SamplingProfilerSidecar:
         self.logs_dir = self.session_root / "logs"
         self.hotspots_file = self.logs_dir / "hotspots.jsonl"
         self.stderr_file = self.logs_dir / "sampling.stderr"
+        self._pid_file = self.session_root / ".sampling_daemon.pid"
         self._traces_tmp = self.session_root / "traces" / "_sampling_tmp"
         self._exports_tmp = self.session_root / "exports" / "_sampling_tmp"
 
@@ -475,6 +486,9 @@ class SamplingProfilerSidecar:
         self._traces_tmp.mkdir(parents=True, exist_ok=True)
         self._exports_tmp.mkdir(parents=True, exist_ok=True)
 
+        # 清理上次残留的孤儿进程
+        self._cleanup_stale_daemon()
+
         daemon_code = (
             "import sys, signal; "
             "from src.perf.sampling import SamplingProfilerSidecar; "
@@ -500,6 +514,10 @@ class SamplingProfilerSidecar:
         )
         log_f.close()
         self._daemon_pid = self._daemon_proc.pid
+
+        # 持久化 PID 到文件，防止崩溃后孤儿进程
+        self._pid_file.write_text(str(self._daemon_pid))
+
         return True
 
     def _start_thread(self) -> bool:
@@ -554,6 +572,10 @@ class SamplingProfilerSidecar:
 
         shutil.rmtree(self._traces_tmp, ignore_errors=True)
         shutil.rmtree(self._exports_tmp, ignore_errors=True)
+        try:
+            self._pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
         return {
             "cycles_completed": self._cycle_count,
@@ -674,13 +696,14 @@ class SamplingProfilerSidecar:
                 self._current_proc = None
 
             if stderr_bytes:
-                stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-                if "already recording" in stderr_text.lower():
+                stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+                if stderr_text:
+                    # 记录所有 stderr 内容
                     self._log_error(
-                        f"cycle {cycle_num}: xctrace conflict — "
-                        f"{stderr_text.strip()[:200]}"
+                        f"cycle {cycle_num}: stderr={stderr_text[:300]}"
                     )
-                    return None
+                    if "already recording" in stderr_text.lower():
+                        return None
 
             if proc.returncode != 0:
                 self._log_error(
@@ -708,9 +731,15 @@ class SamplingProfilerSidecar:
             ensure_ascii=False,
         )
         try:
+            import fcntl
+
             with open(self.hotspots_file, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    f.write(line + "\n")
+                    f.flush()
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
         except Exception as e:
             self._log_error(f"jsonl write failed: {e}")
 
@@ -718,16 +747,32 @@ class SamplingProfilerSidecar:
         if not self.hotspots_file.exists():
             return
         try:
-            lines = (
-                self.hotspots_file.read_text(encoding="utf-8")
-                .strip()
-                .splitlines()
-            )
-            if len(lines) > self.retention:
-                keep = lines[-self.retention :]
-                self.hotspots_file.write_text(
-                    "\n".join(keep) + "\n", encoding="utf-8",
-                )
+            import fcntl
+            import tempfile
+
+            with open(self.hotspots_file, "r+", encoding="utf-8") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    lines = f.read().strip().splitlines()
+                    if len(lines) > self.retention:
+                        keep = lines[-self.retention :]
+                        # 原子写：先写 tmp 再 rename
+                        tmp_fd, tmp_path = tempfile.mkstemp(
+                            dir=str(self.hotspots_file.parent),
+                            prefix=".hotspots.",
+                        )
+                        try:
+                            with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_f:
+                                tmp_f.write("\n".join(keep) + "\n")
+                            os.replace(tmp_path, self.hotspots_file)
+                        except Exception:
+                            try:
+                                os.unlink(tmp_path)
+                            except OSError:
+                                pass
+                            raise
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
         except Exception:
             pass
 
@@ -744,6 +789,30 @@ class SamplingProfilerSidecar:
                 proc.kill()
         except Exception:
             pass
+
+    def _cleanup_stale_daemon(self):
+        """启动前检查并清理上次残留的 daemon 进程。"""
+        if not self._pid_file.exists():
+            return
+        try:
+            old_pid = int(self._pid_file.read_text().strip())
+            os.kill(old_pid, 0)  # 检查进程是否存活
+            logger.warning(
+                "[sampling] killing stale daemon pid=%d", old_pid,
+            )
+            os.kill(old_pid, signal.SIGTERM)
+            time.sleep(1)
+            try:
+                os.kill(old_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        except (ProcessLookupError, ValueError):
+            pass
+        finally:
+            try:
+                self._pid_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _cleanup_path(self, path: Path):
         try:

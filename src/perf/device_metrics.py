@@ -59,18 +59,33 @@ class BatteryPoller:
             f"{self.device_udid!r}, {self.interval_sec}, "
             f"{str(self.output_file)!r})"
         ]
-        log_f = open(
-            str(self.output_file).replace(".jsonl", ".stderr"),
-            "a", encoding="utf-8",
-        ) if self.output_file else subprocess.DEVNULL
+        stderr_path = (
+            str(self.output_file).replace(".jsonl", ".stderr")
+            if self.output_file else None
+        )
+        stderr_f = (
+            open(stderr_path, "a", encoding="utf-8")
+            if stderr_path else subprocess.DEVNULL
+        )
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=log_f if log_f != subprocess.DEVNULL else log_f,
+            stderr=stderr_f,
             start_new_session=True,
         )
-        if hasattr(log_f, "close"):
-            log_f.close()
+        if hasattr(stderr_f, "close"):
+            stderr_f.close()
+
+        # 验证进程启动成功（等 1s 检查是否秒退）
+        time.sleep(1)
+        if proc.poll() is not None:
+            logger.warning(
+                "[battery] daemon exited immediately (rc=%d)",
+                proc.returncode,
+            )
+            self._daemon_pid = 0
+            return 0
+
         self._daemon_pid = proc.pid
         return proc.pid
 

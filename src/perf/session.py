@@ -223,8 +223,12 @@ class PerfSessionManager:
             main_has_xctrace = meta.get("xctrace", {}).get("enabled", False) or bool(meta.get("xctrace_multi"))
             main_has_time = self._main_has_timeprofiler(meta)
             if main_has_xctrace:
+                tpl = meta.get("xctrace", {}).get("template", "")
+                hint = ""
+                if tpl in ("systrace", "systemtrace", "System Trace"):
+                    hint = " (systemtrace already includes time-profile data)"
                 meta.setdefault("errors", []).append(
-                    "sampling_skipped: iOS device allows only one xctrace session"
+                    f"sampling_skipped: iOS device allows only one xctrace session{hint}"
                 )
                 meta["sampling"] = {"enabled": False, "reason": "xctrace_exclusive"}
             else:

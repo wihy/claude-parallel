@@ -104,6 +104,33 @@ SCHEMA_COLUMNS = {
 }
 
 
+# ── 预编译正则 ──
+_RE_COL_NAME_ATTR = re.compile(r'<col[^>]*name="([^"]+)"')
+_RE_COL_NAME_TAG = re.compile(r'<col>\s*(?:<mnemonic>[^<]*</mnemonic>\s*)?<name>([^<]+)</name>')
+_RE_ROW = re.compile(r"<row>(.*?)</row>", re.S)
+_RE_CELL = re.compile(r"<c[^>]*>(.*?)</c>", re.S)
+_RE_FMT = re.compile(r'fmt="([^"]*)"')
+
+
+def _parse_fmt_number(fmt_str: str) -> float:
+    """安全解析 fmt 字符串为数值。'570 mW' → 570, '-1.5 %' → -1.5, '1.00 ms' → 1.0"""
+    parts = fmt_str.strip().split()
+    if not parts:
+        raise ValueError("empty fmt")
+    # 取第一段，保留负号和小数点
+    token = parts[0]
+    # 移除非数字字符但保留开头的负号和小数点
+    cleaned = ""
+    for j, ch in enumerate(token):
+        if ch in "0123456789.":
+            cleaned += ch
+        elif ch == "-" and j == 0:
+            cleaned += ch
+    if not cleaned:
+        raise ValueError(f"no number in: {fmt_str}")
+    return float(cleaned)
+
+
 def _parse_exported_xml(xml_path: Path) -> Dict[str, List[float]]:
     """
     解析 xctrace export 输出的 XML 文件，提取所有数值列。
@@ -123,29 +150,21 @@ def _parse_exported_xml(xml_path: Path) -> Dict[str, List[float]]:
 
     # ── 提取列名 (两种格式) ──
     columns = []
-    # Format 1: <col name="Display"/>
-    for m in re.finditer(r'<col[^>]*name="([^"]+)"', text):
+    for m in _RE_COL_NAME_ATTR.finditer(text):
         columns.append(m.group(1))
-    # Format 2: <col><name>Display</name></col>
     if not columns:
-        for m in re.finditer(r'<col>\s*(?:<mnemonic>[^<]*</mnemonic>\s*)?<name>([^<]+)</name>', text):
+        for m in _RE_COL_NAME_TAG.finditer(text):
             columns.append(m.group(1))
     if not columns:
         return {}
 
     # ── 提取行数据 (两种格式) ──
-    row_pat = re.compile(r"<row>(.*?)</row>", re.S)
-    # Format 1: <c>value</c>
-    cell_pat = re.compile(r"<c[^>]*>(.*?)</c>", re.S)
-    # Format 2: <mnemonic id="N" fmt="display_value">raw</mnemonic>
-    fmt_pat = re.compile(r'fmt="([^"]*)"')
-
     result: Dict[str, List[float]] = {name: [] for name in columns}
-    for row_m in row_pat.finditer(text):
+    for row_m in _RE_ROW.finditer(text):
         row = row_m.group(1)
 
         # Try Format 1 first
-        cells = cell_pat.findall(row)
+        cells = _RE_CELL.findall(row)
         if cells:
             for i, name in enumerate(columns):
                 if i < len(cells):
@@ -155,13 +174,11 @@ def _parse_exported_xml(xml_path: Path) -> Dict[str, List[float]]:
                         continue
         else:
             # Format 2: extract fmt values from any tag with fmt attribute
-            fmt_vals = fmt_pat.findall(row)
+            fmt_vals = _RE_FMT.findall(row)
             for i, name in enumerate(columns):
                 if i < len(fmt_vals):
                     try:
-                        # Strip units: "570 mW" → 570, "45.2 %" → 45.2
-                        num_str = re.sub(r"[^\d.\-]", "", fmt_vals[i].split()[0])
-                        result[name].append(float(num_str))
+                        result[name].append(_parse_fmt_number(fmt_vals[i]))
                     except (ValueError, IndexError):
                         continue
     return result
@@ -177,19 +194,18 @@ def _parse_exported_xml_strings(xml_path: Path) -> Dict[str, List[str]]:
         return {}
 
     columns = []
-    for m in re.finditer(r'<col[^>]*name="([^"]+)"', text):
+    for m in _RE_COL_NAME_ATTR.finditer(text):
         columns.append(m.group(1))
     if not columns:
-        for m in re.finditer(r'<col>\s*(?:<mnemonic>[^<]*</mnemonic>\s*)?<name>([^<]+)</name>', text):
+        for m in _RE_COL_NAME_TAG.finditer(text):
             columns.append(m.group(1))
     if not columns:
         return {}
 
     result: Dict[str, List[str]] = {name: [] for name in columns}
-    fmt_pat = re.compile(r'fmt="([^"]*)"')
-    for row_m in re.finditer(r"<row>(.*?)</row>", text, re.S):
+    for row_m in _RE_ROW.finditer(text):
         row = row_m.group(1)
-        fmt_vals = fmt_pat.findall(row)
+        fmt_vals = _RE_FMT.findall(row)
         for i, name in enumerate(columns):
             if i < len(fmt_vals):
                 result[name].append(fmt_vals[i])
@@ -399,18 +415,25 @@ class LiveMetricsStreamer:
     def _stream_loop(self):
         """后台定期导出循环"""
         consecutive_errors = 0
+        current_interval = self.interval_sec
         while self._running.is_set():
             try:
                 self._tick()
                 consecutive_errors = 0
+                current_interval = self.interval_sec  # 恢复正常间隔
             except Exception as e:
                 consecutive_errors += 1
                 self._log_error(f"_tick 异常 (连续 {consecutive_errors} 次): {e!r}")
-                # 连续失败过多 — xctrace 可能已挂，放慢节奏避免占 CPU
-                if consecutive_errors >= 5:
-                    time.sleep(min(30.0, self.interval_sec * 2))
+                # 渐进降频：3 次后 2x，5 次后 4x，10 次后停止
+                if consecutive_errors >= 10:
+                    self._log_error("连续 10 次失败，停止指标流")
+                    break
+                elif consecutive_errors >= 5:
+                    current_interval = self.interval_sec * 4
+                elif consecutive_errors >= 3:
+                    current_interval = self.interval_sec * 2
             # 分段 sleep，以便快速响应 stop
-            deadline = time.time() + self.interval_sec
+            deadline = time.time() + current_interval
             while self._running.is_set() and time.time() < deadline:
                 time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
