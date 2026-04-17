@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
 from .config import PerfConfig
+from .device_metrics import BatteryPoller, ProcessMetricsStreamer
 from .sampling import (
     SamplingProfilerSidecar,
     export_xctrace_schema,
@@ -42,6 +43,8 @@ class PerfSessionManager:
         self.timeline_file = self.root / "timeline.json"
         self.report_file = self.root / "report.json"
         self.sampling_sidecar: Optional[SamplingProfilerSidecar] = None
+        self.battery_poller: Optional[BatteryPoller] = None
+        self.process_streamer: Optional[ProcessMetricsStreamer] = None
 
     # ---------- lifecycle ----------
     def start(self) -> Dict[str, Any]:
@@ -95,8 +98,59 @@ class PerfSessionManager:
             except Exception as e:
                 meta["errors"].append(f"syslog_start_failed: {e}")
 
-        # xctrace sidecar — 根据 templates 配置启动录制
-        if self.config.device and self.config.attach:
+        # ── 指标采集源决策 ──
+        use_device_metrics = False
+        if self.config.device:
+            src = self.config.metrics_source
+            if src == "device":
+                use_device_metrics = True
+            elif src == "auto" and self.config.sampling_enabled:
+                # auto + sampling → 优先 device 路径以避免 xctrace 互斥
+                use_device_metrics = True
+
+        if use_device_metrics:
+            # BatteryPoller (始终启动)
+            battery_jsonl = self.logs_dir / "battery.jsonl"
+            try:
+                self.battery_poller = BatteryPoller(
+                    device_udid=self.config.device,
+                    interval_sec=self.config.battery_interval_sec,
+                    output_file=battery_jsonl,
+                )
+                bp_pid = self.battery_poller.start()
+                meta["device_metrics"] = {
+                    "enabled": True,
+                    "source": "device",
+                    "battery_pid": bp_pid,
+                    "battery_jsonl": str(battery_jsonl),
+                }
+            except Exception as e:
+                meta["errors"].append(f"battery_poller_failed: {e}")
+                meta["device_metrics"] = {"enabled": False, "reason": str(e)}
+
+            # ProcessMetricsStreamer (条件启动)
+            if self.config.attach:
+                proc_jsonl = self.logs_dir / "process_metrics.jsonl"
+                try:
+                    self.process_streamer = ProcessMetricsStreamer(
+                        device_udid=self.config.device,
+                        process_name=self.config.attach,
+                        interval_ms=self.config.metrics_interval_ms,
+                        output_file=proc_jsonl,
+                    )
+                    pm_pid = self.process_streamer.start()
+                    meta["device_metrics"]["process_pid"] = pm_pid
+                    meta["device_metrics"]["process_jsonl"] = str(proc_jsonl)
+                    if not pm_pid:
+                        meta["device_metrics"]["process_note"] = (
+                            "tunneld not available; run: "
+                            "sudo pymobiledevice3 remote tunneld"
+                        )
+                except Exception as e:
+                    meta["errors"].append(f"process_streamer_failed: {e}")
+
+        # xctrace sidecar — 根据 templates 配置启动录制 (跳过 device 模式)
+        if self.config.device and self.config.attach and not use_device_metrics:
             from .templates import TemplateLibrary, build_xctrace_record_cmd
             tpl_lib = TemplateLibrary()
             tpls = tpl_lib.resolve_multi(self.config.templates)
@@ -212,6 +266,17 @@ class PerfSessionManager:
         elif sampling_pid:
             self._kill_pid(sampling_pid)
             meta["sampling_result"] = {"stopped_pid": sampling_pid}
+
+        # 停 device metrics
+        dm = meta.get("device_metrics", {})
+        if self.battery_poller:
+            self.battery_poller.stop()
+        elif dm.get("battery_pid"):
+            self._kill_pid(dm["battery_pid"])
+        if self.process_streamer:
+            self.process_streamer.stop()
+        elif dm.get("process_pid"):
+            self._kill_pid(dm["process_pid"])
 
         self._kill_pid(meta.get("syslog", {}).get("pid", 0))
         self._kill_pid(meta.get("xctrace", {}).get("pid", 0))

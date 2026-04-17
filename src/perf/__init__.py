@@ -28,6 +28,14 @@ from .templates import (
     list_available_devices,
     list_available_templates,
 )
+from .device_metrics import (
+    BatteryPoller,
+    ProcessMetricsStreamer,
+    read_battery_jsonl,
+    read_process_metrics_jsonl,
+    format_battery_text,
+    format_process_metrics_text,
+)
 from .sampling import (
     SamplingProfilerSidecar,
     HotspotSnapshot,
@@ -59,6 +67,12 @@ __all__ = [
     "PerfIntegrator",
     "SamplingProfilerSidecar",
     "HotspotSnapshot",
+    "BatteryPoller",
+    "ProcessMetricsStreamer",
+    "read_battery_jsonl",
+    "read_process_metrics_jsonl",
+    "format_battery_text",
+    "format_process_metrics_text",
     "export_xctrace_schema",
     "parse_timeprofiler_xml",
     "aggregate_top_n",

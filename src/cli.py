@@ -115,6 +115,9 @@ def build_perf_config_from_args(args) -> PerfConfig:
         sampling_interval_sec=int(getattr(args, "perf_sampling_interval", 10) or 10),
         sampling_top_n=int(getattr(args, "perf_sampling_top", 10) or 10),
         sampling_retention=int(getattr(args, "perf_sampling_retention", 30) or 30),
+        metrics_source=getattr(args, "perf_metrics_source", "auto") or "auto",
+        metrics_interval_ms=int(getattr(args, "perf_metrics_interval", 1000) or 1000),
+        battery_interval_sec=int(getattr(args, "perf_battery_interval", 10) or 10),
     )
 
 
@@ -545,6 +548,9 @@ async def cmd_perf_start(args):
         sampling_interval_sec=int(getattr(args, "sampling_interval", 10) or 10),
         sampling_top_n=int(getattr(args, "sampling_top", 10) or 10),
         sampling_retention=int(getattr(args, "sampling_retention", 30) or 30),
+        metrics_source=getattr(args, "metrics_source", "auto") or "auto",
+        metrics_interval_ms=int(getattr(args, "metrics_interval", 1000) or 1000),
+        battery_interval_sec=int(getattr(args, "battery_interval", 10) or 10),
     )
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     meta = perf.start()
@@ -888,6 +894,50 @@ async def cmd_perf_callstack(args):
         print(text)
 
 
+async def cmd_perf_metrics(args):
+    """Per-process 指标查看"""
+    from src.perf.device_metrics import read_process_metrics_jsonl, format_process_metrics_text
+
+    repo = Path(args.repo).expanduser().resolve()
+    jsonl = repo / ".claude-parallel" / "perf" / args.tag / "logs" / "process_metrics.jsonl"
+
+    if not jsonl.exists():
+        print(f"  [perf] 未找到进程指标: {jsonl}")
+        print(f"  提示: 需要 --perf-metrics-source device 或 auto + tunneld")
+        return
+
+    last_n = getattr(args, "last", 0)
+    records = read_process_metrics_jsonl(jsonl, last_n=last_n)
+
+    if getattr(args, "json", False):
+        print(json.dumps(records, ensure_ascii=False, indent=2))
+    else:
+        text = format_process_metrics_text(records)
+        print(text)
+
+
+async def cmd_perf_battery(args):
+    """电池趋势查看"""
+    from src.perf.device_metrics import read_battery_jsonl, format_battery_text
+
+    repo = Path(args.repo).expanduser().resolve()
+    jsonl = repo / ".claude-parallel" / "perf" / args.tag / "logs" / "battery.jsonl"
+
+    if not jsonl.exists():
+        print(f"  [perf] 未找到电池数据: {jsonl}")
+        print(f"  提示: 需要 --perf-metrics-source device 或 auto")
+        return
+
+    last_n = getattr(args, "last", 0)
+    records = read_battery_jsonl(jsonl, last_n=last_n)
+
+    if getattr(args, "json", False):
+        print(json.dumps(records, ensure_ascii=False, indent=2))
+    else:
+        text = format_battery_text(records)
+        print(text)
+
+
 async def cmd_perf_hotspots(args):
     """运行时热点函数查看"""
     from src.perf.sampling import read_hotspots_jsonl, format_hotspots_text
@@ -1030,6 +1080,9 @@ def main():
     run_parser.add_argument("--perf-sampling-interval", type=int, default=10, help="旁路采样间隔(秒)")
     run_parser.add_argument("--perf-sampling-top", type=int, default=10, help="每 cycle Top N 热点")
     run_parser.add_argument("--perf-sampling-retention", type=int, default=30, help="保留最近 N cycle")
+    run_parser.add_argument("--perf-metrics-source", default="auto", choices=["auto", "device", "xctrace"], help="指标采集源")
+    run_parser.add_argument("--perf-metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
+    run_parser.add_argument("--perf-battery-interval", type=int, default=10, help="电池轮询间隔(s)")
 
     # ── resume ──
     resume_parser = subparsers.add_parser("resume", help="从中断处恢复执行")
@@ -1052,6 +1105,9 @@ def main():
     resume_parser.add_argument("--perf-sampling-interval", type=int, default=10, help="旁路采样间隔(秒)")
     resume_parser.add_argument("--perf-sampling-top", type=int, default=10, help="每 cycle Top N 热点")
     resume_parser.add_argument("--perf-sampling-retention", type=int, default=30, help="保留最近 N cycle")
+    resume_parser.add_argument("--perf-metrics-source", default="auto", choices=["auto", "device", "xctrace"], help="指标采集源")
+    resume_parser.add_argument("--perf-metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
+    resume_parser.add_argument("--perf-battery-interval", type=int, default=10, help="电池轮询间隔(s)")
 
     # ── plan ──
     plan_parser = subparsers.add_parser("plan", help="展示执行计划")
@@ -1116,6 +1172,9 @@ def main():
     perf_start.add_argument("--sampling-interval", type=int, default=10, help="旁路采样间隔(秒, 5-30)")
     perf_start.add_argument("--sampling-top", type=int, default=10, help="每 cycle 记录 Top N 热点")
     perf_start.add_argument("--sampling-retention", type=int, default=30, help="保留最近 N 个 cycle")
+    perf_start.add_argument("--metrics-source", default="auto", choices=["auto", "device", "xctrace"], help="指标采集源")
+    perf_start.add_argument("--metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
+    perf_start.add_argument("--battery-interval", type=int, default=10, help="电池轮询间隔(s)")
 
     perf_stop = perf_sub.add_parser("stop", help="停止 perf 采集")
     perf_stop.add_argument("--repo", required=True, help="项目仓库路径")
@@ -1161,6 +1220,20 @@ def main():
     perf_snap = perf_sub.add_parser("snapshot", help="立即导出指标快照")
     perf_snap.add_argument("trace", help="xctrace trace 文件路径")
     perf_snap.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    # ── perf metrics (per-process 指标) ──
+    perf_metrics = perf_sub.add_parser("metrics", help="Per-process CPU/内存指标")
+    perf_metrics.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_metrics.add_argument("--tag", default="perf", help="会话标签")
+    perf_metrics.add_argument("--last", type=int, default=10, help="最近 N 条")
+    perf_metrics.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    # ── perf battery (电池趋势) ──
+    perf_battery = perf_sub.add_parser("battery", help="电池功耗趋势")
+    perf_battery.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_battery.add_argument("--tag", default="perf", help="会话标签")
+    perf_battery.add_argument("--last", type=int, default=10, help="最近 N 条")
+    perf_battery.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     # ── perf hotspots (运行时热点) ──
     perf_hotspots = perf_sub.add_parser("hotspots", help="运行时热点函数查看")
@@ -1242,10 +1315,14 @@ def main():
             asyncio.run(cmd_perf_callstack(args))
         elif args.perf_cmd == "hotspots":
             asyncio.run(cmd_perf_hotspots(args))
+        elif args.perf_cmd == "metrics":
+            asyncio.run(cmd_perf_metrics(args))
+        elif args.perf_cmd == "battery":
+            asyncio.run(cmd_perf_battery(args))
         elif args.perf_cmd == "templates":
             asyncio.run(cmd_perf_templates(args))
         else:
-            print("  用法: cpar perf <start|stop|tail|report|devices|live|rules|stream|snapshot|callstack|hotspots|templates> ...")
+            print("  用法: cpar perf <start|stop|tail|report|devices|live|rules|stream|snapshot|callstack|hotspots|metrics|battery|templates> ...")
 
 
 if __name__ == "__main__":

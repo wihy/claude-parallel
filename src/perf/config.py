@@ -29,3 +29,8 @@ class PerfConfig:
     sampling_interval_sec: int = 10  # 5-30 合理区间
     sampling_top_n: int = 10
     sampling_retention: int = 30     # 保留最近 N 个 cycle
+
+    # 指标采集源 (device 路径不占 xctrace slot)
+    metrics_source: str = "auto"      # "auto" | "device" | "xctrace"
+    metrics_interval_ms: int = 1000   # pymobiledevice3 采样间隔
+    battery_interval_sec: int = 10    # 电池轮询间隔
