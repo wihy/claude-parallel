@@ -118,6 +118,7 @@ def build_perf_config_from_args(args) -> PerfConfig:
         metrics_source=getattr(args, "perf_metrics_source", "auto") or "auto",
         metrics_interval_ms=int(getattr(args, "perf_metrics_interval", 1000) or 1000),
         battery_interval_sec=int(getattr(args, "perf_battery_interval", 10) or 10),
+        attach_webcontent=bool(getattr(args, "perf_attach_webcontent", False)),
     )
 
 
@@ -551,6 +552,7 @@ async def cmd_perf_start(args):
         metrics_source=getattr(args, "metrics_source", "auto") or "auto",
         metrics_interval_ms=int(getattr(args, "metrics_interval", 1000) or 1000),
         battery_interval_sec=int(getattr(args, "battery_interval", 10) or 10),
+        attach_webcontent=getattr(args, "attach_webcontent", False),
     )
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     meta = perf.start()
@@ -1072,6 +1074,28 @@ async def cmd_perf_dashboard(args):
     print()
 
 
+async def cmd_perf_webcontent(args):
+    """WebContent 进程热点查看"""
+    from src.perf.webcontent import read_webcontent_hotspots, format_webcontent_hotspots
+
+    repo = Path(args.repo).expanduser().resolve()
+    hotspots_file = repo / ".claude-parallel" / "perf" / args.tag / "logs" / "webcontent_hotspots.jsonl"
+
+    if not hotspots_file.exists():
+        print(f"  [perf] 未找到 WebContent 热点: {hotspots_file}")
+        print(f"  提示: 启动时加 --attach-webcontent")
+        return
+
+    last_n = getattr(args, "last", 0)
+    snaps = read_webcontent_hotspots(hotspots_file, last_n=last_n)
+
+    if getattr(args, "json", False):
+        print(json.dumps(snaps, ensure_ascii=False, indent=2))
+    else:
+        text = format_webcontent_hotspots(snaps, top_n=args.top)
+        print(text)
+
+
 async def cmd_perf_hotspots(args):
     """运行时热点函数查看"""
     from src.perf.sampling import read_hotspots_jsonl, format_hotspots_text
@@ -1217,6 +1241,7 @@ def main():
     run_parser.add_argument("--perf-metrics-source", default="auto", choices=["auto", "device", "xctrace"], help="指标采集源")
     run_parser.add_argument("--perf-metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
     run_parser.add_argument("--perf-battery-interval", type=int, default=10, help="电池轮询间隔(s)")
+    run_parser.add_argument("--perf-attach-webcontent", action="store_true", help="采集 WebContent 进程")
 
     # ── resume ──
     resume_parser = subparsers.add_parser("resume", help="从中断处恢复执行")
@@ -1242,6 +1267,7 @@ def main():
     resume_parser.add_argument("--perf-metrics-source", default="auto", choices=["auto", "device", "xctrace"], help="指标采集源")
     resume_parser.add_argument("--perf-metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
     resume_parser.add_argument("--perf-battery-interval", type=int, default=10, help="电池轮询间隔(s)")
+    resume_parser.add_argument("--perf-attach-webcontent", action="store_true", help="采集 WebContent 进程")
 
     # ── plan ──
     plan_parser = subparsers.add_parser("plan", help="展示执行计划")
@@ -1306,6 +1332,7 @@ def main():
     perf_start.add_argument("--sampling-interval", type=int, default=10, help="旁路采样间隔(秒, 5-30)")
     perf_start.add_argument("--sampling-top", type=int, default=10, help="每 cycle 记录 Top N 热点")
     perf_start.add_argument("--sampling-retention", type=int, default=30, help="保留最近 N 个 cycle")
+    perf_start.add_argument("--attach-webcontent", action="store_true", help="自动发现并采集 WebContent 进程 (JS/WebKit)")
     perf_start.add_argument("--metrics-source", default="auto", choices=["auto", "device", "xctrace"], help="指标采集源")
     perf_start.add_argument("--metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
     perf_start.add_argument("--battery-interval", type=int, default=10, help="电池轮询间隔(s)")
@@ -1354,6 +1381,14 @@ def main():
     perf_snap = perf_sub.add_parser("snapshot", help="立即导出指标快照")
     perf_snap.add_argument("trace", help="xctrace trace 文件路径")
     perf_snap.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    # ── perf webcontent (WebContent 热点) ──
+    perf_wc = perf_sub.add_parser("webcontent", help="WebContent 进程 JS/WebKit 热点")
+    perf_wc.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_wc.add_argument("--tag", default="perf", help="会话标签")
+    perf_wc.add_argument("--top", type=int, default=15, help="Top N 热点")
+    perf_wc.add_argument("--last", type=int, default=0, help="最近 N 个 cycle")
+    perf_wc.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     # ── perf dashboard (全指标仪表盘) ──
     perf_dash = perf_sub.add_parser("dashboard", help="全指标统一仪表盘 (时序表+汇总)")
@@ -1460,6 +1495,8 @@ def main():
             asyncio.run(cmd_perf_callstack(args))
         elif args.perf_cmd == "hotspots":
             asyncio.run(cmd_perf_hotspots(args))
+        elif args.perf_cmd == "webcontent":
+            asyncio.run(cmd_perf_webcontent(args))
         elif args.perf_cmd == "dashboard":
             asyncio.run(cmd_perf_dashboard(args))
         elif args.perf_cmd == "metrics":

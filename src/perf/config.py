@@ -34,3 +34,6 @@ class PerfConfig:
     metrics_source: str = "auto"      # "auto" | "device" | "xctrace"
     metrics_interval_ms: int = 1000   # pymobiledevice3 采样间隔
     battery_interval_sec: int = 10    # 电池轮询间隔
+
+    # WebContent 进程采集
+    attach_webcontent: bool = False    # 自动发现并采集 WebContent 进程

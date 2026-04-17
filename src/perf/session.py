@@ -21,6 +21,7 @@ from typing import Optional, Dict, Any, List, Tuple
 
 from .config import PerfConfig
 from .device_metrics import BatteryPoller, ProcessMetricsStreamer
+from .webcontent import WebContentProfiler
 from .sampling import (
     SamplingProfilerSidecar,
     export_xctrace_schema,
@@ -45,6 +46,7 @@ class PerfSessionManager:
         self.sampling_sidecar: Optional[SamplingProfilerSidecar] = None
         self.battery_poller: Optional[BatteryPoller] = None
         self.process_streamer: Optional[ProcessMetricsStreamer] = None
+        self.webcontent_profiler: Optional[WebContentProfiler] = None
 
     # ---------- lifecycle ----------
     def start(self) -> Dict[str, Any]:
@@ -254,6 +256,28 @@ class PerfSessionManager:
                     meta.setdefault("errors", []).append(f"sampling_start_failed: {e}")
                     meta["sampling"] = {"enabled": False, "reason": str(e)}
 
+        # WebContent 采集（不占额外 xctrace slot — 只在无主 xctrace 时启动）
+        if self.config.attach_webcontent and self.config.device:
+            main_has_xctrace = meta.get("xctrace", {}).get("enabled", False) or bool(meta.get("xctrace_multi"))
+            sampling_on = meta.get("sampling", {}).get("enabled", False)
+            if main_has_xctrace or sampling_on:
+                meta["webcontent"] = {
+                    "enabled": False,
+                    "reason": "xctrace_exclusive — App sampling/xctrace 占用 slot，WebContent 需分轮采集",
+                }
+            else:
+                try:
+                    self.webcontent_profiler = WebContentProfiler(
+                        session_root=self.root,
+                        device_udid=self.config.device,
+                        interval_sec=self.config.sampling_interval_sec,
+                        top_n=self.config.sampling_top_n,
+                    )
+                    wc_result = self.webcontent_profiler.start()
+                    meta["webcontent"] = wc_result
+                except Exception as e:
+                    meta["webcontent"] = {"enabled": False, "reason": str(e)}
+
         self._save_meta(meta)
         if not self.timeline_file.exists():
             atomic_write_json(self.timeline_file, {"events": []})
@@ -287,6 +311,13 @@ class PerfSessionManager:
             self.process_streamer.stop()
         elif dm.get("process_pid"):
             self._kill_pid(dm["process_pid"])
+
+        # 停 webcontent profiler
+        wc = meta.get("webcontent", {})
+        if self.webcontent_profiler:
+            self.webcontent_profiler.stop()
+        elif wc.get("daemon_pid"):
+            self._kill_pid(wc["daemon_pid"])
 
         self._kill_pid(meta.get("syslog", {}).get("pid", 0))
         self._kill_pid(meta.get("xctrace", {}).get("pid", 0))

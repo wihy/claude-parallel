@@ -45,6 +45,12 @@ from .sampling import (
     read_hotspots_jsonl,
     format_hotspots_text,
 )
+from .webcontent import (
+    WebContentProfiler,
+    find_webcontent_pids,
+    read_webcontent_hotspots,
+    format_webcontent_hotspots,
+)
 from .integrator import PerfIntegrator
 
 __all__ = [
