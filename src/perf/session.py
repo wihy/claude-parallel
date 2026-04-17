@@ -20,6 +20,12 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
 from .config import PerfConfig
+from .sampling import (
+    SamplingProfilerSidecar,
+    export_xctrace_schema,
+    extract_mnemonic_value,
+    parse_timeprofiler_xml,
+)
 from ..fs_utils import atomic_write_json, safe_read_json
 
 
@@ -35,6 +41,7 @@ class PerfSessionManager:
         self.meta_file = self.root / "meta.json"
         self.timeline_file = self.root / "timeline.json"
         self.report_file = self.root / "report.json"
+        self.sampling_sidecar: Optional[SamplingProfilerSidecar] = None
 
     # ---------- lifecycle ----------
     def start(self) -> Dict[str, Any]:
@@ -152,6 +159,36 @@ class PerfSessionManager:
                         meta["errors"].append(f"xctrace_{tpl.alias}_start_failed: {e}")
                     meta["xctrace_multi"].append(entry)
 
+        # Sampling Profiler 旁路
+        if self.config.sampling_enabled and self.config.device and self.config.attach:
+            main_has_time = self._main_has_timeprofiler(meta)
+            if main_has_time:
+                meta.setdefault("errors", []).append(
+                    "sampling_skipped: main xctrace already includes Time Profiler"
+                )
+                meta["sampling"] = {"enabled": False, "reason": "main_timeprofiler_conflict"}
+            else:
+                try:
+                    self.sampling_sidecar = SamplingProfilerSidecar(
+                        session_root=self.root,
+                        device_udid=self.config.device,
+                        process=self.config.attach,
+                        interval_sec=self.config.sampling_interval_sec,
+                        top_n=self.config.sampling_top_n,
+                        retention=self.config.sampling_retention,
+                    )
+                    started = self.sampling_sidecar.start()
+                    meta["sampling"] = {
+                        "enabled": started,
+                        "interval_sec": self.config.sampling_interval_sec,
+                        "top_n": self.config.sampling_top_n,
+                        "retention": self.config.sampling_retention,
+                        "hotspots_file": str(self.sampling_sidecar.hotspots_file),
+                    }
+                except Exception as e:
+                    meta.setdefault("errors", []).append(f"sampling_start_failed: {e}")
+                    meta["sampling"] = {"enabled": False, "reason": str(e)}
+
         self._save_meta(meta)
         if not self.timeline_file.exists():
             atomic_write_json(self.timeline_file, {"events": []})
@@ -162,6 +199,11 @@ class PerfSessionManager:
         meta = self._load_meta()
         if not meta:
             return {}
+
+        # 先停旁路
+        if self.sampling_sidecar:
+            sampling_result = self.sampling_sidecar.stop()
+            meta["sampling_result"] = sampling_result
 
         self._kill_pid(meta.get("syslog", {}).get("pid", 0))
         self._kill_pid(meta.get("xctrace", {}).get("pid", 0))
@@ -259,14 +301,8 @@ class PerfSessionManager:
         }
 
     def _export_schema(self, trace_file: Path, schema: str, output: Path):
-        cmd = [
-            "xcrun", "xctrace", "export",
-            "--input", str(trace_file),
-            "--xpath", f'/trace-toc/run/data/table[@schema="{schema}"]',
-            "--output", str(output),
-        ]
         try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True)
+            export_xctrace_schema(trace_file, schema, output)
         except Exception:
             pass
 
@@ -435,6 +471,16 @@ class PerfSessionManager:
         if not arr:
             return None
         return round(sum(arr) / len(arr), 4)
+
+    def _main_has_timeprofiler(self, meta: Dict[str, Any]) -> bool:
+        """检查主链路 xctrace 是否已包含 Time Profiler 模板。"""
+        tpl = meta.get("xctrace", {}).get("template", "")
+        if tpl.lower() in ("time", "time profiler"):
+            return True
+        for entry in meta.get("xctrace_multi", []):
+            if entry.get("template", "").lower() in ("time", "time profiler"):
+                return True
+        return False
 
     # ── 调用栈分析 (Time Profiler) ──
 
@@ -608,111 +654,7 @@ class PerfSessionManager:
         return traces
 
     def _parse_timeprofiler_xml(self, xml_path: Path) -> List[Tuple[str, float]]:
-        """
-        解析 xctrace export 的 TimeProfiler XML。
-
-        返回 [(frame_string, weight), ...]
-        frame_string 格式: "caller → callee → leaf" (按调用层级)
-        weight: 采样权重 (通常=1，或由 Sample Count 列决定)
-        """
-        try:
-            text = xml_path.read_text(errors="replace")
-        except Exception:
-            return []
-
-        # 解析 schema 列名
-        col_names = []
-        for m in re.finditer(r'<col><name>([^<]+)</name>', text):
-            col_names.append(m.group(1))
-
-        if not col_names:
-            return []
-
-        # 定位关键列
-        col_idx = {name.lower(): i for i, name in enumerate(col_names)}
-        # TimeProfiler 常见列名: Thread, Process, Symbol Name, Sample Count, Weight, etc.
-        symbol_idx = col_idx.get("symbol name",
-                    col_idx.get("symbol",
-                    col_idx.get("name", -1)))
-        weight_idx = col_idx.get("sample count",
-                    col_idx.get("weight",
-                    col_idx.get("count", -1)))
-        thread_idx = col_idx.get("thread", -1)
-        process_idx = col_idx.get("process", -1)
-        binary_idx = col_idx.get("binary", -1)
-
-        if symbol_idx == -1:
-            return []
-
-        # 解析行
-        samples = []
-        row_pat = re.compile(r'<row>(.*?)</row>', re.S)
-
-        # 尝试用标签解析 (xctrace 用 mnemonic 作为 XML 标签名)
-        # 也用 fallback 的 <c> 标签解析
-        for row_m in row_pat.finditer(text):
-            row_text = row_m.group(1)
-
-            # 方法1: 按 mnemonic 标签解析
-            symbol = self._extract_mnemonic_value(row_text, "symbol-name",
-                       self._extract_mnemonic_value(row_text, "symbol", ""))
-            if not symbol:
-                symbol = self._extract_mnemonic_value(row_text, "name", "")
-
-            if not symbol:
-                # 方法2: 按 <c> 位置解析
-                cells = re.findall(r'<c[^>]*>(.*?)</c>', row_text, re.S)
-                if symbol_idx < len(cells):
-                    symbol = cells[symbol_idx].strip()
-                    # 去掉 fmt 属性等残留
-                    symbol = re.sub(r'<[^>]+/>', '', symbol).strip()
-
-            if not symbol or symbol == "?":
-                continue
-
-            # 提取权重
-            weight = 1.0
-            if weight_idx != -1:
-                w_str = self._extract_mnemonic_value(row_text, "sample-count",
-                         self._extract_mnemonic_value(row_text, "weight",
-                         self._extract_mnemonic_value(row_text, "count", "")))
-                if w_str:
-                    try:
-                        weight = float(re.sub(r'[^\d.]', '', w_str.split()[0]))
-                    except (ValueError, IndexError):
-                        weight = 1.0
-
-            # 提取线程/进程信息（用于区分上下文）
-            thread = ""
-            if thread_idx != -1:
-                thread = self._extract_mnemonic_value(row_text, "thread", "")
-            process = ""
-            if process_idx != -1:
-                process = self._extract_mnemonic_value(row_text, "process", "")
-
-            # 构建调用栈帧字符串
-            # 如果有调用者信息，构建路径；否则只记录当前函数
-            caller = self._extract_mnemonic_value(row_text, "caller", "")
-            frame = symbol
-            if caller:
-                frame = f"{caller} → {symbol}"
-
-            samples.append((frame, weight))
-
-        return samples
+        return parse_timeprofiler_xml(xml_path)
 
     def _extract_mnemonic_value(self, row_text: str, mnemonic: str, default: str = "") -> str:
-        """从 XML row 中提取指定 mnemonic 的 fmt 值"""
-        # 匹配 <mnemonic-tag id="N" fmt="显示值">原始值</mnemonic-tag>
-        # 或 <mnemonic-tag id="N" ref="M"/>
-        patterns = [
-            re.compile(rf'<{re.escape(mnemonic)}[^>]*fmt="([^"]*)"', re.S),
-            re.compile(rf'<{re.escape(mnemonic)}[^>]*>(.*?)</{re.escape(mnemonic)}>', re.S),
-        ]
-        for pat in patterns:
-            m = pat.search(row_text)
-            if m:
-                val = m.group(1).strip()
-                if val:
-                    return val
-        return default
+        return extract_mnemonic_value(row_text, mnemonic, default)

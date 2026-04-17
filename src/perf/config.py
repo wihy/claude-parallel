@@ -23,3 +23,9 @@ class PerfConfig:
     stream_interval: float = 10.0   # 指标导出间隔 (秒)
     stream_window: int = 30         # 滚动窗口快照数
     stream_jsonl: str = ""          # 时序快照 JSONL 输出路径
+
+    # Sampling Profiler 旁路
+    sampling_enabled: bool = False
+    sampling_interval_sec: int = 10  # 5-30 合理区间
+    sampling_top_n: int = 10
+    sampling_retention: int = 30     # 保留最近 N 个 cycle

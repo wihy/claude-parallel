@@ -17,6 +17,7 @@ from .config import PerfConfig
 from .session import PerfSessionManager
 from .live_log import LiveLogAnalyzer, LogRule, DEFAULT_RULES
 from .live_metrics import LiveMetricsStreamer, MetricSnapshot, DEFAULT_THRESHOLDS
+from .sampling import read_hotspots_jsonl, format_hotspots_text
 from .templates import TemplateLibrary
 
 
@@ -130,6 +131,16 @@ class PerfIntegrator:
         if self.config.device and self.config.attach:
             print(f"  [perf] xctrace 设备={self.config.device}, 附加={self.config.attach}")
 
+        # Sampling sidecar 状态
+        sampling = meta.get("sampling", {})
+        if sampling.get("enabled"):
+            print(
+                f"  [perf] Sampling Profiler 旁路已启动 "
+                f"(interval={sampling.get('interval_sec', '?')}s)"
+            )
+        elif sampling.get("reason"):
+            print(f"  [perf] Sampling 未启动: {sampling['reason']}")
+
         return meta
 
     def on_level_start(self, level_idx: int, task_ids: list) -> None:
@@ -193,6 +204,14 @@ class PerfIntegrator:
             tasks=task_ids,
         )
 
+        # 显示最新热点快照
+        if self.session.sampling_sidecar and self.session.sampling_sidecar.is_alive():
+            hotspots_file = self.session.sampling_sidecar.hotspots_file
+            snaps = read_hotspots_jsonl(hotspots_file, last_n=1)
+            if snaps:
+                text = format_hotspots_text(snaps, top_n=5)
+                print(f"  [perf] Level {level_idx} 热点:\n{text}")
+
     def on_run_end(self) -> Dict[str, Any]:
         """
         cpar run 结束时调用。
@@ -232,6 +251,17 @@ class PerfIntegrator:
             "alert_counts": live_summary.get("alert_counts", {}),
             "duration_sec": round(time.time() - self._run_start_ts, 1) if self._run_start_ts else 0,
         }
+
+        # 补充 sampling 摘要
+        if self.session.sampling_sidecar:
+            hotspots_file = self.session.sampling_sidecar.hotspots_file
+            agg = read_hotspots_jsonl(hotspots_file, aggregate=True)
+            report["sampling"] = {
+                "status": "completed",
+                "cycles": self.session.sampling_sidecar._cycle_count,
+                "hotspots_file": str(hotspots_file),
+                "aggregate": agg[0] if agg else {},
+            }
 
         # 补充 metrics streamer 摘要
         report["metrics_stream"] = {
@@ -337,6 +367,15 @@ class PerfIntegrator:
                     if fstats.get("avg") is not None:
                         jitter = fstats.get("jitter", 0)
                         print(f"    {field_name}: avg={fstats['avg']}, peak={fstats['peak']}, jitter={jitter}")
+
+        # Sampling 热点
+        sampling = report.get("sampling", {})
+        if sampling.get("status") == "completed":
+            print(f"  Sampling: {sampling.get('cycles', 0)} cycles")
+            agg = sampling.get("aggregate", {})
+            if agg.get("top"):
+                text = format_hotspots_text([agg], top_n=10)
+                print(text)
 
         # Baseline / Gate
         gate = report.get("gate", {})

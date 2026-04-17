@@ -111,6 +111,10 @@ def build_perf_config_from_args(args) -> PerfConfig:
         stream_interval=float(getattr(args, "perf_stream_interval", 10.0) or 10.0),
         stream_window=int(getattr(args, "perf_stream_window", 30) or 30),
         stream_jsonl=getattr(args, "perf_stream_jsonl", "") or "",
+        sampling_enabled=bool(getattr(args, "perf_sampling", False)),
+        sampling_interval_sec=int(getattr(args, "perf_sampling_interval", 10) or 10),
+        sampling_top_n=int(getattr(args, "perf_sampling_top", 10) or 10),
+        sampling_retention=int(getattr(args, "perf_sampling_retention", 30) or 30),
     )
 
 
@@ -537,6 +541,10 @@ async def cmd_perf_start(args):
         templates=args.templates,
         baseline_tag=args.baseline or "",
         threshold_pct=args.threshold_pct or 0.0,
+        sampling_enabled=getattr(args, "sampling", False),
+        sampling_interval_sec=int(getattr(args, "sampling_interval", 10) or 10),
+        sampling_top_n=int(getattr(args, "sampling_top", 10) or 10),
+        sampling_retention=int(getattr(args, "sampling_retention", 30) or 30),
     )
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     meta = perf.start()
@@ -880,6 +888,55 @@ async def cmd_perf_callstack(args):
         print(text)
 
 
+async def cmd_perf_hotspots(args):
+    """运行时热点函数查看"""
+    from src.perf.sampling import read_hotspots_jsonl, format_hotspots_text
+
+    repo = Path(args.repo).expanduser().resolve()
+    hotspots_file = repo / ".claude-parallel" / "perf" / args.tag / "logs" / "hotspots.jsonl"
+
+    if not hotspots_file.exists():
+        print(f"  [perf] 未找到热点数据: {hotspots_file}")
+        print(f"  提示: 启动时加 --sampling 开启旁路采集")
+        return
+
+    if getattr(args, "follow", False):
+        import select
+
+        last_pos = 0
+        try:
+            while True:
+                if hotspots_file.exists():
+                    text = hotspots_file.read_text(encoding="utf-8")
+                    if len(text) > last_pos:
+                        new_lines = text[last_pos:].strip().splitlines()
+                        last_pos = len(text)
+                        snaps = []
+                        for line in new_lines:
+                            try:
+                                snaps.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                continue
+                        if snaps:
+                            print("\033[2J\033[H", end="")
+                            output = format_hotspots_text(snaps, top_n=args.top)
+                            print(output)
+                time.sleep(2)
+        except KeyboardInterrupt:
+            print("\n  [perf] follow 已停止")
+        return
+
+    aggregate = getattr(args, "aggregate", False)
+    last_n = getattr(args, "last", 0)
+    snaps = read_hotspots_jsonl(hotspots_file, last_n=last_n, aggregate=aggregate)
+
+    if getattr(args, "json", False):
+        print(json.dumps(snaps, ensure_ascii=False, indent=2))
+    else:
+        text = format_hotspots_text(snaps, top_n=args.top)
+        print(text)
+
+
 async def cmd_perf_templates(args):
     """模板管理"""
     from src.perf import TemplateLibrary, BUILTIN_TEMPLATES
@@ -969,6 +1026,10 @@ def main():
     run_parser.add_argument("--perf-baseline", default="", help="baseline perf tag")
     run_parser.add_argument("--perf-threshold-pct", type=float, default=0.0, help="性能退化阈值(%%)")
     run_parser.add_argument("--strict-perf-gate", action="store_true", help="perf gate 失败时返回非0")
+    run_parser.add_argument("--perf-sampling", action="store_true", help="启用 Sampling Profiler 旁路")
+    run_parser.add_argument("--perf-sampling-interval", type=int, default=10, help="旁路采样间隔(秒)")
+    run_parser.add_argument("--perf-sampling-top", type=int, default=10, help="每 cycle Top N 热点")
+    run_parser.add_argument("--perf-sampling-retention", type=int, default=30, help="保留最近 N cycle")
 
     # ── resume ──
     resume_parser = subparsers.add_parser("resume", help="从中断处恢复执行")
@@ -987,6 +1048,10 @@ def main():
     resume_parser.add_argument("--perf-baseline", default="", help="baseline perf tag")
     resume_parser.add_argument("--perf-threshold-pct", type=float, default=0.0, help="性能退化阈值(%%)")
     resume_parser.add_argument("--strict-perf-gate", action="store_true", help="perf gate 失败时返回非0")
+    resume_parser.add_argument("--perf-sampling", action="store_true", help="启用 Sampling Profiler 旁路")
+    resume_parser.add_argument("--perf-sampling-interval", type=int, default=10, help="旁路采样间隔(秒)")
+    resume_parser.add_argument("--perf-sampling-top", type=int, default=10, help="每 cycle Top N 热点")
+    resume_parser.add_argument("--perf-sampling-retention", type=int, default=30, help="保留最近 N cycle")
 
     # ── plan ──
     plan_parser = subparsers.add_parser("plan", help="展示执行计划")
@@ -1047,6 +1112,10 @@ def main():
     perf_start.add_argument("--templates", default="power", help="模板列表")
     perf_start.add_argument("--baseline", default="", help="baseline tag")
     perf_start.add_argument("--threshold-pct", type=float, default=0.0, help="阈值(%%)")
+    perf_start.add_argument("--sampling", action="store_true", help="启用 Sampling Profiler 旁路")
+    perf_start.add_argument("--sampling-interval", type=int, default=10, help="旁路采样间隔(秒, 5-30)")
+    perf_start.add_argument("--sampling-top", type=int, default=10, help="每 cycle 记录 Top N 热点")
+    perf_start.add_argument("--sampling-retention", type=int, default=30, help="保留最近 N 个 cycle")
 
     perf_stop = perf_sub.add_parser("stop", help="停止 perf 采集")
     perf_stop.add_argument("--repo", required=True, help="项目仓库路径")
@@ -1092,6 +1161,16 @@ def main():
     perf_snap = perf_sub.add_parser("snapshot", help="立即导出指标快照")
     perf_snap.add_argument("trace", help="xctrace trace 文件路径")
     perf_snap.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    # ── perf hotspots (运行时热点) ──
+    perf_hotspots = perf_sub.add_parser("hotspots", help="运行时热点函数查看")
+    perf_hotspots.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_hotspots.add_argument("--tag", default="perf", help="会话标签")
+    perf_hotspots.add_argument("--follow", "-f", action="store_true", help="实时追踪 (tail -f 式)")
+    perf_hotspots.add_argument("--top", type=int, default=10, help="Top N 热点")
+    perf_hotspots.add_argument("--last", type=int, default=0, help="最近 N 个 cycle (0=全部)")
+    perf_hotspots.add_argument("--aggregate", action="store_true", help="全会话聚合")
+    perf_hotspots.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     # ── perf callstack (调用栈分析) ──
     perf_cs = perf_sub.add_parser("callstack", help="Time Profiler 调用栈分析")
@@ -1161,10 +1240,12 @@ def main():
             asyncio.run(cmd_perf_snapshot(args))
         elif args.perf_cmd == "callstack":
             asyncio.run(cmd_perf_callstack(args))
+        elif args.perf_cmd == "hotspots":
+            asyncio.run(cmd_perf_hotspots(args))
         elif args.perf_cmd == "templates":
             asyncio.run(cmd_perf_templates(args))
         else:
-            print("  用法: cpar perf <start|stop|tail|report|devices|live|rules|stream|snapshot|callstack|templates> ...")
+            print("  用法: cpar perf <start|stop|tail|report|devices|live|rules|stream|snapshot|callstack|hotspots|templates> ...")
 
 
 if __name__ == "__main__":

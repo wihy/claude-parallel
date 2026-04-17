@@ -28,6 +28,15 @@ from .templates import (
     list_available_devices,
     list_available_templates,
 )
+from .sampling import (
+    SamplingProfilerSidecar,
+    HotspotSnapshot,
+    export_xctrace_schema,
+    parse_timeprofiler_xml,
+    aggregate_top_n,
+    read_hotspots_jsonl,
+    format_hotspots_text,
+)
 from .integrator import PerfIntegrator
 
 __all__ = [
@@ -48,4 +57,11 @@ __all__ = [
     "list_available_devices",
     "list_available_templates",
     "PerfIntegrator",
+    "SamplingProfilerSidecar",
+    "HotspotSnapshot",
+    "export_xctrace_schema",
+    "parse_timeprofiler_xml",
+    "aggregate_top_n",
+    "read_hotspots_jsonl",
+    "format_hotspots_text",
 ]
