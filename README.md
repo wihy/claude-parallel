@@ -36,6 +36,15 @@
 - **Session 持久化管理** — 采集会话 save/load/list/delete，支持跨 session 基线对比
 - **Report 增强** — `--with-callstack` 一键含调用栈分析，`--callstack-top N` 控制热点数量
 
+### Sampling Profiler 旁路 + Device 指标 (Phase 4.1)
+- **运行时热点预览** — xctrace Time Profiler 10s 短周期循环采集，实时 Top-N 热点函数排行
+- **Xcode 16+ 兼容** — 自动检测 `time-profile` (新) / `TimeProfiler` (旧) 两种 XML 格式，id/ref 两遍扫描
+- **独立子进程 daemon** — sampling sidecar 以独立进程运行，主进程退出后持续采集
+- **Device 指标通道** — `ideviceinfo` 电池轮询 + `pymobiledevice3` per-process CPU%/内存，不占 xctrace slot
+- **xctrace 互斥解除** — `--metrics-source device` 模式下，电池 + sampling 完全并行，不再互斥
+- **`hotspots --follow`** — tail -f 式实时追踪热点变化
+- **真机验证** — iPhone 14 Pro (iOS 26.3) 端到端验证通过，业务符号可见（SOAnimationBatchHandler 等）
+
 ## 前置要求
 
 - Python 3.9+
@@ -48,6 +57,7 @@
 - Xcode Command Line Tools (`xcode-select --install`)
 - 已连接的 iOS 真机或模拟器
 - idevicesyslog (libimobiledevice，用于 syslog 采集)
+- pymobiledevice3 (可选，用于 per-process CPU%/内存采集，需 `sudo pymobiledevice3 remote tunneld`)
 
 ## 安装
 
@@ -130,45 +140,50 @@ python3 run.py resume tasks.yaml --merge
 cpar perf devices
 
 # 启动功耗采集 (attach 到目标进程)
-cpar perf start --device 00008120-00164C893AEB401E --attach Soul_New --templates power
+cpar perf start --repo . --device UDID --attach Soul_New --templates power
 
 # 实时查看 syslog 告警
-cpar perf live --device 00008120-00164C893AEB401E
-
-# 实时 xctrace 指标流
-cpar perf stream --device 00008120-00164C893AEB401E --tag power
-
-# 导出指标快照
-cpar perf snapshot --tag perf
+cpar perf live --device UDID
 
 # 停止采集并生成报告
-cpar perf stop --tag perf
-cpar perf report --tag perf
-
-# 带调用栈分析的报告
-cpar perf report --tag perf --with-callstack --callstack-top 20
-
-# 单独分析调用栈热点
-cpar perf callstack --tag perf --top 15
-
-# 基线对比 + 性能退化门禁
-cpar perf report --tag perf --baseline baseline_run --threshold-pct 10.0
-
-# 查看可用 Instruments 模板
-cpar perf templates
-
-# 管理告警规则
-cpar perf rules
+cpar perf stop --repo . --tag perf
+cpar perf report --repo . --tag perf --with-callstack
 ```
 
-也可以在执行任务时同步采集:
+### 8. Sampling Profiler 运行时热点
+
+```bash
+# 启动 sampling 旁路（10s/cycle 循环采集 Time Profiler）
+cpar perf start --repo . --tag hotspot \
+  --device UDID --attach Soul_New --sampling
+
+# 实时追踪热点函数（另一个终端）
+cpar perf hotspots --repo . --tag hotspot --follow
+
+# 全会话聚合 Top-N
+cpar perf stop --repo . --tag hotspot
+cpar perf hotspots --repo . --tag hotspot --aggregate
+```
+
+### 9. 热点 + 电池并行（推荐）
+
+```bash
+# device 模式：电池轮询 + sampling 并行，不占 xctrace slot
+cpar perf start --repo . --tag full \
+  --device UDID --attach Soul_New \
+  --sampling --metrics-source device --battery-interval 5
+
+# 同时查看
+cpar perf hotspots --repo . --tag full --follow
+cpar perf battery --repo . --tag full --last 10
+```
+
+### 10. 与并行执行框架集成
 
 ```bash
 python3 run.py run tasks.yaml --with-perf \
-  --perf-device 00008120-00164C893AEB401E \
-  --perf-attach Soul_New \
-  --perf-templates power,time \
-  --perf-duration 600
+  --perf-device UDID --perf-attach Soul_New \
+  --perf-sampling --perf-metrics-source auto
 ```
 
 ## 完整命令列表
@@ -185,17 +200,20 @@ clean     清理 worktree 和协调文件
 logs      查看任务日志
 chat      对话模式 (自然语言生成任务 YAML)
 
-perf 子命令:
-  perf start       启动 xctrace 采集会话 (--threshold-pct 退化阈值)
+perf 子命令 (14 个):
+  perf start       启动采集 (--sampling, --metrics-source device|xctrace|auto)
   perf stop        停止采集
   perf tail        实时查看 syslog
-  perf report      生成性能报告 (--with-callstack, --callstack-top N, --threshold-pct)
+  perf report      生成报告 (--with-callstack, --callstack-top N)
   perf devices     列出已连接设备
   perf live        实时 syslog 告警分析
   perf rules       列出/管理告警规则 (13 条内置)
   perf stream      实时 xctrace 指标流
   perf snapshot    导出指标快照
-  perf callstack   Time Profiler 调用栈分析 (--top N, --threshold-pct)
+  perf callstack   调用栈分析 (--top N)
+  perf hotspots    运行时热点函数 (--follow, --aggregate, --last N)
+  perf metrics     Per-process CPU/内存指标
+  perf battery     电池功耗趋势
   perf templates   Instruments 模板管理 (10 个内置)
 ```
 
@@ -216,13 +234,22 @@ claude-parallel/
 │   ├── reviewer.py             # 自动 Code Review
 │   ├── validator.py            # YAML 配置校验
 │   ├── context_extractor.py    # 多语言上下文提取
+│   ├── chat_input.py           # 多行富文本输入 (prompt_toolkit)
 │   └── perf/                   # 真机性能采集子系统
-│       ├── config.py           # PerfConfig 数据类
-│       ├── session.py          # xctrace 采集会话生命周期
+│       ├── config.py           # PerfConfig 数据类 (30 个配置字段)
+│       ├── session.py          # 采集会话生命周期 + metrics_source 决策
+│       ├── sampling.py         # Sampling Profiler 旁路 + XML 解析器
+│       ├── device_metrics.py   # BatteryPoller + ProcessMetricsStreamer
 │       ├── live_log.py         # 实时 syslog 流式告警分析
 │       ├── live_metrics.py     # 实时 xctrace 指标流 + 滚动窗口
 │       ├── templates.py        # Instruments 模板注册与管理
 │       └── integrator.py       # 与 Orchestrator 深度集成胶水
+├── scripts/
+│   └── perf_e2e_smoke.sh       # iOS 真机端到端冒烟验证 (4 轮)
+├── tests/
+│   ├── test_chat_input.py      # 输入模块测试
+│   ├── test_perf_sampling.py   # Sampling + 解析器测试 (29 cases)
+│   └── test_device_metrics.py  # Device 指标测试 (15 cases)
 ├── examples/
 │   ├── auth-system.yaml        # 4任务 DAG 示例
 │   ├── test-dag.yaml           # 端到端 DAG 测试
