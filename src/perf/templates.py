@@ -109,12 +109,14 @@ BUILTIN_TEMPLATES: Dict[str, InstrumentTemplate] = {
         template_arg="System Trace",
         alias="systrace",
         schemas=[
-            "SystemPowerLevel",
-            "CPUCore",
-            "ProcessMemory",
-            "CoreAnimationFPS",
+            "system-load",
+            "device-thermal-state-intervals",
+            "time-profile",
+            "cpu-state",
+            "context-switch",
+            "thread-state",
         ],
-        description="全系统追踪: 功耗+CPU+内存+FPS 综合",
+        description="全系统追踪: CPU 负载+温度状态+调用栈+线程状态 综合",
     ),
 }
 

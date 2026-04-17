@@ -98,6 +98,24 @@ class PerfSessionManager:
             except Exception as e:
                 meta["errors"].append(f"syslog_start_failed: {e}")
 
+        # ── BatteryPoller (始终启动，不占任何 slot) ──
+        if self.config.device and self.config.battery_interval_sec > 0:
+            battery_jsonl = self.logs_dir / "battery.jsonl"
+            try:
+                self.battery_poller = BatteryPoller(
+                    device_udid=self.config.device,
+                    interval_sec=self.config.battery_interval_sec,
+                    output_file=battery_jsonl,
+                )
+                bp_pid = self.battery_poller.start()
+                meta["battery"] = {
+                    "enabled": True,
+                    "pid": bp_pid,
+                    "jsonl": str(battery_jsonl),
+                }
+            except Exception as e:
+                meta["errors"].append(f"battery_poller_failed: {e}")
+
         # ── 指标采集源决策 ──
         use_device_metrics = False
         if self.config.device:
@@ -109,26 +127,7 @@ class PerfSessionManager:
                 use_device_metrics = True
 
         if use_device_metrics:
-            # BatteryPoller (始终启动)
-            battery_jsonl = self.logs_dir / "battery.jsonl"
-            try:
-                self.battery_poller = BatteryPoller(
-                    device_udid=self.config.device,
-                    interval_sec=self.config.battery_interval_sec,
-                    output_file=battery_jsonl,
-                )
-                bp_pid = self.battery_poller.start()
-                meta["device_metrics"] = {
-                    "enabled": True,
-                    "source": "device",
-                    "battery_pid": bp_pid,
-                    "battery_jsonl": str(battery_jsonl),
-                }
-            except Exception as e:
-                meta["errors"].append(f"battery_poller_failed: {e}")
-                meta["device_metrics"] = {"enabled": False, "reason": str(e)}
-
-            # ProcessMetricsStreamer (条件启动)
+            # ProcessMetricsStreamer (条件启动，需 tunneld)
             if self.config.attach:
                 proc_jsonl = self.logs_dir / "process_metrics.jsonl"
                 try:
@@ -139,8 +138,12 @@ class PerfSessionManager:
                         output_file=proc_jsonl,
                     )
                     pm_pid = self.process_streamer.start()
-                    meta["device_metrics"]["process_pid"] = pm_pid
-                    meta["device_metrics"]["process_jsonl"] = str(proc_jsonl)
+                    meta["device_metrics"] = {
+                        "enabled": True,
+                        "source": "device",
+                        "process_pid": pm_pid,
+                        "process_jsonl": str(proc_jsonl),
+                    }
                     if not pm_pid:
                         meta["device_metrics"]["process_note"] = (
                             "tunneld not available; run: "
@@ -267,12 +270,15 @@ class PerfSessionManager:
             self._kill_pid(sampling_pid)
             meta["sampling_result"] = {"stopped_pid": sampling_pid}
 
-        # 停 device metrics
-        dm = meta.get("device_metrics", {})
+        # 停 battery
+        batt = meta.get("battery", {})
         if self.battery_poller:
             self.battery_poller.stop()
-        elif dm.get("battery_pid"):
-            self._kill_pid(dm["battery_pid"])
+        elif batt.get("pid"):
+            self._kill_pid(batt["pid"])
+
+        # 停 device metrics
+        dm = meta.get("device_metrics", {})
         if self.process_streamer:
             self.process_streamer.stop()
         elif dm.get("process_pid"):

@@ -938,6 +938,137 @@ async def cmd_perf_battery(args):
         print(text)
 
 
+async def cmd_perf_dashboard(args):
+    """全指标统一仪表盘"""
+    import time as _time
+    from src.perf.device_metrics import read_battery_jsonl
+
+    repo = Path(args.repo).expanduser().resolve()
+    tag = args.tag
+    logs_dir = repo / ".claude-parallel" / "perf" / tag / "logs"
+    metrics_jsonl = logs_dir / "metrics.jsonl"
+    battery_jsonl = logs_dir / "battery.jsonl"
+
+    if not metrics_jsonl.exists():
+        print(f"  [perf] 未找到指标数据: {metrics_jsonl}")
+        print(f"  提示: 先用 cpar perf start --templates systemtrace 采集")
+        return
+
+    # 读取指标快照
+    snapshots = []
+    for line in metrics_jsonl.read_text(encoding="utf-8").strip().splitlines():
+        try:
+            snapshots.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    if not snapshots:
+        print("  (无指标数据)")
+        return
+
+    last_n = getattr(args, "last", 0)
+    if last_n > 0:
+        snapshots = snapshots[-last_n:]
+
+    # 读取电池数据并按时间戳对齐
+    battery_records = read_battery_jsonl(battery_jsonl)
+    battery_by_ts = {}
+    for br in battery_records:
+        battery_by_ts[int(br.get("ts", 0))] = br.get("level_pct")
+
+    def find_battery(ts):
+        if not battery_by_ts:
+            return None
+        target = int(ts)
+        closest = min(battery_by_ts.keys(), key=lambda t: abs(t - target))
+        if abs(closest - target) <= 15:
+            return battery_by_ts[closest]
+        return None
+
+    # 合并电池数据
+    for snap in snapshots:
+        if snap.get("battery_pct") is None:
+            snap["battery_pct"] = find_battery(snap.get("ts", 0))
+
+    if getattr(args, "json", False):
+        print(json.dumps(snapshots, ensure_ascii=False, indent=2))
+        return
+
+    if getattr(args, "csv", False):
+        print("time,display_mw,cpu_mw,network_mw,cpu_pct,fps,mem_mb,battery_pct")
+        for s in snapshots:
+            ts = _time.strftime("%H:%M:%S", _time.localtime(s.get("ts", 0)))
+            vals = [
+                ts,
+                str(s.get("display_mw") or ""),
+                str(s.get("cpu_mw") or ""),
+                str(s.get("networking_mw") or ""),
+                str(s.get("cpu_pct") or ""),
+                str(s.get("gpu_fps") or ""),
+                str(s.get("mem_mb") or ""),
+                str(s.get("battery_pct") or ""),
+            ]
+            print(",".join(vals))
+        return
+
+    # 文本输出
+    fields = [
+        ("Time", 10, lambda s: _time.strftime("%H:%M:%S", _time.localtime(s.get("ts", 0)))),
+        ("Display", 8, lambda s: f"{s['display_mw']:.0f}" if s.get("display_mw") is not None else "-"),
+        ("CPU功耗", 8, lambda s: f"{s['cpu_mw']:.0f}" if s.get("cpu_mw") is not None else "-"),
+        ("Network", 8, lambda s: f"{s['networking_mw']:.0f}" if s.get("networking_mw") is not None else "-"),
+        ("CPU%", 7, lambda s: f"{s['cpu_pct']:.1f}%" if s.get("cpu_pct") is not None else "-"),
+        ("FPS", 5, lambda s: f"{s['gpu_fps']:.0f}" if s.get("gpu_fps") is not None else "-"),
+        ("内存MB", 8, lambda s: f"{s['mem_mb']:.1f}" if s.get("mem_mb") is not None else "-"),
+        ("电量", 5, lambda s: f"{s['battery_pct']:.0f}%" if s.get("battery_pct") is not None else "-"),
+        ("温度", 8, lambda s: s.get("thermal_state", "-") or "-"),
+    ]
+
+    # Part 1: 时序表
+    header = "  ".join(f"{name:>{width}}" for name, width, _ in fields)
+    sep = "  ".join("─" * width for _, width, _ in fields)
+    print(f"\n  ── 指标时序 ({len(snapshots)} 个快照) ──\n")
+    print(f"  {header}")
+    print(f"  {sep}")
+    for s in snapshots:
+        row = "  ".join(f"{fn(s):>{width}}" for _, width, fn in fields)
+        print(f"  {row}")
+
+    # Part 2: 汇总统计
+    print(f"\n  ── 汇总统计 ──\n")
+    stat_fields = [
+        ("Display mW", "display_mw"),
+        ("CPU 功耗 mW", "cpu_mw"),
+        ("Network mW", "networking_mw"),
+        ("CPU%", "cpu_pct"),
+        ("FPS", "gpu_fps"),
+        ("内存 MB", "mem_mb"),
+    ]
+    print(f"  {'指标':<14} {'平均':>8} {'峰值':>8} {'最低':>8} {'波动':>8}")
+    print(f"  {'─'*14} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+    for label, key in stat_fields:
+        vals = [s.get(key) for s in snapshots if s.get(key) is not None]
+        if vals:
+            avg = sum(vals) / len(vals)
+            peak = max(vals)
+            low = min(vals)
+            jitter = peak - low
+            unit = "%" if "pct" in key else ""
+            print(f"  {label:<14} {avg:>7.1f}{unit} {peak:>7.1f}{unit} {low:>7.1f}{unit} {'±'}{jitter:>6.1f}")
+        else:
+            print(f"  {label:<14} {'-':>8} {'-':>8} {'-':>8} {'-':>8}")
+
+    # 电量趋势
+    batt_vals = [s.get("battery_pct") for s in snapshots if s.get("battery_pct") is not None]
+    if batt_vals:
+        first_b = batt_vals[0]
+        last_b = batt_vals[-1]
+        delta = last_b - first_b
+        print(f"  {'电量 %':<14} {first_b:>7.0f}% → {last_b:.0f}%{'':>14} {delta:>+6.0f}%")
+
+    print()
+
+
 async def cmd_perf_hotspots(args):
     """运行时热点函数查看"""
     from src.perf.sampling import read_hotspots_jsonl, format_hotspots_text
@@ -1221,6 +1352,14 @@ def main():
     perf_snap.add_argument("trace", help="xctrace trace 文件路径")
     perf_snap.add_argument("--json", action="store_true", help="JSON 格式输出")
 
+    # ── perf dashboard (全指标仪表盘) ──
+    perf_dash = perf_sub.add_parser("dashboard", help="全指标统一仪表盘 (时序表+汇总)")
+    perf_dash.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_dash.add_argument("--tag", default="perf", help="会话标签")
+    perf_dash.add_argument("--last", type=int, default=0, help="最近 N 个快照 (0=全部)")
+    perf_dash.add_argument("--json", action="store_true", help="JSON 格式输出")
+    perf_dash.add_argument("--csv", action="store_true", help="CSV 格式输出")
+
     # ── perf metrics (per-process 指标) ──
     perf_metrics = perf_sub.add_parser("metrics", help="Per-process CPU/内存指标")
     perf_metrics.add_argument("--repo", required=True, help="项目仓库路径")
@@ -1315,6 +1454,8 @@ def main():
             asyncio.run(cmd_perf_callstack(args))
         elif args.perf_cmd == "hotspots":
             asyncio.run(cmd_perf_hotspots(args))
+        elif args.perf_cmd == "dashboard":
+            asyncio.run(cmd_perf_dashboard(args))
         elif args.perf_cmd == "metrics":
             asyncio.run(cmd_perf_metrics(args))
         elif args.perf_cmd == "battery":

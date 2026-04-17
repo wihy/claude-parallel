@@ -33,6 +33,8 @@ class MetricSnapshot:
     cpu_pct: Optional[float] = None       # CPU 利用率 (%)
     gpu_fps: Optional[float] = None       # GPU 帧率 (fps)
     mem_mb: Optional[float] = None        # 内存使用 (MB)
+    battery_pct: Optional[float] = None   # 电池电量 (%)
+    thermal_state: Optional[str] = None   # 热状态 (Nominal/Fair/Serious/Critical)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -43,6 +45,8 @@ class MetricSnapshot:
             "cpu_pct": self.cpu_pct,
             "gpu_fps": self.gpu_fps,
             "mem_mb": self.mem_mb,
+            "battery_pct": self.battery_pct,
+            "thermal_state": self.thermal_state,
         }
 
 
@@ -70,6 +74,7 @@ DEFAULT_THRESHOLDS = [
 
 # xctrace export XML 中常见的 schema 和对应列名
 SCHEMA_COLUMNS = {
+    # Power Profiler 模板
     "SystemPowerLevel": {
         "Display": "display_mw",
         "CPU": "cpu_mw",
@@ -79,6 +84,7 @@ SCHEMA_COLUMNS = {
         "CPU": "cpu_mw",
         "Networking": "networking_mw",
     },
+    # Legacy schema names (Xcode < 16)
     "CPUCore": {
         "CPU Total": "cpu_pct",
     },
@@ -88,6 +94,13 @@ SCHEMA_COLUMNS = {
     "ProcessMemory": {
         "Physical Memory": "mem_mb",
     },
+    # System Trace 模板 (Xcode 16+ 真机实际 schema)
+    "system-load": {
+        "Load": "cpu_pct",
+    },
+    "device-thermal-state-intervals": {
+        "Thermal State": "_thermal_state",
+    },
 }
 
 
@@ -95,6 +108,11 @@ def _parse_exported_xml(xml_path: Path) -> Dict[str, List[float]]:
     """
     解析 xctrace export 输出的 XML 文件，提取所有数值列。
     返回 {列名: [值列表]}
+
+    兼容两种 XML 格式:
+    - Legacy: <col name="Display"/>  +  <row><c>570</c></row>
+    - Xcode 16+: <col><mnemonic>display</mnemonic><name>Display</name></col>
+                 + <row><display id="1" fmt="570">570</display></row>
     """
     if not xml_path.exists():
         return {}
@@ -103,27 +121,78 @@ def _parse_exported_xml(xml_path: Path) -> Dict[str, List[float]]:
     except Exception:
         return {}
 
-    # 提取列名
+    # ── 提取列名 (两种格式) ──
     columns = []
+    # Format 1: <col name="Display"/>
     for m in re.finditer(r'<col[^>]*name="([^"]+)"', text):
         columns.append(m.group(1))
+    # Format 2: <col><name>Display</name></col>
+    if not columns:
+        for m in re.finditer(r'<col>\s*(?:<mnemonic>[^<]*</mnemonic>\s*)?<name>([^<]+)</name>', text):
+            columns.append(m.group(1))
     if not columns:
         return {}
 
-    # 提取行数据
+    # ── 提取行数据 (两种格式) ──
     row_pat = re.compile(r"<row>(.*?)</row>", re.S)
+    # Format 1: <c>value</c>
     cell_pat = re.compile(r"<c[^>]*>(.*?)</c>", re.S)
+    # Format 2: <mnemonic id="N" fmt="display_value">raw</mnemonic>
+    fmt_pat = re.compile(r'fmt="([^"]*)"')
 
     result: Dict[str, List[float]] = {name: [] for name in columns}
     for row_m in row_pat.finditer(text):
         row = row_m.group(1)
-        cells = [c.strip() for c in cell_pat.findall(row)]
+
+        # Try Format 1 first
+        cells = cell_pat.findall(row)
+        if cells:
+            for i, name in enumerate(columns):
+                if i < len(cells):
+                    try:
+                        result[name].append(float(cells[i].strip()))
+                    except (ValueError, TypeError):
+                        continue
+        else:
+            # Format 2: extract fmt values from any tag with fmt attribute
+            fmt_vals = fmt_pat.findall(row)
+            for i, name in enumerate(columns):
+                if i < len(fmt_vals):
+                    try:
+                        # Strip units: "570 mW" → 570, "45.2 %" → 45.2
+                        num_str = re.sub(r"[^\d.\-]", "", fmt_vals[i].split()[0])
+                        result[name].append(float(num_str))
+                    except (ValueError, IndexError):
+                        continue
+    return result
+
+
+def _parse_exported_xml_strings(xml_path: Path) -> Dict[str, List[str]]:
+    """解析 XML 文件中的字符串值列（用于 thermal state 等非数值字段）。"""
+    if not xml_path.exists():
+        return {}
+    try:
+        text = xml_path.read_text(errors="replace")
+    except Exception:
+        return {}
+
+    columns = []
+    for m in re.finditer(r'<col[^>]*name="([^"]+)"', text):
+        columns.append(m.group(1))
+    if not columns:
+        for m in re.finditer(r'<col>\s*(?:<mnemonic>[^<]*</mnemonic>\s*)?<name>([^<]+)</name>', text):
+            columns.append(m.group(1))
+    if not columns:
+        return {}
+
+    result: Dict[str, List[str]] = {name: [] for name in columns}
+    fmt_pat = re.compile(r'fmt="([^"]*)"')
+    for row_m in re.finditer(r"<row>(.*?)</row>", text, re.S):
+        row = row_m.group(1)
+        fmt_vals = fmt_pat.findall(row)
         for i, name in enumerate(columns):
-            if i < len(cells):
-                try:
-                    result[name].append(float(cells[i]))
-                except (ValueError, TypeError):
-                    continue
+            if i < len(fmt_vals):
+                result[name].append(fmt_vals[i])
     return result
 
 
@@ -154,8 +223,21 @@ def build_snapshot_from_exports(
             continue
 
         parsed = _parse_exported_xml(xml_out)
+        parsed_str = _parse_exported_xml_strings(xml_out) if any(
+            f.startswith("_") for f in col_map.values()
+        ) else {}
+
         # 对每个列，取最近一个值 (精确匹配优先，子串匹配兜底)
         for col_name, field_name in col_map.items():
+            # 字符串字段（以 _ 开头标记）
+            if field_name.startswith("_"):
+                real_field = field_name[1:]  # "_thermal_state" → "thermal_state"
+                for key, vals in parsed_str.items():
+                    if col_name.lower() in key.lower() and vals:
+                        setattr(snap, real_field, vals[-1])
+                        break
+                continue
+
             matched = False
             # 1. 精确匹配 (忽略大小写)
             for key, vals in parsed.items():
@@ -277,7 +359,7 @@ class LiveMetricsStreamer:
             return {"samples": 0}
 
         stats: Dict[str, Any] = {"samples": len(snaps)}
-        for field_name in ("display_mw", "cpu_mw", "networking_mw", "cpu_pct", "gpu_fps", "mem_mb"):
+        for field_name in ("display_mw", "cpu_mw", "networking_mw", "cpu_pct", "gpu_fps", "mem_mb", "battery_pct"):
             vals = [getattr(s, field_name) for s in snaps if getattr(s, field_name) is not None]
             if not vals:
                 stats[field_name] = {"avg": None, "peak": None, "min": None}
