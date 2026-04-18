@@ -14,6 +14,13 @@ class PerfConfig:
     baseline_tag: str = ""
     threshold_pct: float = 0.0
 
+    # Composite 模式 (多 instrument 合并单个 xctrace 进程)
+    # "auto" — 多模板时自动启用 composite
+    # "full"/"webperf"/"power_cpu"/... — 使用预置组合
+    # "power+time+network" — 自由组合
+    # "" — 禁用 composite, 使用旧的多进程模式
+    composite: str = "auto"
+
     # 实时 syslog 分析
     live_rules_file: str = ""       # 自定义规则文件路径
     live_alert_log: str = ""        # 告警日志输出路径

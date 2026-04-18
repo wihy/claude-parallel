@@ -28,7 +28,10 @@ from .templates import (
     InstrumentTemplate,
     TemplateLibrary,
     BUILTIN_TEMPLATES,
+    COMPOSITE_PRESETS,
     build_xctrace_record_cmd,
+    build_composite_record_cmd,
+    resolve_composite,
     list_available_devices,
     list_available_templates,
 )
@@ -39,6 +42,19 @@ from .device_metrics import (
     read_process_metrics_jsonl,
     format_battery_text,
     format_process_metrics_text,
+)
+from .dvt_bridge import (
+    DvtBridgeThread,
+    DvtBridgeSession,
+    DvtProcessSnapshot,
+    DvtSystemSnapshot,
+    DvtNetworkEvent,
+    DvtGraphicsSnapshot,
+    check_dvt_available,
+    read_dvt_process_jsonl,
+    read_dvt_system_jsonl,
+    format_dvt_process_text,
+    dvt_bridge_main,
 )
 from .sampling import (
     SamplingProfilerSidecar,
@@ -116,6 +132,7 @@ from .ai_diagnosis import (
     format_diagnosis_report,
     run_diagnosis,
 )
+from .report_html import generate_html_report
 
 __all__ = [
     "PerfConfig",
@@ -133,7 +150,10 @@ __all__ = [
     "InstrumentTemplate",
     "TemplateLibrary",
     "BUILTIN_TEMPLATES",
+    "COMPOSITE_PRESETS",
     "build_xctrace_record_cmd",
+    "build_composite_record_cmd",
+    "resolve_composite",
     "list_available_devices",
     "list_available_templates",
     "PerfIntegrator",
@@ -145,6 +165,18 @@ __all__ = [
     "read_process_metrics_jsonl",
     "format_battery_text",
     "format_process_metrics_text",
+    # dvt_bridge
+    "DvtBridgeThread",
+    "DvtBridgeSession",
+    "DvtProcessSnapshot",
+    "DvtSystemSnapshot",
+    "DvtNetworkEvent",
+    "DvtGraphicsSnapshot",
+    "check_dvt_available",
+    "read_dvt_process_jsonl",
+    "read_dvt_system_jsonl",
+    "format_dvt_process_text",
+    "dvt_bridge_main",
     "export_xctrace_schema",
     "parse_timeprofiler_xml",
     "aggregate_top_n",
@@ -204,4 +236,6 @@ __all__ = [
     "generate_webkit_report",
     "format_diagnosis_report",
     "run_diagnosis",
+    # report_html
+    "generate_html_report",
 ]

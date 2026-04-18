@@ -22,6 +22,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from .config import PerfConfig
 from .device_metrics import BatteryPoller, ProcessMetricsStreamer
 from .webcontent import WebContentProfiler
+from .dvt_bridge import DvtBridgeThread, check_dvt_available
 from .sampling import (
     SamplingProfilerSidecar,
     export_xctrace_schema,
@@ -46,6 +47,7 @@ class PerfSessionManager:
         self.sampling_sidecar: Optional[SamplingProfilerSidecar] = None
         self.battery_poller: Optional[BatteryPoller] = None
         self.process_streamer: Optional[ProcessMetricsStreamer] = None
+        self.dvt_bridge_thread: Optional[DvtBridgeThread] = None
         self.webcontent_profiler: Optional[WebContentProfiler] = None
 
     # ---------- lifecycle ----------
@@ -129,34 +131,87 @@ class PerfSessionManager:
                 use_device_metrics = True
 
         if use_device_metrics:
-            # ProcessMetricsStreamer (条件启动，需 tunneld)
+            # 优先使用 DvtBridge (asyncio RPC 直连，更高精度、更低开销)
+            # 如果 DvtBridge 不可用或启动失败，fallback 到 ProcessMetricsStreamer (CLI 子进程)
             if self.config.attach:
-                proc_jsonl = self.logs_dir / "process_metrics.jsonl"
-                try:
-                    self.process_streamer = ProcessMetricsStreamer(
-                        device_udid=self.config.device,
-                        process_name=self.config.attach,
-                        interval_ms=self.config.metrics_interval_ms,
-                        output_file=proc_jsonl,
-                    )
-                    pm_pid = self.process_streamer.start()
-                    meta["device_metrics"] = {
-                        "enabled": True,
-                        "source": "device",
-                        "process_pid": pm_pid,
-                        "process_jsonl": str(proc_jsonl),
-                    }
-                    if not pm_pid:
-                        meta["device_metrics"]["process_note"] = (
-                            "tunneld not available; run: "
-                            "sudo pymobiledevice3 remote tunneld"
+                dvt_output_dir = self.logs_dir / "dvt"
+                dvt_output_dir.mkdir(parents=True, exist_ok=True)
+
+                dvt_started = False
+                dvt_check = check_dvt_available()
+
+                if dvt_check.get("pymobiledevice3"):
+                    try:
+                        # 确定进程名列表 (attach + 可选的 webcontent 进程)
+                        proc_names = [self.config.attach]
+                        if self.config.attach_webcontent:
+                            proc_names.append("WebContent")
+                            proc_names.append("WebKitWebContent")
+
+                        self.dvt_bridge_thread = DvtBridgeThread(
+                            device_udid=self.config.device,
+                            process_names=proc_names,
+                            interval_ms=self.config.metrics_interval_ms,
+                            output_dir=dvt_output_dir,
+                            cpu_threshold=self.config.dvt_cpu_threshold if hasattr(self.config, 'dvt_cpu_threshold') else 80.0,
+                            memory_threshold_mb=self.config.dvt_memory_threshold_mb if hasattr(self.config, 'dvt_memory_threshold_mb') else 1500.0,
                         )
-                except Exception as e:
-                    meta["errors"].append(f"process_streamer_failed: {e}")
+                        dvt_result = self.dvt_bridge_thread.start()
+                        dvt_started = dvt_result.get("status") in ("started", "starting")
+
+                        if dvt_started:
+                            meta["device_metrics"] = {
+                                "enabled": True,
+                                "source": "dvt_bridge",
+                                "process_names": proc_names,
+                                "interval_ms": self.config.metrics_interval_ms,
+                                "process_jsonl": str(dvt_output_dir / "dvt_process.jsonl"),
+                                "system_jsonl": str(dvt_output_dir / "dvt_system.jsonl"),
+                            }
+                            meta.setdefault("dvt_bridge", {
+                                "status": "running",
+                                "device": self.config.device,
+                                "interval_ms": self.config.metrics_interval_ms,
+                                "tunneld": dvt_check.get("tunneld", False),
+                            })
+                        else:
+                            meta["errors"].append(
+                                f"dvt_bridge_start_failed: status={dvt_result.get('status', 'unknown')}"
+                            )
+                    except Exception as e:
+                        meta["errors"].append(f"dvt_bridge_start_failed: {e}")
+
+                if not dvt_started:
+                    # Fallback: ProcessMetricsStreamer (pymobiledevice3 CLI 子进程)
+                    proc_jsonl = self.logs_dir / "process_metrics.jsonl"
+                    try:
+                        self.process_streamer = ProcessMetricsStreamer(
+                            device_udid=self.config.device,
+                            process_name=self.config.attach,
+                            interval_ms=self.config.metrics_interval_ms,
+                            output_file=proc_jsonl,
+                        )
+                        pm_pid = self.process_streamer.start()
+                        meta["device_metrics"] = {
+                            "enabled": bool(pm_pid),
+                            "source": "cli_subprocess",
+                            "process_pid": pm_pid,
+                            "process_jsonl": str(proc_jsonl),
+                        }
+                        if not pm_pid:
+                            meta["device_metrics"]["process_note"] = (
+                                "tunneld not available; run: "
+                                "sudo pymobiledevice3 remote tunneld"
+                            )
+                    except Exception as e:
+                        meta["errors"].append(f"process_streamer_failed: {e}")
 
         # xctrace sidecar — 根据 templates 配置启动录制 (跳过 device 模式)
         if self.config.device and self.config.attach and not use_device_metrics:
-            from .templates import TemplateLibrary, build_xctrace_record_cmd
+            from .templates import (
+                TemplateLibrary, build_xctrace_record_cmd,
+                build_composite_record_cmd, resolve_composite, COMPOSITE_PRESETS,
+            )
             tpl_lib = TemplateLibrary()
             tpls = tpl_lib.resolve_multi(self.config.templates)
 
@@ -165,8 +220,71 @@ class PerfSessionManager:
                 tpls = []
                 meta["xctrace"]["template_raw"] = self.config.templates
 
-            # 如果只有单个模板，用旧的单一 xctrace 结构
-            if len(tpls) == 1:
+            # ── 决策: 是否使用 composite 模式 ──
+            use_composite = False
+            composite_info = None
+
+            composite_cfg = getattr(self.config, "composite", "auto")
+            if composite_cfg == "":
+                # 显式禁用 composite
+                use_composite = False
+            elif composite_cfg != "auto":
+                # 指定了预置名或自由组合
+                composite_info = resolve_composite(composite_cfg, tpl_lib)
+                if composite_info:
+                    use_composite = True
+                else:
+                    meta["errors"].append(
+                        f"composite_resolve_failed: 无法解析 '{composite_cfg}', 退回多进程模式"
+                    )
+            elif len(tpls) > 1:
+                # auto + 多模板 → 尝试自动 composite
+                # 把第一个模板作为 base, 其余作为附加 instrument
+                base_tpl = tpls[0]
+                extra_instruments = [t.name for t in tpls[1:]]
+                all_schemas = []
+                for t in tpls:
+                    all_schemas.extend(t.schemas)
+                composite_info = {
+                    "base_template": base_tpl,
+                    "instruments": extra_instruments,
+                    "schemas": all_schemas,
+                    "preset": "",
+                }
+                use_composite = True
+
+            # ── 执行录制 ──
+            if use_composite and composite_info:
+                base_tpl = composite_info["base_template"]
+                instruments = composite_info["instruments"]
+                trace_path = self.traces_dir / f"{self.config.tag}_composite.trace"
+                stderr_path = Path(meta["xctrace"]["stderr"])
+                cmd = build_composite_record_cmd(
+                    base_template=base_tpl,
+                    instruments=instruments,
+                    device=self.config.device,
+                    attach=self.config.attach,
+                    duration_sec=self.config.duration_sec,
+                    output_path=str(trace_path),
+                )
+                try:
+                    ferr = open(stderr_path, "a", encoding="utf-8")
+                    proc = subprocess.Popen(cmd, stdout=ferr, stderr=subprocess.STDOUT)
+                    ferr.close()
+                    meta["xctrace"]["enabled"] = True
+                    meta["xctrace"]["pid"] = proc.pid
+                    meta["xctrace"]["trace"] = str(trace_path)
+                    meta["xctrace"]["template"] = base_tpl.alias or base_tpl.name
+                    meta["xctrace"]["mode"] = "composite"
+                    meta["xctrace"]["composite_instruments"] = [base_tpl.name] + instruments
+                    meta["xctrace"]["composite_schemas"] = composite_info["schemas"]
+                    if composite_info["preset"]:
+                        meta["xctrace"]["composite_preset"] = composite_info["preset"]
+                except Exception as e:
+                    meta["errors"].append(f"xctrace_composite_start_failed: {e}")
+
+            elif len(tpls) == 1:
+                # 单模板: 用旧的单一 xctrace 结构
                 tpl = tpls[0]
                 trace_path = self.traces_dir / tpl.trace_filename(self.config.tag)
                 stderr_path = Path(meta["xctrace"]["stderr"])
@@ -188,7 +306,7 @@ class PerfSessionManager:
                 except Exception as e:
                     meta["errors"].append(f"xctrace_start_failed: {e}")
             elif len(tpls) > 1:
-                # 多模板: 每个模板独立 xctrace 进程
+                # 多模板 + composite 被禁用 → 旧的多进程模式 (iOS 互斥, 仅第一个能成功)
                 meta["xctrace_multi"] = []
                 for tpl in tpls:
                     trace_path = self.traces_dir / tpl.trace_filename(self.config.tag)
@@ -221,14 +339,25 @@ class PerfSessionManager:
         # Sampling Profiler 旁路
         # iOS 设备同一时刻只允许一个 xctrace 录制，
         # 因此 sampling 与主链路 xctrace 互斥。
+        # composite 模式下: 如果已包含 Time Profiler, sampling 自动跳过
         if self.config.sampling_enabled and self.config.device and self.config.attach:
             main_has_xctrace = meta.get("xctrace", {}).get("enabled", False) or bool(meta.get("xctrace_multi"))
             main_has_time = self._main_has_timeprofiler(meta)
+
+            # composite 模式: 检查 instruments 列表里是否有 Time Profiler
+            composite_instruments = meta.get("xctrace", {}).get("composite_instruments", [])
+            composite_has_time = any(
+                "time" in inst.lower() or "profiler" in inst.lower()
+                for inst in composite_instruments
+            )
+
             if main_has_xctrace:
                 tpl = meta.get("xctrace", {}).get("template", "")
                 hint = ""
                 if tpl in ("systrace", "systemtrace", "System Trace"):
                     hint = " (systemtrace already includes time-profile data)"
+                if composite_has_time:
+                    hint = " (composite 模式已包含 Time Profiler)"
                 meta.setdefault("errors", []).append(
                     f"sampling_skipped: iOS device allows only one xctrace session{hint}"
                 )
@@ -305,7 +434,10 @@ class PerfSessionManager:
         elif batt.get("pid"):
             self._kill_pid(batt["pid"])
 
-        # 停 device metrics
+        # 停 device metrics (DvtBridge 优先)
+        if self.dvt_bridge_thread and self.dvt_bridge_thread.is_alive():
+            dvt_result = self.dvt_bridge_thread.stop()
+            meta["dvt_bridge_result"] = dvt_result
         dm = meta.get("device_metrics", {})
         if self.process_streamer:
             self.process_streamer.stop()
@@ -382,6 +514,11 @@ class PerfSessionManager:
 
         if f_callstack:
             report["callstack"] = f_callstack.result()
+
+        # DvtBridge 进程指标分析
+        dvt_data = self._dvt_metrics_report(meta)
+        if dvt_data:
+            report["dvt_metrics"] = dvt_data
 
         if self.config.baseline_tag:
             baseline = PerfSessionManager(str(self.repo), self.coordination_dir, PerfConfig(tag=self.config.baseline_tag))
@@ -817,3 +954,129 @@ class PerfSessionManager:
 
     def _extract_mnemonic_value(self, row_text: str, mnemonic: str, default: str = "") -> str:
         return extract_mnemonic_value(row_text, mnemonic, default)
+
+    # ── DvtBridge 指标分析 ──
+
+    def _dvt_metrics_report(self, meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """分析 DvtBridge 采集的进程/系统指标 JSONL，返回统计摘要。"""
+        dm = meta.get("device_metrics", {})
+        if dm.get("source") != "dvt_bridge":
+            return None
+
+        from .dvt_bridge import read_dvt_process_jsonl, read_dvt_system_jsonl
+
+        process_jsonl = Path(dm.get("process_jsonl", ""))
+        system_jsonl = Path(dm.get("system_jsonl", ""))
+
+        result: Dict[str, Any] = {"source": "dvt_bridge"}
+
+        # 进程指标统计
+        proc_records = read_dvt_process_jsonl(process_jsonl) if process_jsonl.exists() else []
+        if proc_records:
+            # 按进程名分组
+            by_name: Dict[str, List[Dict[str, Any]]] = {}
+            for r in proc_records:
+                name = r.get("name", "unknown")
+                by_name.setdefault(name, []).append(r)
+
+            proc_stats = {}
+            for name, records in by_name.items():
+                cpu_vals = [r["cpuUsage"] for r in records if isinstance(r.get("cpuUsage"), (int, float))]
+                mem_vals = [r["physFootprintMB"] for r in records if isinstance(r.get("physFootprintMB"), (int, float))]
+                thread_vals = [r["threadCount"] for r in records if isinstance(r.get("threadCount"), (int, float))]
+
+                proc_stats[name] = {
+                    "samples": len(records),
+                    "pid": records[-1].get("pid", "?"),
+                    "cpu_pct": {
+                        "avg": round(sum(cpu_vals) / len(cpu_vals), 2) if cpu_vals else None,
+                        "peak": round(max(cpu_vals), 2) if cpu_vals else None,
+                        "min": round(min(cpu_vals), 2) if cpu_vals else None,
+                    },
+                    "mem_mb": {
+                        "avg": round(sum(mem_vals) / len(mem_vals), 1) if mem_vals else None,
+                        "peak": round(max(mem_vals), 1) if mem_vals else None,
+                        "min": round(min(mem_vals), 1) if mem_vals else None,
+                    },
+                    "threads": {
+                        "avg": round(sum(thread_vals) / len(thread_vals), 1) if thread_vals else None,
+                        "peak": max(thread_vals) if thread_vals else None,
+                    },
+                }
+
+            result["process_stats"] = proc_stats
+            result["total_process_samples"] = len(proc_records)
+
+        # 系统指标统计
+        sys_records = read_dvt_system_jsonl(system_jsonl) if system_jsonl.exists() else []
+        if sys_records:
+            cpu_total = [r["cpuTotal"] for r in sys_records if isinstance(r.get("cpuTotal"), (int, float))]
+            mem_free = [r["physMemoryFreeMB"] for r in sys_records if isinstance(r.get("physMemoryFreeMB"), (int, float))]
+            mem_used = [r["physMemoryUsedMB"] for r in sys_records if isinstance(r.get("physMemoryUsedMB"), (int, float))]
+
+            result["system_stats"] = {
+                "samples": len(sys_records),
+                "cpu_total_pct": {
+                    "avg": round(sum(cpu_total) / len(cpu_total), 2) if cpu_total else None,
+                    "peak": round(max(cpu_total), 2) if cpu_total else None,
+                },
+                "mem_free_mb": {
+                    "avg": round(sum(mem_free) / len(mem_free), 1) if mem_free else None,
+                    "min": round(min(mem_free), 1) if mem_free else None,
+                },
+                "mem_used_mb": {
+                    "avg": round(sum(mem_used) / len(mem_used), 1) if mem_used else None,
+                    "peak": round(max(mem_used), 1) if mem_used else None,
+                },
+            }
+
+        return result if result.get("process_stats") or result.get("system_stats") else None
+
+    def format_dvt_metrics_text(self, dvt_data: Dict[str, Any]) -> str:
+        """将 DvtBridge 指标分析结果格式化为可读文本。"""
+        if not dvt_data:
+            return "  (无 DvtBridge 数据)"
+
+        lines = []
+        lines.append("  ── DvtBridge 实时指标 ──")
+        lines.append("")
+
+        # 进程统计
+        proc_stats = dvt_data.get("process_stats", {})
+        for name, stats in sorted(proc_stats.items(), key=lambda x: -(x[1].get("cpu_pct", {}).get("avg") or 0)):
+            cpu = stats.get("cpu_pct", {})
+            mem = stats.get("mem_mb", {})
+            threads = stats.get("threads", {})
+            samples = stats.get("samples", 0)
+
+            cpu_avg = cpu.get("avg", "?")
+            cpu_peak = cpu.get("peak", "?")
+            mem_avg = mem.get("avg", "?")
+            mem_peak = mem.get("peak", "?")
+
+            cpu_avg_str = f"{cpu_avg:.1f}%" if isinstance(cpu_avg, (int, float)) else "?"
+            cpu_peak_str = f"{cpu_peak:.1f}%" if isinstance(cpu_peak, (int, float)) else "?"
+            mem_avg_str = f"{mem_avg:.0f}MB" if isinstance(mem_avg, (int, float)) else "?"
+            mem_peak_str = f"{mem_peak:.0f}MB" if isinstance(mem_peak, (int, float)) else "?"
+
+            lines.append(
+                f"  {name}(pid={stats.get('pid', '?')})  "
+                f"CPU: avg={cpu_avg_str} peak={cpu_peak_str}  "
+                f"MEM: avg={mem_avg_str} peak={mem_peak_str}  "
+                f"({samples} samples)"
+            )
+
+        # 系统统计
+        sys_stats = dvt_data.get("system_stats", {})
+        if sys_stats:
+            lines.append("")
+            cpu_total = sys_stats.get("cpu_total_pct", {})
+            mem_free = sys_stats.get("mem_free_mb", {})
+            cpu_avg = cpu_total.get("avg")
+            mem_min = mem_free.get("min")
+            if cpu_avg is not None:
+                lines.append(f"  系统CPU: avg={cpu_avg:.1f}%")
+            if mem_min is not None:
+                lines.append(f"  可用内存: min={mem_min:.0f}MB")
+
+        return "\n".join(lines)

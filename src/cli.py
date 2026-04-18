@@ -119,6 +119,7 @@ def build_perf_config_from_args(args) -> PerfConfig:
         metrics_interval_ms=int(getattr(args, "perf_metrics_interval", 1000) or 1000),
         battery_interval_sec=int(getattr(args, "perf_battery_interval", 10) or 10),
         attach_webcontent=bool(getattr(args, "perf_attach_webcontent", False)),
+        composite=getattr(args, "perf_composite", "auto") or "auto",
     )
 
 
@@ -553,6 +554,7 @@ async def cmd_perf_start(args):
         metrics_interval_ms=int(getattr(args, "metrics_interval", 1000) or 1000),
         battery_interval_sec=int(getattr(args, "battery_interval", 10) or 10),
         attach_webcontent=getattr(args, "attach_webcontent", False),
+        composite=getattr(args, "composite", "auto") or "auto",
     )
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     meta = perf.start()
@@ -608,6 +610,20 @@ async def cmd_perf_report(args):
         if gate.get("checked"):
             status = "PASS" if gate.get("passed") else "FAIL"
             print(f"  gate: {status} ({gate.get('reason', '')})")
+
+    # HTML 报告生成
+    if getattr(args, "html", False):
+        from .perf.report_html import generate_html_report
+
+        session_dir = perf.root
+        meta_path = session_dir / "meta.json"
+        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+
+        out_arg = getattr(args, "html_output", "")
+        out_path = Path(out_arg) if out_arg else None
+
+        html_path = generate_html_report(rep, meta, session_dir, output_path=out_path)
+        print(f"  HTML report: {html_path}")
 
 
 async def cmd_perf_devices(args):
@@ -1527,6 +1543,7 @@ def main():
     run_parser.add_argument("--perf-metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
     run_parser.add_argument("--perf-battery-interval", type=int, default=10, help="电池轮询间隔(s)")
     run_parser.add_argument("--perf-attach-webcontent", action="store_true", help="采集 WebContent 进程")
+    run_parser.add_argument("--perf-composite", default="auto", help="Composite 模式: auto|full|webperf|power_cpu|gpu_full|memory")
 
     # ── resume ──
     resume_parser = subparsers.add_parser("resume", help="从中断处恢复执行")
@@ -1621,6 +1638,10 @@ def main():
     perf_start.add_argument("--metrics-source", default="auto", choices=["auto", "device", "xctrace"], help="指标采集源")
     perf_start.add_argument("--metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
     perf_start.add_argument("--battery-interval", type=int, default=10, help="电池轮询间隔(s)")
+    perf_start.add_argument(
+        "--composite", default="auto",
+        help="Composite 模式: auto|full|webperf|power_cpu|gpu_full|memory|power+time+network|\"\"",
+    )
 
     perf_stop = perf_sub.add_parser("stop", help="停止 perf 采集")
     perf_stop.add_argument("--repo", required=True, help="项目仓库路径")
@@ -1639,6 +1660,8 @@ def main():
     perf_report.add_argument("--with-callstack", action="store_true", help="包含 Time Profiler 调用栈分析")
     perf_report.add_argument("--callstack-top", type=int, default=20, help="调用栈热点 Top N")
     perf_report.add_argument("--json", action="store_true", help="JSON 格式输出")
+    perf_report.add_argument("--html", action="store_true", help="生成自包含 HTML 报告 (chart.js)")
+    perf_report.add_argument("--html-output", default="", help="HTML 输出路径 (默认 <session>/report.html)")
 
     perf_devices = perf_sub.add_parser("devices", help="列出 xctrace 设备")
 

@@ -4,7 +4,8 @@ TemplateLibrary — Instruments 录制模板注册与扩展。
 功能:
 - 内置常用 Instruments 模板定义
 - 支持自定义 .instruments 模板文件
-- 多模板并行录制（每个模板独立 trace 文件）
+- **Composite 模式**: 多 instrument 合并到单个 xctrace 录制 (解决 iOS 互斥限制)
+- 多模板并行录制（每个模板独立 trace 文件）— 旧模式, 已被 composite 取代
 - 模板→xctrace 命令行参数映射
 - trace 文件命名规范
 """
@@ -118,6 +119,105 @@ BUILTIN_TEMPLATES: Dict[str, InstrumentTemplate] = {
         ],
         description="全系统追踪: CPU 负载+温度状态+调用栈+线程状态 综合",
     ),
+    # ── 单独 instrument (仅用于 composite --instrument) ──
+    "caf": InstrumentTemplate(
+        name="Core Animation FPS",
+        template_arg="Core Animation FPS",
+        alias="caf",
+        schemas=["CoreAnimationFPS"],
+        description="Core Animation 帧率 (轻量)",
+    ),
+    "thermal": InstrumentTemplate(
+        name="Thermal State",
+        template_arg="Thermal State",
+        alias="thermal",
+        schemas=["device-thermal-state-intervals"],
+        description="设备热管理状态追踪",
+    ),
+    "sysload": InstrumentTemplate(
+        name="System Load",
+        template_arg="System Load",
+        alias="sysload",
+        schemas=["system-load"],
+        description="系统级 CPU/IO 负载概览",
+    ),
+    "actmon": InstrumentTemplate(
+        name="Activity Monitor",
+        template_arg="Activity Monitor",
+        alias="actmon",
+        schemas=["cpu-track", "physical-memory-track"],
+        description="进程级 CPU/Memory 活动监控",
+        requires_attach=False,
+    ),
+}
+
+# ── Composite 预置组合 ──
+# 每个组合定义: base_template + 附加 instrument 列表 + 聚合 schema
+# 用途: 一个 xctrace 进程录制所有 instrument, 解决 iOS 互斥限制
+
+COMPOSITE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "full": {
+        "description": "全能组合: 功耗+CPU热点+帧率+网络+GPU+活动监控+热管理+系统负载",
+        "base_template": "power",
+        "instruments": [
+            "Time Profiler",
+            "Core Animation FPS",
+            "Network",
+            "GPU",
+            "Activity Monitor",
+            "Thermal State",
+            "System Load",
+        ],
+        "schemas": [
+            "SystemPowerLevel", "ProcessSubsystemPowerImpact",
+            "time-profile", "TimeProfiler",
+            "CoreAnimationFPS",
+            "networking",
+            "GPU",
+            "cpu-track", "physical-memory-track",
+            "device-thermal-state-intervals",
+            "system-load",
+        ],
+    },
+    "power_cpu": {
+        "description": "功耗+CPU热点: Power Profiler + Time Profiler",
+        "base_template": "power",
+        "instruments": ["Time Profiler"],
+        "schemas": [
+            "SystemPowerLevel", "ProcessSubsystemPowerImpact",
+            "time-profile", "TimeProfiler",
+        ],
+    },
+    "webperf": {
+        "description": "Web渲染性能: 功耗+CPU热点+帧率+网络",
+        "base_template": "power",
+        "instruments": ["Time Profiler", "Core Animation FPS", "Network"],
+        "schemas": [
+            "SystemPowerLevel", "ProcessSubsystemPowerImpact",
+            "time-profile", "TimeProfiler",
+            "CoreAnimationFPS",
+            "networking",
+        ],
+    },
+    "gpu_full": {
+        "description": "GPU 完整分析: 功耗+GPU+Metal+帧率",
+        "base_template": "gpu",
+        "instruments": ["Core Animation FPS", "Metal System Trace", "Power Profiler"],
+        "schemas": [
+            "GPU", "MetalGPU", "MetalIO",
+            "CoreAnimationFPS",
+            "SystemPowerLevel",
+        ],
+    },
+    "memory": {
+        "description": "内存分析: Allocations + Leaks + Activity Monitor",
+        "base_template": "allocations",
+        "instruments": ["Leaks", "Activity Monitor"],
+        "schemas": [
+            "Allocations", "Leaks",
+            "cpu-track", "physical-memory-track",
+        ],
+    },
 }
 
 
@@ -258,7 +358,7 @@ def build_xctrace_record_cmd(
     if template.requires_attach and attach:
         cmd.extend(["--attach", attach])
 
-    cmd.extend(["--time", f"{int(duration_sec)}s"])
+    cmd.extend(["--time-limit", f"{int(duration_sec)}s"])
 
     if output_path:
         cmd.extend(["--output", output_path])
@@ -269,6 +369,143 @@ def build_xctrace_record_cmd(
         cmd.extend(extra_args)
 
     return cmd
+
+
+def build_composite_record_cmd(
+    base_template: InstrumentTemplate,
+    instruments: List[str],
+    device: str,
+    attach: str = "",
+    duration_sec: int = 1800,
+    output_path: str = "",
+    extra_args: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    构建 composite 模式的 xctrace record 命令。
+
+    使用 --template 指定基础模板, 然后用多个 --instrument 叠加。
+    所有 instrument 在单个 xctrace 进程中录制, 产出单个 .trace 文件。
+    解决 iOS 设备同一时刻只允许一个 xctrace 录制的限制。
+
+    Args:
+        base_template: 基础模板 (决定录制的主要 instrument 和显示设置)
+        instruments: 附加 instrument 名称列表 (对应 xctrace list instruments 输出)
+        device: 设备 UDID
+        attach: 目标进程名
+        duration_sec: 录制时长 (秒)
+        output_path: .trace 输出路径
+        extra_args: 额外 xctrace 参数
+
+    Returns:
+        完整的命令行参数列表
+
+    Example:
+        >>> cmd = build_composite_record_cmd(
+        ...     base_template=tpl, instruments=["Time Profiler", "Network"],
+        ...     device="00008120-...", attach="Soul_New", duration_sec=300,
+        ...     output_path="/tmp/composite.trace",
+        ... )
+        >>> " ".join(cmd)
+        'xcrun xctrace record --template Power Profiler --instrument Time Profiler
+         --instrument Network --device 00008120-... --attach Soul_New
+         --time-limit 300s --output /tmp/composite.trace --no-prompt'
+    """
+    cmd = ["xcrun", "xctrace", "record"]
+
+    # 基础模板
+    if base_template.custom_path:
+        cmd.extend(["--template", base_template.custom_path])
+    else:
+        cmd.extend(["--template", base_template.template_arg])
+
+    # 附加 instruments (每个 --instrument 叠加一个)
+    for inst_name in instruments:
+        cmd.extend(["--instrument", inst_name])
+
+    cmd.extend(["--device", device])
+
+    if base_template.requires_attach and attach:
+        cmd.extend(["--attach", attach])
+
+    cmd.extend(["--time-limit", f"{int(duration_sec)}s"])
+
+    if output_path:
+        cmd.extend(["--output", output_path])
+
+    cmd.append("--no-prompt")
+
+    if extra_args:
+        cmd.extend(extra_args)
+
+    return cmd
+
+
+def resolve_composite(
+    spec: str, lib: Optional["TemplateLibrary"] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    解析 composite 规格字符串, 返回构建命令所需的完整信息。
+
+    支持格式:
+    - 预置名: "full", "webperf", "power_cpu", "gpu_full", "memory"
+    - 自由组合: "power+time+network" (第一个为 base, 其余为附加 instrument)
+
+    Returns:
+        {
+            "base_template": InstrumentTemplate,
+            "instruments": ["Time Profiler", ...],   # 附加 instrument 显示名
+            "schemas": [...],                         # 聚合可导出 schema
+            "preset": "full" or "",                   # 使用的预置名
+        }
+        或 None (无法解析)
+    """
+    if lib is None:
+        lib = TemplateLibrary()
+
+    # 1. 尝试匹配预置名
+    preset = COMPOSITE_PRESETS.get(spec.lower())
+    if preset:
+        base_tpl = lib.get(preset["base_template"])
+        if base_tpl is None:
+            return None
+        return {
+            "base_template": base_tpl,
+            "instruments": list(preset["instruments"]),
+            "schemas": list(preset["schemas"]),
+            "preset": spec.lower(),
+        }
+
+    # 2. 尝试 "+" 分隔的自由组合: "power+time+network"
+    if "+" in spec:
+        parts = [p.strip() for p in spec.split("+") if p.strip()]
+        if len(parts) < 2:
+            return None
+
+        # 第一个作为 base template
+        base_tpl = lib.resolve(parts[0])
+        if base_tpl is None:
+            return None
+
+        # 其余映射为 instrument 显示名
+        extra_instruments = []
+        extra_schemas = list(base_tpl.schemas)
+        for part in parts[1:]:
+            resolved = lib.resolve(part)
+            if resolved:
+                extra_instruments.append(resolved.name)
+                extra_schemas.extend(resolved.schemas)
+            else:
+                # 直接当作 instrument 名传入 (用户可能用 xctrace list instruments 中的名字)
+                extra_instruments.append(part)
+
+        return {
+            "base_template": base_tpl,
+            "instruments": extra_instruments,
+            "schemas": extra_schemas,
+            "preset": "",
+        }
+
+    return None
 
 
 # ── 设备探测 ──

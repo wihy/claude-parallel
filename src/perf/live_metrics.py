@@ -101,6 +101,28 @@ SCHEMA_COLUMNS = {
     "device-thermal-state-intervals": {
         "Thermal State": "_thermal_state",
     },
+    # ── Composite 模式额外 schema ──
+    "time-profile": {
+        "CPU Time": "cpu_time_ms",
+    },
+    "TimeProfiler": {
+        "Weight": "cpu_weight",
+    },
+    "networking": {
+        "Bytes In": "net_bytes_in",
+        "Bytes Out": "net_bytes_out",
+        "Connections": "net_connections",
+    },
+    "GPU": {
+        "GPU Time": "gpu_time_ms",
+        "Vertex Fetch": "gpu_vertex_fetch",
+    },
+    "cpu-track": {
+        "CPU": "cpu_pct",
+    },
+    "physical-memory-track": {
+        "Physical Memory": "mem_mb",
+    },
 }
 
 

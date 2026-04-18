@@ -141,6 +141,19 @@ class PerfIntegrator:
         elif sampling.get("reason"):
             print(f"  [perf] Sampling 未启动: {sampling['reason']}")
 
+        # DvtBridge 状态
+        dvt_bridge = meta.get("dvt_bridge", {})
+        if dvt_bridge.get("status") == "running":
+            dm = meta.get("device_metrics", {})
+            src = dm.get("source", "?")
+            procs = dm.get("process_names", [])
+            print(
+                f"  [perf] DvtBridge 已启动 (source={src}, "
+                f"processes={procs}, tunneld={dvt_bridge.get('tunneld', False)})"
+            )
+        elif meta.get("device_metrics", {}).get("source") == "cli_subprocess":
+            print(f"  [perf] 指标采集: CLI 子进程模式 (DvtBridge 不可用)")
+
         return meta
 
     def on_level_start(self, level_idx: int, task_ids: list) -> None:
@@ -376,6 +389,13 @@ class PerfIntegrator:
             if agg.get("top"):
                 text = format_hotspots_text([agg], top_n=10)
                 print(text)
+
+        # DvtBridge 实时指标
+        dvt_metrics = report.get("dvt_metrics", {})
+        if dvt_metrics:
+            dvt_text = self.session.format_dvt_metrics_text(dvt_metrics)
+            if dvt_text:
+                print(dvt_text)
 
         # Baseline / Gate
         gate = report.get("gate", {})
