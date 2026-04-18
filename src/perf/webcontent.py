@@ -76,11 +76,19 @@ def find_webcontent_pids(device_udid: str) -> List[Dict[str, Any]]:
 
 class WebContentProfiler:
     """
-    WebContent 进程 Time Profiler 采集。
+    WebContent 进程 Time Profiler 采集 (带 PID 动态刷新)。
 
     以独立子进程运行 xctrace record，采集 WebContent 进程的
     JS/WebKit 热点函数。采集完成后导出解析到 webcontent_hotspots.jsonl。
+
+    改进:
+    - PID 动态刷新: 每隔 N 个 cycle 重新扫描 WebContent PID
+    - PID 变化事件记录到 JSONL
+    - WebContent 进程重建后自动迁移采集目标
     """
+
+    # PID 刷新间隔 (每 N 个 cycle 检查一次)
+    PID_REFRESH_INTERVAL = 5
 
     def __init__(
         self,
@@ -129,7 +137,7 @@ class WebContentProfiler:
 
         wc_pid = wc["pid"]
 
-        # 启动 daemon 子进程
+        # 启动 daemon 子进程 — 传入 PID_REFRESH_INTERVAL
         daemon_code = (
             "import sys, signal, json, time; "
             "from pathlib import Path; "
@@ -139,7 +147,8 @@ class WebContentProfiler:
             f"{self.device_udid!r},"
             f"{wc_pid},"
             f"{self.interval_sec},"
-            f"{self.top_n})"
+            f"{self.top_n},"
+            f"{self.PID_REFRESH_INTERVAL})"
         )
         cmd = [sys.executable, "-c", daemon_code]
 
@@ -164,6 +173,7 @@ class WebContentProfiler:
             "gpu_pid": gpu["pid"] if gpu else None,
             "hotspots_file": str(self.hotspots_file),
             "all_webkit_processes": wk_procs,
+            "pid_refresh_interval": self.PID_REFRESH_INTERVAL,
         }
 
     def stop(self):
@@ -220,8 +230,15 @@ def _webcontent_cycle_loop(
     webcontent_pid: int,
     interval_sec: int,
     top_n: int,
+    pid_refresh_interval: int = 5,
 ):
-    """WebContent 采集 daemon 入口。SIGTERM 退出。"""
+    """WebContent 采集 daemon 入口 (带 PID 动态刷新)。SIGTERM 退出。
+
+    改进:
+    - 每隔 pid_refresh_interval 个 cycle 重新扫描 WebContent PID
+    - PID 变化时记录事件到 JSONL，并自动迁移到新 PID
+    - 连续多次找不到 WebContent 进程时自动停止
+    """
     import signal as _sig
     from concurrent.futures import ThreadPoolExecutor, Future
 
@@ -244,7 +261,9 @@ def _webcontent_cycle_loop(
 
     tpl = BUILTIN_TEMPLATES["time"]
     cycle = 0
+    current_pid = webcontent_pid
     consecutive_failures = 0
+    pid_not_found_count = 0
     pool = ThreadPoolExecutor(max_workers=1)
     pending: Optional[Future] = None
 
@@ -255,16 +274,88 @@ def _webcontent_cycle_loop(
         except Exception:
             pass
 
+    def _write_pid_event(event_type: str, old_pid: int, new_pid: int, detail: str = ""):
+        """记录 PID 变化事件到 JSONL。"""
+        try:
+            import fcntl
+            line = json.dumps({
+                "ts": time.time(),
+                "cycle": cycle,
+                "event": event_type,
+                "old_pid": old_pid,
+                "new_pid": new_pid,
+                "detail": detail,
+            }, ensure_ascii=False)
+            with open(hotspots_file, "a", encoding="utf-8") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    f.write(line + "\n")
+                    f.flush()
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception:
+            pass
+
     try:
         while running:
             cycle += 1
+
+            # ── PID 刷新检查 ──
+            if cycle > 1 and (cycle % pid_refresh_interval) == 0:
+                _log(f"cycle {cycle}: 刷新 WebContent PID...")
+                new_procs = find_webcontent_pids(device_udid)
+                new_wc = next((p for p in new_procs if p["role"] == "js"), None)
+
+                if new_wc:
+                    pid_not_found_count = 0
+                    if new_wc["pid"] != current_pid:
+                        old_pid = current_pid
+                        current_pid = new_wc["pid"]
+                        _log(
+                            f"cycle {cycle}: PID 变化 "
+                            f"{old_pid} -> {current_pid}"
+                        )
+                        _write_pid_event(
+                            "webcontent_pid_change",
+                            old_pid=old_pid,
+                            new_pid=current_pid,
+                            detail=f"detected at cycle {cycle}",
+                        )
+                    else:
+                        _log(f"cycle {cycle}: PID 未变 ({current_pid})")
+                else:
+                    pid_not_found_count += 1
+                    _log(
+                        f"cycle {cycle}: WebContent 进程未找到 "
+                        f"(连续 {pid_not_found_count} 次)"
+                    )
+                    _write_pid_event(
+                        "webcontent_pid_lost",
+                        old_pid=current_pid,
+                        new_pid=0,
+                        detail=f"not found at cycle {cycle}, "
+                               f"consecutive={pid_not_found_count}",
+                    )
+                    if pid_not_found_count >= 3:
+                        _log("auto-stop: WebContent 进程连续 3 次未找到")
+                        break
+                    # 不退出，等下一个刷新周期再检查
+                    consecutive_failures += 1
+                    continue
+
+            # ── 验证当前 PID 是否存活 ──
+            if current_pid <= 0:
+                _log(f"cycle {cycle}: 无有效 PID，跳过")
+                consecutive_failures += 1
+                continue
+
             trace_path = traces_tmp / f"wc_cycle_{cycle}.trace"
 
             # Record
             cmd = build_xctrace_record_cmd(
                 template=tpl,
                 device=device_udid,
-                attach=str(webcontent_pid),
+                attach=str(current_pid),
                 duration_sec=interval_sec,
                 output_path=str(trace_path),
             )
@@ -283,6 +374,17 @@ def _webcontent_cycle_loop(
                             _log("auto-stop: xctrace slot occupied")
                             break
                         time.sleep(3)
+                        continue
+                    if "not found" in stderr_text.lower() or "does not exist" in stderr_text.lower():
+                        # PID 对应的进程不存在
+                        _log(f"cycle {cycle}: PID {current_pid} 不存在")
+                        _write_pid_event(
+                            "webcontent_pid_gone",
+                            old_pid=current_pid,
+                            new_pid=0,
+                            detail=f"attach failed at cycle {cycle}",
+                        )
+                        consecutive_failures += 1
                         continue
 
                 if proc.returncode != 0:
@@ -317,7 +419,7 @@ def _webcontent_cycle_loop(
                 pending = pool.submit(
                     _export_webcontent_cycle,
                     cycle, trace_path, exports_tmp, hotspots_file,
-                    top_n, interval_sec, _log,
+                    top_n, interval_sec, current_pid, _log,
                 )
 
             consecutive_failures = 0
@@ -339,6 +441,7 @@ def _export_webcontent_cycle(
     hotspots_file: Path,
     top_n: int,
     interval_sec: int,
+    current_pid: int,
     log_fn,
 ):
     """导出 + 解析 + 追加 JSONL。"""
@@ -361,6 +464,7 @@ def _export_webcontent_cycle(
             "ts": time.time(),
             "cycle": cycle,
             "process": "WebContent",
+            "pid": current_pid,
             "duration_s": interval_sec,
             "sample_count": int(total),
             "top": top,
@@ -417,15 +521,45 @@ def format_webcontent_hotspots(
 ) -> str:
     if not snapshots:
         return "  (无 WebContent 热点数据)"
+
     lines = []
     for snap in snapshots:
+        # PID 变化事件
+        if snap.get("event") in ("webcontent_pid_change", "webcontent_pid_lost", "webcontent_pid_gone"):
+            evt = snap["event"]
+            old_pid = snap.get("old_pid", "?")
+            new_pid = snap.get("new_pid", "?")
+            detail = snap.get("detail", "")
+            ts = snap.get("ts", 0)
+            ts_str = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "?"
+            cycle = snap.get("cycle", "?")
+            if evt == "webcontent_pid_change":
+                lines.append(
+                    f"  ── [PID 变化] Cycle {cycle} @ {ts_str}: "
+                    f"PID {old_pid} -> {new_pid}  ({detail}) ──"
+                )
+            elif evt == "webcontent_pid_lost":
+                lines.append(
+                    f"  ── [PID 丢失] Cycle {cycle} @ {ts_str}: "
+                    f"PID {old_pid} not found  ({detail}) ──"
+                )
+            else:
+                lines.append(
+                    f"  ── [PID 消失] Cycle {cycle} @ {ts_str}: "
+                    f"PID {old_pid} gone  ({detail}) ──"
+                )
+            lines.append("")
+            continue
+
+        # 普通热点数据
         ts = snap.get("ts", 0)
         ts_str = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "?"
         cycle = snap.get("cycle", "?")
         samples = snap.get("sample_count", 0)
+        pid = snap.get("pid", "?")
         lines.append(
             f"  ── WebContent Cycle {cycle} @ {ts_str} "
-            f"({samples} samples, {snap.get('duration_s', '?')}s) ──"
+            f"(PID={pid}, {samples} samples, {snap.get('duration_s', '?')}s) ──"
         )
         top = snap.get("top", [])[:top_n]
         if not top:

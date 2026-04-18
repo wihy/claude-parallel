@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable
 
+from .reconnect import ReconnectableMixin, ReconnectPolicy
+
 
 # ── 规则定义 ──
 
@@ -221,15 +223,16 @@ DEFAULT_RULES: List[LogRule] = [
 
 # ── 分析器 ──
 
-class LiveLogAnalyzer:
+class LiveLogAnalyzer(ReconnectableMixin):
     """
-    实时 syslog 流式分析器。
+    实时 syslog 流式分析器 (带自动重连)。
 
     工作方式:
     1. 启动 idevicesyslog 进程
     2. 逐行读取 stdout, 对每行应用所有规则
     3. 命中规则时触发回调 + 写告警日志 + 可选 mark_event
     4. 后台线程运行, 主线程可随时查询告警统计
+    5. idevicesyslog 进程退出时自动重连 (指数退避)
     """
 
     def __init__(
@@ -240,7 +243,22 @@ class LiveLogAnalyzer:
         alert_log_path: Optional[str] = None,
         perf_manager=None,  # Optional[PerfSessionManager]
         buffer_lines: int = 200,
+        reconnect_policy: Optional[ReconnectPolicy] = None,
     ):
+        # 初始化重连 mixin
+        policy = reconnect_policy or ReconnectPolicy(
+            max_retries=20,
+            initial_delay_sec=2.0,
+            max_delay_sec=30.0,
+            backoff_factor=2.0,
+        )
+        super().__init__(
+            policy=policy,
+            stop_event=threading.Event(),
+            on_disconnect=self._on_syslog_disconnect,
+            on_reconnect=self._on_syslog_reconnect,
+        )
+
         self.device = device
         self.rules = rules if rules is not None else [copy.deepcopy(r) for r in DEFAULT_RULES]
         self.alert_callback = alert_callback
@@ -265,23 +283,11 @@ class LiveLogAnalyzer:
         if self._running.is_set():
             return {"status": "already_running"}
 
-        cmd = ["idevicesyslog"]
-        if self.device:
-            cmd.extend(["-u", self.device])
+        # 同步 stop_event 给 mixin
+        self._stop_event = self._running
 
-        try:
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,  # 行缓冲
-                text=True,
-                errors="replace",
-            )
-        except FileNotFoundError:
-            return {"status": "error", "error": "idevicesyslog not found. Install: brew install libimobiledevice"}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+        if not self._spawn_syslog_process():
+            return {"status": "error", "error": "idevicesyslog spawn failed (see logs)"}
 
         self._running.set()
         self._start_time = time.time()
@@ -290,8 +296,11 @@ class LiveLogAnalyzer:
         if self.alert_log_path:
             self.alert_log_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # 重置重连计数
+        self._reconnect_stats.current_retry = 0
+
         # 后台线程
-        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread = threading.Thread(target=self._reconnectable_reader_loop, daemon=True)
         self._thread.start()
 
         return {
@@ -300,6 +309,7 @@ class LiveLogAnalyzer:
             "device": self.device or "auto",
             "rules_count": len(self.rules),
             "rules": [r.name for r in self.rules],
+            "reconnect_enabled": True,
         }
 
     def stop(self) -> Dict[str, Any]:
@@ -335,7 +345,7 @@ class LiveLogAnalyzer:
         """获取当前分析摘要"""
         with self._lock:
             duration = time.time() - self._start_time if self._start_time else 0
-            return {
+            summary = {
                 "status": "running" if self._running.is_set() else "stopped",
                 "device": self.device or "auto",
                 "duration_sec": round(duration, 1),
@@ -346,6 +356,9 @@ class LiveLogAnalyzer:
                 "rules_count": len(self.rules),
                 "line_buffer_size": len(self._line_buffer),
             }
+        # 加入重连统计
+        summary["reconnect"] = self.get_reconnect_stats()
+        return summary
 
     def get_alerts(self, level: str = "", limit: int = 50) -> List[Dict[str, Any]]:
         """获取告警列表"""
@@ -430,17 +443,111 @@ class LiveLogAnalyzer:
 
     # ── 内部 ──
 
-    def _reader_loop(self):
-        """后台读取 syslog 逐行分析"""
+    def _spawn_syslog_process(self) -> bool:
+        """启动/重新启动 idevicesyslog 子进程。返回是否成功。"""
+        cmd = ["idevicesyslog"]
+        if self.device:
+            cmd.extend(["-u", self.device])
+
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,  # 行缓冲
+                text=True,
+                errors="replace",
+            )
+            return True
+        except FileNotFoundError:
+            self._log_error("idevicesyslog not found. Install: brew install libimobiledevice")
+            return False
+        except Exception as e:
+            self._log_error(f"idevicesyslog spawn failed: {e!r}")
+            return False
+
+    def _on_syslog_disconnect(self, reason: str):
+        """重连 mixin 回调: 断连时记录到告警日志。"""
+        self._log_error(f"syslog 断连: {reason}")
+        if self.perf_manager:
+            try:
+                self.perf_manager.mark_event(
+                    "syslog_disconnect",
+                    detail=f"idevicesyslog disconnected: {reason}",
+                )
+            except Exception:
+                pass
+
+    def _on_syslog_reconnect(self):
+        """重连 mixin 回调: 重连成功时记录事件。"""
+        self._log_error(f"syslog 重连成功 (PID={self._process.pid if self._process else '?'})")
+        if self.perf_manager:
+            try:
+                self.perf_manager.mark_event(
+                    "syslog_reconnect",
+                    detail=f"idevicesyslog reconnected (PID={self._process.pid})",
+                )
+            except Exception:
+                pass
+
+    def _reconnectable_reader_loop(self):
+        """外层循环: 断连时自动重连。"""
+        while self._running.is_set():
+            # 内层读取循环
+            exited_normally = self._inner_reader_loop()
+
+            # 如果是主动停止或 EOF 不需要重连
+            if not self._running.is_set():
+                break
+
+            if exited_normally:
+                # 进程正常退出 (可能设备断开)，尝试重连
+                self._handle_disconnect("idevicesyslog process exited")
+
+            if not self._should_retry():
+                self._mark_reconnect_failed()
+                break
+
+            # 退避等待
+            delay = self._get_backoff_delay()
+            self._log_error(
+                f"syslog 重连等待 {delay:.1f}s "
+                f"(retry={self._reconnect_stats.current_retry})"
+            )
+            if not self._reconnect_sleep(delay):
+                break  # 被 stop 打断
+
+            # 尝试重连
+            if self._spawn_syslog_process():
+                self._mark_reconnected()
+            else:
+                # spawn 失败，继续下一轮退避
+                self._handle_disconnect("idevicesyslog spawn failed")
+                if not self._should_retry():
+                    self._mark_reconnect_failed()
+                    break
+
+        self._running.clear()
+
+    def _inner_reader_loop(self) -> bool:
+        """内层循环: 逐行读取 syslog 并分析。
+
+        Returns:
+            True 表示进程退出 (非异常)，需要重连
+            False 表示读取异常或被 stop 打断
+        """
         try:
             while self._running.is_set() and self._process and self._process.poll() is None:
                 try:
                     line = self._process.stdout.readline()
                 except Exception as e:
-                    # 读取错误（例如设备断开）— 记录并退出循环
                     self._log_error(f"syslog readline 失败: {e!r}")
-                    break
+                    return True  # 尝试重连
+
                 if not line:
+                    # poll() 检查进程是否真的退出了
+                    if self._process.poll() is not None:
+                        return True  # 进程退出，触发重连
                     time.sleep(0.1)
                     continue
 
@@ -457,15 +564,14 @@ class LiveLogAnalyzer:
 
                     self._analyze_line(line)
                 except Exception as e:
-                    # 单行分析异常不影响整体 — 记录后继续
                     self._log_error(f"_analyze_line 异常: {e!r}")
+
+            return True  # 正常退出循环 (进程退出)
+
         except Exception as e:
-            # 仅当处于运行态时才视为异常退出
             if self._running.is_set():
-                self._log_error(f"_reader_loop 异常退出: {e!r}")
-        finally:
-            if self._running.is_set():
-                self._log_error("_reader_loop 提前结束（设备断开？）")
+                self._log_error(f"_inner_reader_loop 异常: {e!r}")
+            return False
 
     def _log_error(self, msg: str):
         """把后台线程异常写到 alert log 旁边的 errors.log，避免静默。"""

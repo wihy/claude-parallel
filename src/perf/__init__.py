@@ -14,6 +14,7 @@ cpar perf 子包 — 真机性能采集、实时分析、报告生成。
 """
 
 from .config import PerfConfig
+from .reconnect import ReconnectableMixin, ReconnectPolicy
 from .session import PerfSessionManager
 from .live_log import LiveLogAnalyzer, LogRule, DEFAULT_RULES
 from .live_metrics import (
@@ -68,11 +69,15 @@ from .deep_export import (
 from .symbolicate import (
     find_dsym,
     find_dsym_by_uuid,
+    find_dsym_in_archives,
+    find_dsym_app_store_connect,
     symbolicate_addresses,
     swift_demangle,
     symbolicate_hotspots,
     cache_dsym_map,
     auto_symbolicate,
+    extract_binary_uuid,
+    extract_app_uuid_from_device,
 )
 from .time_sync import (
     SyslogEvent,
@@ -114,6 +119,8 @@ from .ai_diagnosis import (
 
 __all__ = [
     "PerfConfig",
+    "ReconnectableMixin",
+    "ReconnectPolicy",
     "PerfSessionManager",
     "LiveLogAnalyzer",
     "LogRule",
@@ -145,11 +152,15 @@ __all__ = [
     "format_hotspots_text",
     "find_dsym",
     "find_dsym_by_uuid",
+    "find_dsym_in_archives",
+    "find_dsym_app_store_connect",
     "symbolicate_addresses",
     "swift_demangle",
     "symbolicate_hotspots",
     "cache_dsym_map",
     "auto_symbolicate",
+    "extract_binary_uuid",
+    "extract_app_uuid_from_device",
     # deep_export
     "DEEP_SCHEMAS",
     "export_deep_schema",
