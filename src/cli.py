@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.orchestrator import Orchestrator
 from src.validator import TaskValidator
 from src.perf import PerfConfig, PerfSessionManager
+from src.perf.perf_defaults import PerfDefaults
 
 VERSION = "0.3.0"
 
@@ -535,54 +536,87 @@ async def cmd_logs(args):
             print(f"    {lf.stem}.log  ({size:,} bytes)")
 
 
+def _resolve_perf_repo_tag(args, require_repo=True):
+    """统一解析 perf 子命令的 repo 和 tag 参数。
+
+    优先级: CLI 显式参数 > 环境变量 > ~/.cpar/perf_defaults.json > 硬编码默认值
+
+    Returns: (repo_path: Path, tag: str, defaults: PerfDefaults) 或 (None, None, defaults)
+    """
+    defaults = PerfDefaults.load()
+    repo_str = defaults.resolve("repo", getattr(args, "repo", None))
+    if require_repo and not repo_str:
+        print("  错误: 未指定项目仓库路径。")
+        print("  用法: cpar perf <cmd> --repo /path/to/project")
+        print("  或先设置默认: cpar perf config set repo /path/to/project")
+        return None, None, defaults
+    tag = defaults.resolve("tag", getattr(args, "tag", None), "perf")
+    repo = Path(repo_str).expanduser().resolve() if repo_str else None
+    return repo, tag, defaults
+
+
 async def cmd_perf_start(args):
-    repo = Path(args.repo).expanduser().resolve()
+    repo, tag, defaults = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
+    attach = defaults.resolve("attach", getattr(args, "attach", None), "")
     cfg = PerfConfig(
         enabled=True,
-        tag=args.tag,
+        tag=tag,
         device=args.device or "",
-        attach=args.attach or "",
-        duration_sec=args.duration,
-        templates=args.templates,
-        baseline_tag=args.baseline or "",
-        threshold_pct=args.threshold_pct or 0.0,
+        attach=attach,
+        duration_sec=int(defaults.resolve("duration", getattr(args, "duration", None), 1800)),
+        templates=defaults.resolve("templates", getattr(args, "templates", None), "power"),
+        baseline_tag=defaults.resolve("baseline", getattr(args, "baseline", None), ""),
+        threshold_pct=float(defaults.resolve("threshold_pct", getattr(args, "threshold_pct", None), 0.0)),
         sampling_enabled=getattr(args, "sampling", False),
-        sampling_interval_sec=int(getattr(args, "sampling_interval", 10) or 10),
-        sampling_top_n=int(getattr(args, "sampling_top", 10) or 10),
+        sampling_interval_sec=int(defaults.resolve("sampling_interval", getattr(args, "sampling_interval", None), 10)),
+        sampling_top_n=int(defaults.resolve("sampling_top", getattr(args, "sampling_top", None), 10)),
         sampling_retention=int(getattr(args, "sampling_retention", 30) or 30),
-        metrics_source=getattr(args, "metrics_source", "auto") or "auto",
-        metrics_interval_ms=int(getattr(args, "metrics_interval", 1000) or 1000),
-        battery_interval_sec=int(getattr(args, "battery_interval", 10) or 10),
-        attach_webcontent=getattr(args, "attach_webcontent", False),
-        composite=getattr(args, "composite", "auto") or "auto",
+        metrics_source=defaults.resolve("metrics_source", getattr(args, "metrics_source", None), "auto"),
+        metrics_interval_ms=int(defaults.resolve("metrics_interval", getattr(args, "metrics_interval", None), 1000)),
+        battery_interval_sec=int(defaults.resolve("battery_interval", getattr(args, "battery_interval", None), 10)),
+        attach_webcontent=defaults.resolve_bool("attach_webcontent", getattr(args, "attach_webcontent", None), False),
+        composite=defaults.resolve("composite", getattr(args, "composite", None), "auto"),
     )
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     meta = perf.start()
+
+    # 首次使用时自动保存关键参数
+    defaults.update_from_args(args)
     print(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
 async def cmd_perf_stop(args):
-    repo = Path(args.repo).expanduser().resolve()
-    cfg = PerfConfig(enabled=True, tag=args.tag)
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
+    cfg = PerfConfig(enabled=True, tag=tag)
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     meta = perf.stop()
     print(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
 async def cmd_perf_tail(args):
-    repo = Path(args.repo).expanduser().resolve()
-    cfg = PerfConfig(enabled=True, tag=args.tag)
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
+    cfg = PerfConfig(enabled=True, tag=tag)
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     print(perf.tail_syslog(lines=args.lines))
 
 
 async def cmd_perf_report(args):
-    repo = Path(args.repo).expanduser().resolve()
+    repo, tag, defaults = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
+    baseline = defaults.resolve("baseline", getattr(args, "baseline", None), "")
+    threshold = float(defaults.resolve("threshold_pct", getattr(args, "threshold_pct", None), 0.0))
     cfg = PerfConfig(
         enabled=True,
-        tag=args.tag,
-        baseline_tag=args.baseline or "",
-        threshold_pct=args.threshold_pct or 0.0,
+        tag=tag,
+        baseline_tag=baseline,
+        threshold_pct=threshold,
     )
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     with_cs = getattr(args, "with_callstack", False)
@@ -638,6 +672,33 @@ async def cmd_perf_devices(args):
         print(proc.stderr.strip() or "xctrace list devices failed")
         return
     print(proc.stdout)
+
+
+async def cmd_perf_config(args):
+    """查看/修改 perf 默认配置"""
+    defaults = PerfDefaults.load()
+    action = getattr(args, "config_action", "show")
+
+    if action == "show" or not action:
+        print(defaults.show())
+
+    elif action == "set":
+        field = args.field
+        value = args.value
+        try:
+            defaults.set(field, value)
+            print(f"  已设置: {field} = {value}")
+        except KeyError as e:
+            print(f"  错误: {e}")
+
+    elif action == "unset":
+        field = args.field
+        defaults.unset(field)
+        print(f"  已清除: {field}")
+
+    else:
+        print(f"  未知操作: {action}")
+        print("  用法: cpar perf config [show|set|unset]")
 
 
 async def cmd_perf_live(args):
@@ -896,8 +957,10 @@ async def cmd_perf_snapshot(args):
 
 async def cmd_perf_callstack(args):
     """调用栈分析 (Time Profiler)"""
-    repo = Path(args.repo).expanduser().resolve()
-    cfg = PerfConfig(enabled=True, tag=args.tag)
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
+    cfg = PerfConfig(enabled=True, tag=tag)
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     data = perf.callstack(
         top_n=args.top,
@@ -919,8 +982,10 @@ async def cmd_perf_metrics(args):
     """Per-process 指标查看"""
     from src.perf.device_metrics import read_process_metrics_jsonl, format_process_metrics_text
 
-    repo = Path(args.repo).expanduser().resolve()
-    jsonl = repo / ".claude-parallel" / "perf" / args.tag / "logs" / "process_metrics.jsonl"
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
+    jsonl = repo / ".claude-parallel" / "perf" / tag / "logs" / "process_metrics.jsonl"
 
     if not jsonl.exists():
         print(f"  [perf] 未找到进程指标: {jsonl}")
@@ -941,8 +1006,10 @@ async def cmd_perf_battery(args):
     """电池趋势查看"""
     from src.perf.device_metrics import read_battery_jsonl, format_battery_text
 
-    repo = Path(args.repo).expanduser().resolve()
-    jsonl = repo / ".claude-parallel" / "perf" / args.tag / "logs" / "battery.jsonl"
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
+    jsonl = repo / ".claude-parallel" / "perf" / tag / "logs" / "battery.jsonl"
 
     if not jsonl.exists():
         print(f"  [perf] 未找到电池数据: {jsonl}")
@@ -964,8 +1031,9 @@ async def cmd_perf_dashboard(args):
     import time as _time
     from src.perf.device_metrics import read_battery_jsonl
 
-    repo = Path(args.repo).expanduser().resolve()
-    tag = args.tag
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
     logs_dir = repo / ".claude-parallel" / "perf" / tag / "logs"
     metrics_jsonl = logs_dir / "metrics.jsonl"
     battery_jsonl = logs_dir / "battery.jsonl"
@@ -1094,8 +1162,10 @@ async def cmd_perf_webcontent(args):
     """WebContent 进程热点查看"""
     from src.perf.webcontent import read_webcontent_hotspots, format_webcontent_hotspots
 
-    repo = Path(args.repo).expanduser().resolve()
-    hotspots_file = repo / ".claude-parallel" / "perf" / args.tag / "logs" / "webcontent_hotspots.jsonl"
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
+    hotspots_file = repo / ".claude-parallel" / "perf" / tag / "logs" / "webcontent_hotspots.jsonl"
 
     if not hotspots_file.exists():
         print(f"  [perf] 未找到 WebContent 热点: {hotspots_file}")
@@ -1116,8 +1186,10 @@ async def cmd_perf_hotspots(args):
     """运行时热点函数查看"""
     from src.perf.sampling import read_hotspots_jsonl, format_hotspots_text
 
-    repo = Path(args.repo).expanduser().resolve()
-    hotspots_file = repo / ".claude-parallel" / "perf" / args.tag / "logs" / "hotspots.jsonl"
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
+    hotspots_file = repo / ".claude-parallel" / "perf" / tag / "logs" / "hotspots.jsonl"
 
     if not hotspots_file.exists():
         print(f"  [perf] 未找到热点数据: {hotspots_file}")
@@ -1232,8 +1304,9 @@ async def cmd_perf_symbolicate(args):
     )
     from src.perf.sampling import read_hotspots_jsonl
 
-    repo = Path(args.repo).expanduser().resolve()
-    tag = args.tag
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
     logs_dir = repo / ".claude-parallel" / "perf" / tag / "logs"
 
     # 查找 dSYM
@@ -1299,8 +1372,9 @@ async def cmd_perf_time_sync(args):
         run_time_sync,
     )
 
-    repo = Path(args.repo).expanduser().resolve()
-    tag = args.tag
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
     session_dir = repo / ".claude-parallel" / "perf" / tag
 
     # 查找 syslog
@@ -1342,8 +1416,9 @@ async def cmd_perf_deep_export(args):
         deep_export_all, format_deep_report, probe_trace_schemas,
     )
 
-    repo = Path(args.repo).expanduser().resolve()
-    tag = args.tag
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
     session_dir = repo / ".claude-parallel" / "perf" / tag
     traces_dir = session_dir / "traces"
     exports_dir = session_dir / "exports"
@@ -1393,8 +1468,9 @@ async def cmd_perf_power_attr(args):
         attribute_power, format_attribution_report,
     )
 
-    repo = Path(args.repo).expanduser().resolve()
-    tag = args.tag
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
     session_dir = repo / ".claude-parallel" / "perf" / tag
     exports_dir = session_dir / "exports"
     logs_dir = session_dir / "logs"
@@ -1449,8 +1525,9 @@ async def cmd_perf_ai_diag(args):
         run_diagnosis, generate_regression_analysis, generate_webkit_report,
     )
 
-    repo = Path(args.repo).expanduser().resolve()
-    tag = args.tag
+    repo, tag, _ = _resolve_perf_repo_tag(args)
+    if not repo:
+        return
     session_dir = repo / ".claude-parallel" / "perf" / tag
 
     print(f"  [ai-diag] 收集诊断上下文...")
@@ -1622,7 +1699,7 @@ def main():
     perf_sub = perf_parser.add_subparsers(dest="perf_cmd")
 
     perf_start = perf_sub.add_parser("start", help="启动 perf 采集")
-    perf_start.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_start.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_start.add_argument("--tag", default="perf", help="会话标签")
     perf_start.add_argument("--device", default="", help="xctrace UDID")
     perf_start.add_argument("--attach", default="", help="xctrace attach 进程")
@@ -1644,16 +1721,16 @@ def main():
     )
 
     perf_stop = perf_sub.add_parser("stop", help="停止 perf 采集")
-    perf_stop.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_stop.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_stop.add_argument("--tag", default="perf", help="会话标签")
 
     perf_tail = perf_sub.add_parser("tail", help="查看实时 syslog")
-    perf_tail.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_tail.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_tail.add_argument("--tag", default="perf", help="会话标签")
     perf_tail.add_argument("--lines", type=int, default=80, help="最后 N 行")
 
     perf_report = perf_sub.add_parser("report", help="生成 perf 报告")
-    perf_report.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_report.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_report.add_argument("--tag", default="perf", help="会话标签")
     perf_report.add_argument("--baseline", default="", help="baseline tag")
     perf_report.add_argument("--threshold-pct", type=float, default=0.0, help="阈值(%%)")
@@ -1664,6 +1741,16 @@ def main():
     perf_report.add_argument("--html-output", default="", help="HTML 输出路径 (默认 <session>/report.html)")
 
     perf_devices = perf_sub.add_parser("devices", help="列出 xctrace 设备")
+
+    # ── perf config (默认配置管理) ──
+    perf_config = perf_sub.add_parser("config", help="查看/修改 perf 默认配置")
+    perf_config_sub = perf_config.add_subparsers(dest="config_action")
+    perf_config_show = perf_config_sub.add_parser("show", help="查看当前默认配置")
+    perf_config_set = perf_config_sub.add_parser("set", help="设置默认值")
+    perf_config_set.add_argument("field", help="字段名 (repo/attach/tag/templates/...)")
+    perf_config_set.add_argument("value", help="字段值")
+    perf_config_unset = perf_config_sub.add_parser("unset", help="清除默认值")
+    perf_config_unset.add_argument("field", help="字段名")
 
     # ── perf live (实时 syslog 分析) ──
     perf_live = perf_sub.add_parser("live", help="实时 syslog 告警分析")
@@ -1692,7 +1779,7 @@ def main():
 
     # ── perf webcontent (WebContent 热点) ──
     perf_wc = perf_sub.add_parser("webcontent", help="WebContent 进程 JS/WebKit 热点")
-    perf_wc.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_wc.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_wc.add_argument("--tag", default="perf", help="会话标签")
     perf_wc.add_argument("--top", type=int, default=15, help="Top N 热点")
     perf_wc.add_argument("--last", type=int, default=0, help="最近 N 个 cycle")
@@ -1700,7 +1787,7 @@ def main():
 
     # ── perf dashboard (全指标仪表盘) ──
     perf_dash = perf_sub.add_parser("dashboard", help="全指标统一仪表盘 (时序表+汇总)")
-    perf_dash.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_dash.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_dash.add_argument("--tag", default="perf", help="会话标签")
     perf_dash.add_argument("--last", type=int, default=0, help="最近 N 个快照 (0=全部)")
     perf_dash.add_argument("--json", action="store_true", help="JSON 格式输出")
@@ -1708,21 +1795,21 @@ def main():
 
     # ── perf metrics (per-process 指标) ──
     perf_metrics = perf_sub.add_parser("metrics", help="Per-process CPU/内存指标")
-    perf_metrics.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_metrics.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_metrics.add_argument("--tag", default="perf", help="会话标签")
     perf_metrics.add_argument("--last", type=int, default=10, help="最近 N 条")
     perf_metrics.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     # ── perf battery (电池趋势) ──
     perf_battery = perf_sub.add_parser("battery", help="电池功耗趋势")
-    perf_battery.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_battery.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_battery.add_argument("--tag", default="perf", help="会话标签")
     perf_battery.add_argument("--last", type=int, default=10, help="最近 N 条")
     perf_battery.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     # ── perf hotspots (运行时热点) ──
     perf_hotspots = perf_sub.add_parser("hotspots", help="运行时热点函数查看")
-    perf_hotspots.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_hotspots.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_hotspots.add_argument("--tag", default="perf", help="会话标签")
     perf_hotspots.add_argument("--follow", "-f", action="store_true", help="实时追踪 (tail -f 式)")
     perf_hotspots.add_argument("--top", type=int, default=10, help="Top N 热点")
@@ -1732,7 +1819,7 @@ def main():
 
     # ── perf callstack (调用栈分析) ──
     perf_cs = perf_sub.add_parser("callstack", help="Time Profiler 调用栈分析")
-    perf_cs.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_cs.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_cs.add_argument("--tag", default="perf", help="会话标签")
     perf_cs.add_argument("--top", type=int, default=20, help="热点函数 Top N")
     perf_cs.add_argument("--min-weight", type=float, default=0.5, help="最小权重百分比")
@@ -1755,7 +1842,7 @@ def main():
 
     # ── perf symbolicate (dSYM 符号化) ──
     perf_sym = perf_sub.add_parser("symbolicate", help="dSYM 符号化调用栈地址")
-    perf_sym.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_sym.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_sym.add_argument("--tag", default="perf", help="会话标签")
     perf_sym.add_argument("--app-id", default="", help="App Bundle ID (用于查找 dSYM)")
     perf_sym.add_argument("--dsym", default="", help="指定 dSYM 路径")
@@ -1766,7 +1853,7 @@ def main():
 
     # ── perf time-sync (syslog-xctrace 时序对齐) ──
     perf_ts = perf_sub.add_parser("time-sync", help="syslog-xctrace 时序对齐 + 事件归因")
-    perf_ts.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_ts.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_ts.add_argument("--tag", default="perf", help="会话标签")
     perf_ts.add_argument("--syslog", default="", help="syslog 文件路径 (空=自动查找)")
     perf_ts.add_argument("--window", type=int, default=5, help="事件关联窗口(秒)")
@@ -1774,20 +1861,20 @@ def main():
 
     # ── perf deep-export (深度 Schema 采集) ──
     perf_de = perf_sub.add_parser("deep-export", help="深度 Schema 采集 (GPU/Network/VM/Metal)")
-    perf_de.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_de.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_de.add_argument("--tag", default="perf", help="会话标签")
     perf_de.add_argument("--schemas", default="all", help="Schema 列表 (逗号分隔: gpu,network,vm,metal 或 all)")
     perf_de.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     # ── perf power-attr (进程级功耗归因) ──
     perf_pa = perf_sub.add_parser("power-attr", help="进程级功耗归因分析")
-    perf_pa.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_pa.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_pa.add_argument("--tag", default="perf", help="会话标签")
     perf_pa.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     # ── perf ai-diag (AI 辅助诊断) ──
     perf_ai = perf_sub.add_parser("ai-diag", help="AI 辅助性能诊断")
-    perf_ai.add_argument("--repo", required=True, help="项目仓库路径")
+    perf_ai.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_ai.add_argument("--tag", default="perf", help="会话标签")
     perf_ai.add_argument("--focus", default="general",
                          choices=["general", "webkit", "power", "memory", "gpu"],
@@ -1835,6 +1922,8 @@ def main():
             asyncio.run(cmd_perf_report(args))
         elif args.perf_cmd == "devices":
             asyncio.run(cmd_perf_devices(args))
+        elif args.perf_cmd == "config":
+            asyncio.run(cmd_perf_config(args))
         elif args.perf_cmd == "live":
             asyncio.run(cmd_perf_live(args))
         elif args.perf_cmd == "rules":
@@ -1868,7 +1957,7 @@ def main():
         elif args.perf_cmd == "ai-diag":
             asyncio.run(cmd_perf_ai_diag(args))
         else:
-            print("  用法: cpar perf <start|stop|tail|report|devices|live|rules|stream|snapshot|callstack|hotspots|metrics|battery|templates|symbolicate|time-sync|deep-export|power-attr|ai-diag> ...")
+            print("  用法: cpar perf <start|stop|tail|report|devices|config|live|rules|stream|snapshot|callstack|hotspots|metrics|battery|templates|symbolicate|time-sync|deep-export|power-attr|ai-diag> ...")
 
 
 if __name__ == "__main__":

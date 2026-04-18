@@ -133,6 +133,7 @@ from .ai_diagnosis import (
     run_diagnosis,
 )
 from .report_html import generate_html_report
+from .perf_defaults import PerfDefaults
 
 __all__ = [
     "PerfConfig",
@@ -238,4 +239,6 @@ __all__ = [
     "run_diagnosis",
     # report_html
     "generate_html_report",
+    # perf_defaults
+    "PerfDefaults",
 ]
