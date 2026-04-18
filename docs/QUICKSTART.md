@@ -127,7 +127,7 @@ cpar perf report --repo REPO --tag TAG
 
 **注意**：功耗模式与 sampling 互斥（iOS 只允许一个 xctrace），不要同时加 `--sampling`。
 
-### 3.5 调用栈分析（事后分析）
+### 3.5 调用栈分析 + dSYM 符号化（事后分析）
 
 ```bash
 # 需要先完成一次含 Time Profiler 模板的采集
@@ -137,7 +137,18 @@ cpar perf start --repo REPO --tag TAG \
 
 cpar perf stop --repo REPO --tag TAG
 cpar perf callstack --repo REPO --tag TAG --top 20
+
+# 自动符号化 (Debug 包: DerivedData 自动搜索)
+cpar perf symbolicate --repo REPO --app-id com.example.app
+
+# Release 包: 从 Archives + App Store Connect 搜索 dSYM
+cpar perf symbolicate --repo REPO --app-id com.example.app --app-name MyApp
+cpar perf symbolicate --repo REPO --app-id com.example.app \
+  --asc-api-key KEY_ID --asc-issuer ISSUER --asc-key-path AuthKey.p8
 ```
+
+> **5 级 dSYM 搜索策略**: DerivedData → Xcode Archives → Spotlight UUID → 设备 UUID → App Store Connect API
+> **ReconnectableMixin**: idevicesyslog 断连后自动重连，无需手动重启
 
 ### 3.6 基线对比 + 性能门禁
 
@@ -179,10 +190,14 @@ cpar perf metrics --repo REPO --tag TAG --last 10
 | `perf devices` 无输出 | USB 线松了 / 未信任 / 重插 |
 | `sampling.enabled: false` + `reason: xctrace_exclusive` | 主链路 xctrace 已占 slot，改用 `--metrics-source device` |
 | hotspots.jsonl 为空 | 检查 `logs/sampling.stderr`，可能 xctrace exit=2（互斥） |
-| 全是 `0x...` 地址无符号 | Xcode 需打开目标项目以加载 dSYM |
+| 全是 `0x...` 地址无符号 | 使用 `perf symbolicate` 自动搜索 dSYM (DerivedData → Archives → ASC) |
 | `pymobiledevice3` 报 tunneld 错误 | 运行 `sudo pymobiledevice3 remote tunneld` |
 | iOS 26 syslog 不抓 App 日志 | 已知限制，改用 Xcode Console.app 抓 `process:Soul_New` |
 | battery.jsonl 无数据 | 确认 `ideviceinfo` 已安装：`brew install libimobiledevice` |
+| idevicesyslog 频繁断连 | v0.3.1+ 已内置自动重连 (ReconnectableMixin)，查看 `get_summary().reconnect` |
+| Release 包符号化失败 | 确认: 1) Xcode Archives 存在 2) 或提供 ASC API Key 参数 |
+| WebKit 采集无数据 | 检查 WebContent PID 是否变化: `cpar perf webcontent` 自动刷新 PID |
+| dSYM 搜索不到 | 1) 确认 Xcode 有对应 Archive  2) 检查 Bundle ID 匹配  3) 尝试手动指定 UUID |
 
 ## 5. 数据目录结构
 

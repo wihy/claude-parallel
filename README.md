@@ -1,4 +1,4 @@
-# Claude Parallel v0.3.0
+# Claude Parallel v0.3.1
 
 多 Claude Code 并行协同执行框架。通过 YAML 定义任务依赖关系，自动编排多个 Claude Code 实例并行工作。
 
@@ -72,9 +72,22 @@
 - **进程级功耗归因** (`perf power-attr`) — 按 CPU% 比例将 SystemPowerLevel 总功耗分摊到各进程，回答"到底是谁在耗电"，进程树跟踪 + 僵尸进程/功耗飙升/内存增长异常检测
 - **AI 辅助诊断** (`perf ai-diag`) — 全 session 数据喂 LLM 生成诊断报告，支持 5 种 focus (general/webkit/power/memory/gpu)，回归分析 (before vs after)，WebKit 专项报告，离线模式输出 prompt
 
+### 连接可靠性 + Release 分析 (Phase 4.5)
+
+- **子进程自动重连** (`ReconnectableMixin`) — 通用重连 mixin，指数退避 (2s→4s→8s→16s→30s cap) + 随机抖动，可中断 sleep 响应 stop 信号，断连/重连事件自动 mark_event
+- **LiveLogAnalyzer 自动重连** — idevicesyslog 进程退出后自动重连，双层循环架构（外层重连调度 + 内行读取），get_summary 包含 reconnect 统计信息
+- **Release 包 dSYM 自动发现** — 5 级搜索策略: DerivedData → Xcode Archives → Spotlight UUID → 设备 UUID 提取 → App Store Connect API 下载，支持 xcodebuild -downloadDsyms 和 JWT 认证
+- **WebKit PID 动态刷新** — 每 N cycle 自动重新扫描 WebContent PID，PID 变化时记录事件并迁移采集目标，连续 3 次未找到自动停止 daemon
+- **binary UUID 提取** — `extract_binary_uuid()` 用 dwarfdump 从 App 二进制提取 UUID，用于 dSYM 精确匹配
+
 ```bash
-# 符号化业务代码调用栈
+# 符号化业务代码调用栈 (自动搜索 dSYM: DerivedData → Archives → ASC)
 cpar perf symbolicate --repo ~/SoulApp --app-id com.soulapp.Soul
+cpar perf symbolicate --repo ~/SoulApp --app-id com.soulapp.Soul --app-name Soul
+
+# Release 包: 从 Archive + ASC 搜索 dSYM
+cpar perf symbolicate --repo ~/SoulApp --app-id com.soulapp.Soul \
+  --asc-api-key KEY_ID --asc-issuer ISSUER --asc-key-path AuthKey.p8
 
 # syslog 与 xctrace 时间对齐
 cpar perf time-sync --repo ~/SoulApp --tag perf --window 5
@@ -245,13 +258,13 @@ clean     清理 worktree 和协调文件
 logs      查看任务日志
 chat      对话模式 (自然语言生成任务 YAML)
 
-perf 子命令 (15 个):
+perf 子命令 (21 个):
   perf start       启动采集 (--sampling, --metrics-source device|xctrace|auto)
   perf stop        停止采集
   perf tail        实时查看 syslog
   perf report      生成报告 (--with-callstack, --callstack-top N)
   perf devices     列出已连接设备
-  perf live        实时 syslog 告警分析
+  perf live        实时 syslog 告警分析 (自动重连)
   perf rules       列出/管理告警规则 (13 条内置)
   perf stream      实时 xctrace 指标流
   perf snapshot    导出指标快照
@@ -261,6 +274,12 @@ perf 子命令 (15 个):
   perf metrics     Per-process CPU/内存指标
   perf battery     电池功耗趋势
   perf templates   Instruments 模板管理 (10 个内置)
+  perf symbolicate dSYM 符号化 (5级搜索: DerivedData→Archives→Spotlight→设备→ASC)
+  perf time-sync   syslog-xctrace 时序对齐
+  perf deep-export 深度 Schema 导出 (GPU/Network/VM/Metal)
+  perf power-attr  进程级功耗归因
+  perf ai-diag     AI 辅助诊断 (5种focus+回归分析)
+  perf webcontent  WebKit 进程采集 (PID动态刷新)
 ```
 
 ## 文件结构
@@ -271,7 +290,7 @@ claude-parallel/
 ├── chat.py                     # 对话模式入口
 ├── cpar                        # 封装脚本
 ├── src/
-│   ├── cli.py                  # CLI 命令处理
+│   ├── cli.py                  # CLI 命令处理 (21 perf 子命令)
 │   ├── task_parser.py          # YAML 解析 + DAG 拓扑排序
 │   ├── worker.py               # Worker 进程管理 + 重试 + 日志
 │   ├── orchestrator.py         # 调度器 (DAG/重试/预算/恢复)
@@ -281,15 +300,24 @@ claude-parallel/
 │   ├── validator.py            # YAML 配置校验
 │   ├── context_extractor.py    # 多语言上下文提取
 │   ├── chat_input.py           # 多行富文本输入 (prompt_toolkit)
-│   └── perf/                   # 真机性能采集子系统
-│       ├── config.py           # PerfConfig 数据类 (30 个配置字段)
-│       ├── session.py          # 采集会话生命周期 + metrics_source 决策
-│       ├── sampling.py         # Sampling Profiler 旁路 + XML 解析器
-│       ├── device_metrics.py   # BatteryPoller + ProcessMetricsStreamer
-│       ├── live_log.py         # 实时 syslog 流式告警分析
-│       ├── live_metrics.py     # 实时 xctrace 指标流 + 滚动窗口
-│       ├── templates.py        # Instruments 模板注册与管理
-│       └── integrator.py       # 与 Orchestrator 深度集成胶水
+│   └── perf/                   # 真机性能采集子系统 (17 模块, 11,087 行)
+│       ├── config.py           # PerfConfig 数据类 (39 行)
+│       ├── reconnect.py        # ReconnectableMixin 自动重连 (182 行)
+│       ├── session.py          # 采集会话生命周期 (819 行)
+│       ├── sampling.py         # Sampling Profiler 旁路 (1,042 行)
+│       ├── live_log.py         # 实时 syslog 流式告警 + 自动重连 (632 行)
+│       ├── live_metrics.py     # 实时 xctrace 指标流 (608 行)
+│       ├── webcontent.py       # WebKit 进程分析 + PID 刷新 (579 行)
+│       ├── dvt_bridge.py       # pymobiledevice3 DVT 协议桥接 (692 行)
+│       ├── symbolicate.py      # dSYM 符号化 + 5 级搜索 (1,139 行)
+│       ├── time_sync.py        # syslog-xctrace 时序对齐 (857 行)
+│       ├── deep_export.py      # GPU/网络/VM/Metal 深度导出 (855 行)
+│       ├── power_attribution.py # 进程级功耗归因 (1,118 行)
+│       ├── ai_diagnosis.py     # AI 辅助诊断 (1,260 行)
+│       ├── device_metrics.py   # BatteryPoller + ProcessMetrics (355 行)
+│       ├── templates.py        # Instruments 模板管理 (317 行)
+│       ├── integrator.py       # 与 Orchestrator 集成胶水 (386 行)
+│       └── __init__.py         # 公共导出 (207 行)
 ├── scripts/
 │   └── perf_e2e_smoke.sh       # iOS 真机端到端冒烟验证 (4 轮)
 ├── tests/
@@ -302,6 +330,8 @@ claude-parallel/
 │   ├── simple-parallel.yaml    # 简单并行
 │   └── test-p2.yaml            # Phase 2 测试
 ├── docs/
+│   ├── ARCHITECTURE.md         # 整体架构文档
+│   ├── QUICKSTART.md           # 快速上手模板
 │   └── playbook.md             # 编排 playbook
 └── README.md
 ```
