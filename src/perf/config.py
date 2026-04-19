@@ -44,3 +44,7 @@ class PerfConfig:
 
     # WebContent 进程采集
     attach_webcontent: bool = False    # 自动发现并采集 WebContent 进程
+
+    # DvtBridge 网络与图形采集
+    collect_network: bool = True       # 采集网络指标到 dvt_network.jsonl
+    collect_graphics: bool = True      # 采集图形指标到 dvt_graphics.jsonl

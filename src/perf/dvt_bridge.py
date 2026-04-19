@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable
 
+from .reconnect import ReconnectableMixin, ReconnectPolicy
+
 logger = logging.getLogger(__name__)
 
 
@@ -134,11 +136,12 @@ class DvtGraphicsSnapshot:
 # ── DVT 会话 (asyncio 侧) ──
 
 
-class DvtBridgeSession:
+class DvtBridgeSession(ReconnectableMixin):
     """
     管理与 iOS 设备的 DVT 连接，在 asyncio 事件循环中运行。
 
     通过 DvtBridgeThread 在独立线程中启动，不阻塞 cpar 主线程。
+    集成 ReconnectableMixin 实现断连自动重连。
     """
 
     def __init__(
@@ -177,6 +180,13 @@ class DvtBridgeSession:
         self._error_count = 0
         self._start_ts: float = 0
 
+        # ReconnectableMixin 初始化
+        self._reconnect_stop_event = threading.Event()
+        self.__init_reconnect__(
+            policy=ReconnectPolicy(max_retries=10, initial_delay_sec=2.0),
+            stop_event=self._reconnect_stop_event,
+        )
+
     @property
     def is_running(self) -> bool:
         return self._running
@@ -186,17 +196,52 @@ class DvtBridgeSession:
         return self._snapshot_count
 
     async def run(self):
-        """主入口 — 在 asyncio loop 中运行"""
+        """主入口 — 在 asyncio loop 中运行，支持断连重连"""
         self._running = True
         self._start_ts = time.time()
         self._loop = asyncio.get_running_loop()
 
-        try:
-            await self._connect_and_collect()
-        except Exception as e:
-            self._log_error(f"DVT session failed: {e!r}")
-        finally:
-            self._running = False
+        while self._running:
+            try:
+                await self._connect_and_collect()
+            except Exception as e:
+                self._log_error(f"DVT session failed: {e!r}")
+                # 通知 ReconnectableMixin 断连
+                self._handle_disconnect(str(e))
+
+                # 如果不再运行（外部 stop），退出
+                if not self._running:
+                    break
+
+                # 检查是否应该重试
+                if not self._should_retry():
+                    self._mark_reconnect_failed()
+                    break
+
+                # 退避等待
+                delay = self._get_backoff_delay()
+                logger.info("[dvt_bridge] 等待 %.1f 秒后重连...", delay)
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    break
+
+                if not self._running:
+                    break
+
+                # 重连成功后继续循环，_connect_and_collect 成功后会在下方
+                # 调用 _mark_reconnected()
+                continue
+
+            # _connect_and_collect 正常返回 → 连接成功（或自然结束）
+            # 如果之前有断连记录（current_retry > 0），标记重连成功
+            if self._reconnect_stats.current_retry > 0:
+                self._mark_reconnected()
+
+            # 连接正常结束，退出循环
+            break
+
+        self._running = False
 
     async def _connect_and_collect(self):
         """建立 DVT 连接并开始采集"""
@@ -230,28 +275,62 @@ class DvtBridgeSession:
         try:
             # 启动 sysmontap
             sysmon = await Sysmontap.create(dvt_provider, interval=self.interval_ms)
-            async with sysmon:
-                # 跳过第一帧 (CPU% 为 0)
-                first = True
 
-                async for snapshot_data in sysmon:
-                    if not self._running:
-                        break
+            # 准备并行采集任务
+            tasks = []
 
-                    if first:
-                        first = False
-                        continue
+            # Sysmon 采集（核心，始终运行）
+            async def sysmon_stream():
+                async with sysmon:
+                    first = True
+                    async for snapshot_data in sysmon:
+                        if not self._running:
+                            break
+                        if first:
+                            first = False
+                            continue
+                        await self._process_sysmon_snapshot(snapshot_data)
+                        self._snapshot_count += 1
 
-                    await self._process_sysmon_snapshot(snapshot_data)
-                    self._snapshot_count += 1
+            tasks.append(asyncio.create_task(sysmon_stream()))
+
+            # NetworkMonitor 采集
+            if self.collect_network:
+                tasks.append(asyncio.create_task(
+                    self._stream_network(dvt_provider)
+                ))
+
+            # Graphics 采集
+            if self.collect_graphics:
+                tasks.append(asyncio.create_task(
+                    self._stream_graphics(dvt_provider)
+                ))
+
+            # 并行运行所有采集任务
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 检查是否有异常（非 sysmon 异常不影响主流程）
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    channel_name = (
+                        "sysmon" if i == 0
+                        else "network" if (self.collect_network and i == 1)
+                        else "graphics"
+                    )
+                    # 如果是 sysmon 异常（i==0），需要向上抛出以触发重连
+                    if i == 0:
+                        raise result
+                    else:
+                        self._log_error(f"{channel_name} 采集异常: {result!r}")
 
         except Exception as e:
             self._log_error(f"sysmon 采集异常: {e!r}")
+            raise  # 向上抛出以触发重连逻辑
         finally:
             try:
                 await dvt_provider.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[dvt_bridge] dvt_provider.close() 失败: %s", e)
 
     async def _try_tunneld(self):
         """尝试通过 tunneld 获取连接 (iOS 17+)"""
@@ -311,8 +390,8 @@ class DvtBridgeSession:
                 if self.on_process_snapshot:
                     try:
                         self.on_process_snapshot(snap)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("[dvt_bridge] on_process_snapshot 回调异常: %s", e)
 
         # 解析系统数据 (snapshot_data 可能包含 "System" key 的 dict)
         elif isinstance(snapshot_data, dict):
@@ -349,8 +428,8 @@ class DvtBridgeSession:
             if self.on_alert:
                 try:
                     self.on_alert(alert)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[dvt_bridge] on_alert 回调异常: %s", e)
 
     def _append_jsonl(self, path: Optional[Path], data: Dict[str, Any]):
         """追加写入 JSONL"""
@@ -366,6 +445,148 @@ class DvtBridgeSession:
     def _log_error(self, msg: str):
         self._error_count += 1
         logger.warning("[dvt_bridge] %s", msg)
+
+    # ── ReconnectableMixin 接口实现 ──
+
+    def _spawn_process(self) -> bool:
+        """DVT 使用 asyncio 而非 subprocess，始终返回 True。"""
+        return True
+
+    def _is_process_alive(self) -> bool:
+        """检查 DVT 会话是否仍在运行。"""
+        return self._running
+
+    # ── Network / Graphics 采集流 ──
+
+    async def _stream_network(self, dvt_provider) -> None:
+        """
+        通过 DVT raw channel 采集网络数据。
+
+        使用 com.apple.instruments.server.services.networking channel。
+        数据写入 network_jsonl，格式: {ts, pid, name, rx_bytes, tx_bytes, connections}
+        """
+        channel_name = "com.apple.instruments.server.services.networking"
+        try:
+            channel = await dvt_provider.open_channel(channel_name)
+        except Exception as e:
+            self._log_error(f"无法打开 NetworkMonitor channel: {e}")
+            return
+
+        try:
+            # 启动监控
+            try:
+                await channel.call_method("start")
+            except Exception:
+                # 某些版本可能不需要 start，忽略
+                pass
+
+            while self._running:
+                try:
+                    # 从 channel 读取数据（带超时以响应 stop）
+                    try:
+                        data = await asyncio.wait_for(channel.next(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    if data is None:
+                        continue
+
+                    now = time.time()
+
+                    # 解析 channel 返回的数据
+                    # 网络数据通常是 dict 或包含多个 dict 的列表
+                    entries = data if isinstance(data, list) else [data]
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+
+                        record = {
+                            "ts": now,
+                            "pid": entry.get("pid", 0),
+                            "name": entry.get("name", ""),
+                            "rx_bytes": entry.get("rxBytes", 0),
+                            "tx_bytes": entry.get("txBytes", 0),
+                            "connections": entry.get("connections", 0),
+                        }
+                        self._append_jsonl(self.network_jsonl, record)
+
+                except Exception as e:
+                    logger.debug("[dvt_bridge] network 数据解析异常: %s", e)
+                    await asyncio.sleep(0.1)
+
+        except Exception as e:
+            self._log_error(f"NetworkMonitor 流异常退出: {e!r}")
+        finally:
+            try:
+                await channel.stopMonitoring()
+            except Exception:
+                pass
+
+    async def _stream_graphics(self, dvt_provider) -> None:
+        """
+        通过 DVT raw channel 采集图形/GPU 数据。
+
+        使用 com.apple.instruments.server.services.graphics channel。
+        数据写入 graphics_jsonl，格式: {ts, pid, name, fps, gpu_time_ms, draw_calls}
+        """
+        channel_name = "com.apple.instruments.server.services.graphics"
+        try:
+            channel = await dvt_provider.open_channel(channel_name)
+        except Exception as e:
+            self._log_error(f"无法打开 Graphics channel: {e}")
+            return
+
+        try:
+            # 启动监控
+            try:
+                await channel.call_method("startSamplingAtTime", 0.0)
+            except Exception:
+                # 某些版本可能不支持此方法，尝试 start
+                try:
+                    await channel.call_method("start")
+                except Exception:
+                    pass
+
+            while self._running:
+                try:
+                    # 从 channel 读取数据（带超时以响应 stop）
+                    try:
+                        data = await asyncio.wait_for(channel.next(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    if data is None:
+                        continue
+
+                    now = time.time()
+
+                    # 解析 channel 返回的数据
+                    entries = data if isinstance(data, list) else [data]
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+
+                        record = {
+                            "ts": now,
+                            "pid": entry.get("pid", 0),
+                            "name": entry.get("name", ""),
+                            "fps": entry.get("fps"),
+                            "gpu_time_ms": entry.get("gpuTimeMS"),
+                            "draw_calls": entry.get("drawCalls", 0),
+                        }
+                        self._append_jsonl(self.graphics_jsonl, record)
+
+                except Exception as e:
+                    logger.debug("[dvt_bridge] graphics 数据解析异常: %s", e)
+                    await asyncio.sleep(0.1)
+
+        except Exception as e:
+            self._log_error(f"Graphics 流异常退出: {e!r}")
+        finally:
+            try:
+                await channel.stopMonitoring()
+            except Exception:
+                pass
 
 
 # ── DVT Bridge 线程 (桥接 asyncio 和 cpar 线程模型) ──

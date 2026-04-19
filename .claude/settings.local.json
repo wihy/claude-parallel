@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "mcp__feishu-mcp__get_feishu_document_info"
+    ]
+  }
+}

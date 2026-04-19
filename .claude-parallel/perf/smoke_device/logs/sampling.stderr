@@ -1,0 +1,10 @@
+[sampling] cycle 2: xctrace exit=19
+1776396560 cycle 2: xctrace exit=19
+[sampling] cycle 2: trace not found at /Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/traces/_sampling_tmp/cycle_2.trace
+1776396560 cycle 2: trace not found at /Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/traces/_sampling_tmp/cycle_2.trace
+[sampling] cycle 2: xctrace exit=19
+1776396562 cycle 2: xctrace exit=19
+[sampling] cycle 2: trace not found at /Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/traces/_sampling_tmp/cycle_2.trace
+1776396562 cycle 2: trace not found at /Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/traces/_sampling_tmp/cycle_2.trace
+[sampling] auto-stop: 3 consecutive failures
+1776396562 auto-stop: 3 consecutive failures

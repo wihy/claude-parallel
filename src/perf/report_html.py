@@ -3,23 +3,103 @@ report_html — 将 perf report 生成为自包含 HTML 报告。
 
 特性:
 - chart.js 时序图: CPU/内存/功耗趋势
+- xctrace 功耗子系统堆叠图 (Display/CPU/GPU/Networking mW)
+- Before/After 对比双线图
+- Syslog 告警时序散点图
+- WebKit 进程树可视化
 - DvtBridge 进程指标可视化
 - 采样热点排名
-- Syslog 告警统计
 - Timeline 事件甘特图
 - Gate/回归检测结果
-- 零外部依赖: chart.js 通过 CDN 加载，CSS 内联
+- PDF 导出按钮 (浏览器打印)
+- chartjs-plugin-zoom 交互式缩放
+- 零外部依赖: chart.js + zoom plugin 通过 CDN 加载，CSS 内联
 """
 
 import json
+import math
 import os
+import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .dvt_bridge import read_dvt_process_jsonl, read_dvt_system_jsonl
 from .device_metrics import read_battery_jsonl
 from .sampling import read_hotspots_jsonl
+
+
+# ── xctrace XML Parsing ──
+
+
+def _parse_xctrace_table(xml_path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
+    """
+    解析 xctrace export 的 XML 表格。
+    返回 (列名列表, 行字典列表)。
+    xctrace 格式: <row><c>val1</c><c>val2</c></row>，列名在 <col name="..."> 中。
+    """
+    if not xml_path.exists():
+        return [], []
+    try:
+        text = xml_path.read_text(errors="replace")
+    except Exception:
+        return [], []
+
+    # 提取列名
+    columns = [m.group(1) for m in re.finditer(r'<col[^>]*name="([^"]+)"', text)]
+    if not columns:
+        return [], []
+
+    # 提取行数据
+    rows = []
+    row_pat = re.compile(r"<row>(.*?)</row>", re.S)
+    cell_pat = re.compile(r"<c[^>]*>(.*?)</c>", re.S)
+    for row_m in row_pat.finditer(text):
+        cells = [c.strip() for c in cell_pat.findall(row_m.group(1))]
+        row_dict = {}
+        for i, col in enumerate(columns):
+            if i < len(cells):
+                row_dict[col] = cells[i]
+        rows.append(row_dict)
+
+    return columns, rows
+
+
+def _parse_mw_value(text: str) -> Optional[float]:
+    """从 '123 mW' 或纯数字中提取 mW 值。"""
+    if not text:
+        return None
+    m = re.search(r"([\d.]+)", text)
+    if m:
+        try:
+            return float(m.group(1))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _safe_float(text: str) -> Optional[float]:
+    """安全地从字符串中提取数字。"""
+    if not text:
+        return None
+    try:
+        cleaned = re.sub(r"[^\d.\-eE]", "", text)
+        return float(cleaned) if cleaned else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_time(ts: float) -> str:
+    """时间戳转 HH:MM:SS"""
+    if not ts:
+        return "?"
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(ts))
+    except Exception:
+        return "?"
+
+
+# ── Main Entry ──
 
 
 def generate_html_report(
@@ -30,25 +110,35 @@ def generate_html_report(
 ) -> Path:
     """
     从 perf report + meta + JSONL 数据生成自包含 HTML 报告。
-
-    Args:
-        report: report.json 内容
-        meta: meta.json 内容
-        session_root: perf session 根目录 (.claude-parallel/perf/<tag>/)
-        output_path: 输出 HTML 路径（默认 session_root/report.html）
-
-    Returns:
-        生成的 HTML 文件路径
     """
     if output_path is None:
         output_path = session_root / "report.html"
 
     logs_dir = session_root / "logs"
+    exports_dir = session_root / "exports"
 
-    # 收集各数据源
     chart_configs = []
+    sections = []
 
-    # 1. DvtBridge 进程指标时序图
+    # 1. xctrace 功耗时序图 (P0 — 最重要)
+    power_chart = _build_power_chart(exports_dir)
+    if power_chart:
+        chart_configs.append(power_chart)
+
+    # 2. Before/After 对比图 (P1)
+    baseline_chart = _build_baseline_chart(report, session_root)
+    if baseline_chart:
+        chart_configs.append(baseline_chart)
+
+    # 3. Syslog 告警时序散点图 (P2)
+    live = report.get("live_analysis", {})
+    alerts = live.get("alerts", [])
+    if alerts:
+        alert_chart = _build_alert_timeline_chart(alerts)
+        if alert_chart:
+            chart_configs.append(alert_chart)
+
+    # 4. DvtBridge 进程指标时序图
     dvt_metrics = report.get("dvt_metrics", {})
     dm = meta.get("device_metrics", {})
     if dm.get("source") == "dvt_bridge":
@@ -64,7 +154,7 @@ def generate_html_report(
             if dvt_sys_data:
                 chart_configs.append(_build_dvt_system_chart(dvt_sys_data))
 
-    # 2. 电池趋势图
+    # 5. 电池趋势图
     batt = meta.get("battery", {})
     if batt.get("jsonl"):
         batt_path = Path(batt["jsonl"])
@@ -73,7 +163,7 @@ def generate_html_report(
             if batt_data:
                 chart_configs.append(_build_battery_chart(batt_data))
 
-    # 3. 采样热点数据
+    # 6. 采样热点数据
     hotspots = []
     sampling_meta = meta.get("sampling", {})
     if sampling_meta.get("hotspots_file"):
@@ -81,8 +171,7 @@ def generate_html_report(
         if hs_path.exists():
             hotspots = read_hotspots_jsonl(hs_path)
 
-    # 4. 构建页面各 Section
-    sections = []
+    # ── 构建 Sections ──
 
     # Header
     tag = report.get("tag", meta.get("tag", "unknown"))
@@ -100,6 +189,11 @@ def generate_html_report(
     if gate.get("checked"):
         sections.append(_section_gate(gate))
 
+    # Power Summary (数字摘要)
+    metrics = report.get("metrics", {})
+    if metrics.get("display_avg") is not None:
+        sections.append(_section_power_summary(metrics))
+
     # Charts
     if chart_configs:
         sections.append(_section_charts(chart_configs))
@@ -112,6 +206,9 @@ def generate_html_report(
     if hotspots:
         sections.append(_section_hotspots(hotspots))
 
+    # WebKit 进程树 + 调用栈 (P2)
+    sections.append(_section_webkit_tree(report, session_root))
+
     # Timeline
     timeline = report.get("timeline", {})
     if timeline.get("events"):
@@ -123,7 +220,6 @@ def generate_html_report(
         sections.append(_section_syslog(syslog))
 
     # Live Analysis
-    live = report.get("live_analysis", {})
     if live.get("status") == "completed":
         sections.append(_section_live_analysis(live))
 
@@ -144,10 +240,329 @@ def generate_html_report(
 # ── Chart 构建器 ──
 
 
+def _build_power_chart(exports_dir: Path) -> Optional[Dict]:
+    """P0: xctrace 功耗子系统堆叠图 — Display/CPU/GPU/Networking mW 时序。"""
+    power_xml = exports_dir / "SystemPowerLevel.xml"
+    if not power_xml.exists():
+        return None
+
+    columns, rows = _parse_xctrace_table(power_xml)
+    if not rows:
+        return None
+
+    # 提取各子系统的 mW 时序
+    labels = []
+    display_vals = []
+    cpu_vals = []
+    gpu_vals = []
+    net_vals = []
+    total_vals = []
+
+    for row in rows:
+        # 时间列可能是 sample-time 或 start-time 等
+        time_val = None
+        for col in columns:
+            if "time" in col.lower():
+                time_val = _safe_float(row.get(col, ""))
+                break
+        labels.append(time_val or len(labels))
+
+        d = _parse_mw_value(row.get("Display", ""))
+        c = _parse_mw_value(row.get("CPU", ""))
+        g = _parse_mw_value(row.get("GPU", ""))
+        n = _parse_mw_value(row.get("Networking", ""))
+
+        display_vals.append(d)
+        cpu_vals.append(c)
+        gpu_vals.append(g)
+        net_vals.append(n)
+        total_vals.append(sum(v for v in [d, c, g, n] if v is not None) if any(v is not None for v in [d, c, g, n]) else None)
+
+    # 时间标签格式化
+    time_labels = [f"{i}" for i in range(len(labels))]
+
+    # 检查 thermal state 数据
+    thermal_labels = []
+    thermal_levels = []
+    thermal_xml = exports_dir / "device-thermal-state-intervals.xml"
+    if thermal_xml.exists():
+        _, thermal_rows = _parse_xctrace_table(thermal_xml)
+        for tr in thermal_rows:
+            state = tr.get("thermal-state", "")
+            thermal_labels.append(state[:10])
+            level_map = {"Nominal": 0, "Fair": 1, "Serious": 2, "Critical": 3}
+            thermal_levels.append(level_map.get(state, 0))
+
+    datasets = [
+        {
+            "label": "Display",
+            "data": display_vals,
+            "backgroundColor": "#3b82f680",
+            "borderColor": "#3b82f6",
+            "fill": True,
+            "tension": 0.3,
+            "pointRadius": 0,
+            "order": 1,
+        },
+        {
+            "label": "CPU",
+            "data": cpu_vals,
+            "backgroundColor": "#ef444480",
+            "borderColor": "#ef4444",
+            "fill": True,
+            "tension": 0.3,
+            "pointRadius": 0,
+            "order": 2,
+        },
+        {
+            "label": "GPU",
+            "data": gpu_vals,
+            "backgroundColor": "#f59e0b80",
+            "borderColor": "#f59e0b",
+            "fill": True,
+            "tension": 0.3,
+            "pointRadius": 0,
+            "order": 3,
+        },
+        {
+            "label": "Networking",
+            "data": net_vals,
+            "backgroundColor": "#10b98180",
+            "borderColor": "#10b981",
+            "fill": True,
+            "tension": 0.3,
+            "pointRadius": 0,
+            "order": 4,
+        },
+        {
+            "label": "Total",
+            "data": total_vals,
+            "borderColor": "#e2e8f0",
+            "backgroundColor": "transparent",
+            "fill": False,
+            "tension": 0.3,
+            "pointRadius": 0,
+            "borderWidth": 2,
+            "borderDash": [5, 5],
+            "order": 0,
+        },
+    ]
+
+    # 如果有 thermal 数据，加一条线
+    if thermal_levels:
+        # 将 thermal 归一化到功耗范围内
+        max_power = max((v for v in total_vals if v is not None), default=1000)
+        scaled_thermal = [l / 3.0 * max_power * 0.1 for l in thermal_levels]
+        datasets.append({
+            "label": "Thermal State",
+            "data": scaled_thermal,
+            "type": "line",
+            "borderColor": "#ff00ff",
+            "backgroundColor": "transparent",
+            "fill": False,
+            "pointRadius": 2,
+            "borderDash": [2, 2],
+            "yAxisID": "y1",
+            "order": 0,
+        })
+
+    charts = [
+        {
+            "subtitle": "功耗子系统 (mW) — 堆叠面积图",
+            "type": "line",
+            "labels": time_labels,
+            "datasets": datasets,
+            "yLabel": "mW",
+            "stacked": True,
+            "hasThermal": bool(thermal_levels),
+        },
+    ]
+
+    return {
+        "id": "xctrace_power",
+        "title": "xctrace 功耗时序图",
+        "charts": charts,
+    }
+
+
+def _build_baseline_chart(report: Dict, session_root: Path) -> Optional[Dict]:
+    """P1: Before/After 对比双线图。尝试读两个 session 的 SystemPowerLevel.xml。"""
+    baseline = report.get("baseline", {})
+    if not baseline.get("metrics"):
+        return None
+
+    current_exports = session_root / "exports"
+    current_xml = current_exports / "SystemPowerLevel.xml"
+    if not current_xml.exists():
+        return None
+
+    # 当前数据
+    _, cur_rows = _parse_xctrace_table(current_xml)
+    if not cur_rows:
+        return None
+
+    cur_total = []
+    for row in cur_rows:
+        d = _parse_mw_value(row.get("Display", ""))
+        c = _parse_mw_value(row.get("CPU", ""))
+        g = _parse_mw_value(row.get("GPU", ""))
+        n = _parse_mw_value(row.get("Networking", ""))
+        cur_total.append(sum(v for v in [d, c, g, n] if v is not None) if any(v is not None for v in [d, c, g, n]) else 0)
+
+    # 尝试读 baseline 数据
+    baseline_tag = baseline.get("tag", "")
+    baseline_exports = session_root.parent / baseline_tag / "exports"
+    baseline_xml = baseline_exports / "SystemPowerLevel.xml"
+
+    base_total = []
+    if baseline_xml.exists():
+        _, base_rows = _parse_xctrace_table(baseline_xml)
+        for row in base_rows:
+            d = _parse_mw_value(row.get("Display", ""))
+            c = _parse_mw_value(row.get("CPU", ""))
+            g = _parse_mw_value(row.get("GPU", ""))
+            n = _parse_mw_value(row.get("Networking", ""))
+            base_total.append(sum(v for v in [d, c, g, n] if v is not None) if any(v is not None for v in [d, c, g, n]) else 0)
+
+    labels = [str(i) for i in range(max(len(cur_total), len(base_total)))]
+
+    if base_total:
+        # 双线对比模式
+        datasets = [
+            {
+                "label": f"Before ({baseline_tag})",
+                "data": base_total,
+                "borderColor": "#94a3b8",
+                "backgroundColor": "#94a3b830",
+                "fill": False,
+                "tension": 0.3,
+                "pointRadius": 1,
+                "borderDash": [5, 5],
+            },
+            {
+                "label": "After",
+                "data": cur_total,
+                "borderColor": "#3b82f6",
+                "backgroundColor": "#3b82f630",
+                "fill": True,
+                "tension": 0.3,
+                "pointRadius": 1,
+            },
+        ]
+    else:
+        # Fallback: 柱状对比 (用 metrics 数值)
+        bm = baseline.get("metrics", {})
+        cm = report.get("metrics", {})
+        labels_bar = ["Display", "CPU", "Networking"]
+        before_vals = [bm.get("display_avg"), bm.get("cpu_avg"), bm.get("networking_avg")]
+        after_vals = [cm.get("display_avg"), cm.get("cpu_avg"), cm.get("networking_avg")]
+
+        datasets = [
+            {
+                "label": f"Before ({baseline_tag})",
+                "data": before_vals,
+                "borderColor": "#94a3b8",
+                "backgroundColor": "#94a3b860",
+            },
+            {
+                "label": "After",
+                "data": after_vals,
+                "borderColor": "#3b82f6",
+                "backgroundColor": "#3b82f660",
+            },
+        ]
+        return {
+            "id": "baseline_compare",
+            "title": "Before/After 功耗对比",
+            "charts": [
+                {
+                    "subtitle": "平均功耗对比 (mW)",
+                    "type": "bar",
+                    "labels": labels_bar,
+                    "datasets": datasets,
+                    "yLabel": "mW (avg)",
+                },
+            ],
+        }
+
+    return {
+        "id": "baseline_compare",
+        "title": "Before/After 功耗时序对比",
+        "charts": [
+            {
+                "subtitle": "总功耗对比 (mW)",
+                "type": "line",
+                "labels": labels,
+                "datasets": datasets,
+                "yLabel": "mW",
+            },
+        ],
+    }
+
+
+def _build_alert_timeline_chart(alerts: List[Dict]) -> Optional[Dict]:
+    """P2: Syslog 告警时序散点图 — X时间 Y级别，彩色圆点。"""
+    if not alerts:
+        return None
+
+    # 提取时间和级别
+    scatter_data = []
+    level_map = {"critical": 3, "error": 2.5, "warn": 2, "warning": 2, "info": 1}
+    color_map = {"critical": "#ef4444", "error": "#ef4444", "warn": "#f59e0b", "warning": "#f59e0b", "info": "#3b82f6"}
+
+    for a in alerts:
+        ts = a.get("ts", 0)
+        level = a.get("level", "info").lower()
+        y_val = level_map.get(level, 1)
+        color = color_map.get(level, "#64748b")
+        msg = a.get("message", a.get("rule", ""))
+        rule = a.get("rule", "")
+        scatter_data.append({
+            "x": ts,
+            "y": y_val,
+            "msg": msg[:80],
+            "rule": rule,
+            "color": color,
+            "level": level,
+        })
+
+    # 按 time 分组为 datasets（按颜色）
+    by_color = {}  # type: Dict[str, List[Dict]]
+    for d in scatter_data:
+        by_color.setdefault(d["color"], []).append(d)
+
+    datasets = []
+    for color, items in by_color.items():
+        level_name = items[0]["level"]
+        datasets.append({
+            "label": level_name,
+            "data": [{"x": i["x"], "y": i["y"]} for i in items],
+            "backgroundColor": color,
+            "pointRadius": 5,
+            "pointHoverRadius": 8,
+            "msgs": [i["msg"] for i in items],  # for tooltip
+        })
+
+    return {
+        "id": "alert_timeline",
+        "title": "Syslog 告警时序分布",
+        "charts": [
+            {
+                "subtitle": "告警时间线 (hover 查看详情)",
+                "type": "scatter",
+                "labels": [],
+                "datasets": datasets,
+                "yLabel": "",
+                "yLabels": {1: "Info", 2: "Warn", 3: "Critical"},
+                "isScatter": True,
+            },
+        ],
+    }
+
+
 def _build_dvt_process_chart(records: List[Dict]) -> Dict:
-    """构建 DvtBridge 进程 CPU/内存时序图配置。"""
-    # 按进程名分组
-    by_name: Dict[str, List[Dict]] = {}
+    """DvtBridge 进程 CPU/内存时序图。"""
+    by_name = {}  # type: Dict[str, List[Dict]]
     for r in records:
         name = r.get("name", "unknown")
         by_name.setdefault(name, []).append(r)
@@ -162,7 +577,7 @@ def _build_dvt_process_chart(records: List[Dict]) -> Dict:
 
     for i, (name, recs) in enumerate(by_name.items()):
         color = colors[i % len(colors)]
-        labels = [time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0))) for r in recs]
+        labels = [_fmt_time(r.get("ts", 0)) for r in recs]
         cpu_vals = [r.get("cpuUsage") for r in recs]
         mem_vals = [r.get("physFootprintMB") for r in recs]
 
@@ -185,7 +600,7 @@ def _build_dvt_process_chart(records: List[Dict]) -> Dict:
             "pointRadius": 1,
         })
 
-    all_labels = [time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0))) for r in records[:1]]
+    all_labels = [_fmt_time(records[0].get("ts", 0))] if records else []
 
     return {
         "id": "dvt_process",
@@ -194,14 +609,14 @@ def _build_dvt_process_chart(records: List[Dict]) -> Dict:
             {
                 "subtitle": "CPU 使用率 (%)",
                 "type": "line",
-                "labels": labels if len(by_name) == 1 else labels,
+                "labels": all_labels if len(by_name) == 1 else labels,
                 "datasets": datasets_cpu,
                 "yLabel": "CPU %",
             },
             {
                 "subtitle": "物理内存 (MB)",
                 "type": "line",
-                "labels": labels if len(by_name) == 1 else labels,
+                "labels": all_labels if len(by_name) == 1 else labels,
                 "datasets": datasets_mem,
                 "yLabel": "MB",
             },
@@ -210,8 +625,8 @@ def _build_dvt_process_chart(records: List[Dict]) -> Dict:
 
 
 def _build_dvt_system_chart(records: List[Dict]) -> Dict:
-    """构建系统级指标时序图。"""
-    labels = [time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0))) for r in records]
+    """系统级指标时序图。"""
+    labels = [_fmt_time(r.get("ts", 0)) for r in records]
     cpu_vals = [r.get("cpuTotal") for r in records]
     mem_free = [r.get("physMemoryFreeMB") for r in records]
     mem_used = [r.get("physMemoryUsedMB") for r in records]
@@ -266,8 +681,8 @@ def _build_dvt_system_chart(records: List[Dict]) -> Dict:
 
 
 def _build_battery_chart(records: List[Dict]) -> Dict:
-    """构建电池趋势图。"""
-    labels = [time.strftime("%H:%M:%S", time.localtime(r.get("ts", 0))) for r in records]
+    """电池趋势图。"""
+    labels = [_fmt_time(r.get("ts", 0)) for r in records]
     levels = [r.get("level_pct") for r in records]
 
     return {
@@ -314,6 +729,7 @@ def _section_header(tag, status, started, ended, duration, meta):
             <div><span class="label">Ended</span> {ended}</div>
             <div><span class="label">Duration</span> {duration}s</div>
         </div>
+        <button onclick="window.print()" class="btn-pdf">导出 PDF</button>
     </div>"""
 
 
@@ -330,6 +746,37 @@ def _section_gate(gate):
     </div>"""
 
 
+def _section_power_summary(metrics):
+    """P0: 功耗数字摘要卡片 — 一目了然。"""
+    display_avg = metrics.get("display_avg")
+    cpu_avg = metrics.get("cpu_avg")
+    gpu_avg = metrics.get("gpu_avg")
+    networking_avg = metrics.get("networking_avg")
+
+    def fmt(v):
+        return f"{v:.0f} mW" if isinstance(v, (int, float)) else "N/A"
+
+    rows = ""
+    items = [
+        ("Display", display_avg, "#3b82f6"),
+        ("CPU", cpu_avg, "#ef4444"),
+        ("GPU", gpu_avg, "#f59e0b"),
+        ("Networking", networking_avg, "#10b981"),
+    ]
+    for name, val, color in items:
+        pct = ""
+        if isinstance(val, (int, float)):
+            bar_w = min(val / 1500 * 100, 100)
+            pct = f'<div class="power-bar" style="width:{bar_w:.0f}%;background:{color}"></div>'
+        rows += f'<div class="power-item"><span class="label">{name}</span> {fmt(val)} {pct}</div>'
+
+    return f"""
+    <div class="card">
+        <h3>功耗摘要 (xctrace Power Profiler)</h3>
+        <div class="power-grid">{rows}</div>
+    </div>"""
+
+
 def _section_charts(chart_configs):
     nav_items = []
     chart_divs = []
@@ -340,10 +787,14 @@ def _section_charts(chart_configs):
         sub_charts = []
         for j, ch in enumerate(cfg.get("charts", [])):
             sub_id = f"{cid}_chart_{j}"
+            chart_type = ch.get("type", "line")
+            extra_attrs = f'data-chart-type="{chart_type}"'
+            if ch.get("isScatter"):
+                extra_attrs += ' data-scatter="true"'
             sub_charts.append(f"""
             <div class="chart-sub">
                 <h4>{ch["subtitle"]}</h4>
-                <canvas id="{sub_id}"></canvas>
+                <canvas id="{sub_id}" {extra_attrs}></canvas>
             </div>""")
         chart_divs.append(f"""
         <div id="{cid}" class="card">
@@ -363,7 +814,7 @@ def _section_charts(chart_configs):
 
 def _section_dvt_process_table(dvt_metrics):
     proc_stats = dvt_metrics.get("process_stats", {})
-    rows = []
+    rows = ""
     for name, stats in sorted(proc_stats.items(), key=lambda x: -(x[1].get("cpu_pct", {}).get("avg") or 0)):
         cpu = stats.get("cpu_pct", {})
         mem = stats.get("mem_mb", {})
@@ -375,7 +826,7 @@ def _section_dvt_process_table(dvt_metrics):
         cpu_peak_s = f"{cpu_peak:.1f}" if isinstance(cpu_peak, (int, float)) else "N/A"
         mem_avg_s = f"{mem_avg:.0f}" if isinstance(mem_avg, (int, float)) else "N/A"
         mem_peak_s = f"{mem_peak:.0f}" if isinstance(mem_peak, (int, float)) else "N/A"
-        rows.append(f"""
+        rows += f"""
             <tr>
                 <td>{name}</td>
                 <td>{stats.get('pid', '?')}</td>
@@ -384,44 +835,43 @@ def _section_dvt_process_table(dvt_metrics):
                 <td>{cpu_peak_s}</td>
                 <td>{mem_avg_s}</td>
                 <td>{mem_peak_s}</td>
-            </tr>""")
+            </tr>"""
 
     return f"""
     <div class="card">
         <h3>DvtBridge 进程指标统计</h3>
         <table>
             <thead><tr><th>Process</th><th>PID</th><th>Samples</th><th>CPU Avg%</th><th>CPU Peak%</th><th>MEM Avg MB</th><th>MEM Peak MB</th></tr></thead>
-            <tbody>{"".join(rows)}</tbody>
+            <tbody>{rows}</tbody>
         </table>
     </div>"""
 
 
 def _section_hotspots(hotspots):
-    # 聚合热点
     agg = hotspots[-1] if hotspots else {}
     top = agg.get("top", [])
     if not top:
         return ""
 
-    rows = []
+    rows = ""
     for i, h in enumerate(top[:20]):
         sym = h.get("symbol", "?")
         weight = h.get("weight_pct", 0)
         bar_width = min(weight * 3, 100)
-        rows.append(f"""
+        rows += f"""
             <tr>
                 <td>{i + 1}</td>
                 <td class="symbol">{sym[:100]}</td>
                 <td>{weight:.2f}%</td>
                 <td><div class="bar" style="width: {bar_width}%"></div></td>
-            </tr>""")
+            </tr>"""
 
     return f"""
     <div class="card">
         <h3>Sampling Hotspots (Top 20)</h3>
         <table>
             <thead><tr><th>#</th><th>Symbol</th><th>Weight</th><th></th></tr></thead>
-            <tbody>{"".join(rows)}</tbody>
+            <tbody>{rows}</tbody>
         </table>
     </div>"""
 
@@ -431,24 +881,24 @@ def _section_timeline(timeline):
     if not levels:
         return ""
 
-    rows = []
+    rows = ""
     for lvl in levels:
         dur = lvl.get("duration_sec")
         dur_s = f"{dur:.1f}s" if dur else "N/A"
         tasks = ", ".join(lvl.get("tasks", []))
-        rows.append(f"""
+        rows += f"""
             <tr>
                 <td>Level {lvl['level_idx']}</td>
                 <td>{dur_s}</td>
                 <td>{tasks}</td>
-            </tr>""")
+            </tr>"""
 
     return f"""
     <div class="card">
         <h3>Timeline ({timeline.get('events', 0)} events)</h3>
         <table>
             <thead><tr><th>Level</th><th>Duration</th><th>Tasks</th></tr></thead>
-            <tbody>{"".join(rows)}</tbody>
+            <tbody>{rows}</tbody>
         </table>
     </div>"""
 
@@ -502,11 +952,102 @@ def _section_baseline(baseline):
     </div>"""
 
 
+def _section_webkit_tree(report: Dict, session_root: Path):
+    """P2: WebKit 进程树 + 调用栈热点可视化。"""
+    dvt_metrics = report.get("dvt_metrics", {})
+    proc_stats = dvt_metrics.get("process_stats", {})
+    callstack = report.get("callstack", {})
+
+    # 收集 WebKit 相关进程
+    webkit_procs = {}
+    for name, stats in proc_stats.items():
+        if any(kw in name.lower() for kw in ["webkit", "webcontent", "gpu", "networking", "soul"]):
+            webkit_procs[name] = stats
+
+    if not webkit_procs and not callstack:
+        return ""
+
+    # 进程树 HTML
+    tree_html = ""
+
+    if webkit_procs:
+        # 主进程
+        main_procs = {k: v for k, v in webkit_procs.items() if "soul" in k.lower()}
+        child_procs = {k: v for k, v in webkit_procs.items() if "soul" not in k.lower()}
+
+        tree_items = ""
+        for name, stats in main_procs.items():
+            cpu = stats.get("cpu_pct", {})
+            mem = stats.get("mem_mb", {})
+            cpu_avg = cpu.get("avg", 0) or 0
+            mem_avg = mem.get("avg", 0) or 0
+            tree_items += f"""
+                <div class="tree-node tree-main">
+                    <span class="tree-icon">📱</span>
+                    <span class="tree-name">{name}</span>
+                    <span class="tree-badge">{cpu_avg:.1f}% CPU</span>
+                    <span class="tree-badge">{mem_avg:.0f}MB</span>
+                </div>"""
+
+        for name, stats in child_procs.items():
+            cpu = stats.get("cpu_pct", {})
+            mem = stats.get("mem_mb", {})
+            cpu_avg = cpu.get("avg", 0) or 0
+            mem_avg = mem.get("avg", 0) or 0
+            icon = "🌐" if "webcontent" in name.lower() else ("🎮" if "gpu" in name.lower() else ("📡" if "network" in name.lower() else "⚙️"))
+            tree_items += f"""
+                <div class="tree-node tree-child">
+                    <span class="tree-line">├─</span>
+                    <span class="tree-icon">{icon}</span>
+                    <span class="tree-name">{name}</span>
+                    <span class="tree-badge">{cpu_avg:.1f}% CPU</span>
+                    <span class="tree-badge">{mem_avg:.0f}MB</span>
+                </div>"""
+
+        tree_html = f'<div class="tree-container">{tree_items}</div>'
+
+    # 调用栈热点（按进程分组）
+    hotspots_html = ""
+    if callstack:
+        top_frames = callstack.get("top_frames", [])
+        if top_frames:
+            rows = ""
+            for i, f in enumerate(top_frames[:15]):
+                sym = f.get("symbol", f.get("name", "?"))
+                weight = f.get("weight", f.get("weight_pct", 0))
+                proc = f.get("process", "")
+                bar_w = min(weight * 3, 100)
+                rows += f"""
+                    <tr>
+                        <td>{i + 1}</td>
+                        <td class="symbol">{sym[:80]}</td>
+                        <td>{proc[:30]}</td>
+                        <td>{weight:.2f}%</td>
+                        <td><div class="bar" style="width: {bar_w}%"></div></td>
+                    </tr>"""
+            hotspots_html = f"""
+            <h4>调用栈热点 (Top 15)</h4>
+            <table>
+                <thead><tr><th>#</th><th>Symbol</th><th>Process</th><th>Weight</th><th></th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>"""
+
+    if not tree_html and not hotspots_html:
+        return ""
+
+    return f"""
+    <div class="card">
+        <h3>WebKit 进程分析</h3>
+        {tree_html}
+        {hotspots_html}
+    </div>"""
+
+
 # ── Full Page Renderer ──
 
 
 def _render_full_page(tag, sections, chart_configs):
-    """渲染完整 HTML 页面。"""
+    """渲染完整 HTML 页面 — 含 zoom 插件 + PDF 按钮 + print 样式。"""
 
     # 构建 chart.js 初始化脚本
     chart_scripts = ""
@@ -517,8 +1058,102 @@ def _render_full_page(tag, sections, chart_configs):
             datasets_json = json.dumps(ch.get("datasets", []))
             y_label = ch.get("yLabel", "")
             chart_type = ch.get("type", "line")
+            stacked = ch.get("stacked", False)
+            is_scatter = ch.get("isScatter", False)
+            y_labels = ch.get("yLabels", {})
+            has_thermal = ch.get("hasThermal", False)
 
-            chart_scripts += f"""
+            if is_scatter:
+                # Scatter chart: 自定义 tooltip 显示 msg
+                chart_scripts += f"""
+        (function() {{
+            var ctx = document.getElementById('{sub_id}');
+            if (!ctx) return;
+            var datasets = {datasets_json};
+            // 添加 tooltip 回调
+            datasets.forEach(function(ds) {{
+                ds.pointHitRadius = 10;
+            }});
+            new Chart(ctx, {{
+                type: 'scatter',
+                data: {{ datasets: datasets }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {{
+                        legend: {{ position: 'bottom' }},
+                        tooltip: {{
+                            callbacks: {{
+                                label: function(ctx) {{
+                                    var ds = ctx.dataset;
+                                    var idx = ctx.dataIndex;
+                                    var msgs = ds.msgs || [];
+                                    return ds.label + ': ' + (msgs[idx] || '');
+                                }}
+                            }}
+                        }}
+                    }},
+                    scales: {{
+                        x: {{
+                            type: 'linear',
+                            title: {{ display: true, text: 'Timestamp' }},
+                            ticks: {{
+                                callback: function(val) {{
+                                    var d = new Date(val * 1000);
+                                    return d.getHours() + ':' + String(d.getMinutes()).padStart(2,'0');
+                                }}
+                            }}
+                        }},
+                        y: {{
+                            min: 0.5,
+                            max: 3.5,
+                            ticks: {{
+                                callback: function(val) {{
+                                    var map = {json.dumps(y_labels)};
+                                    return map[val] || val;
+                                }},
+                                stepSize: 1
+                            }}
+                        }}
+                    }},
+                    plugins: [{{
+                        id: 'zoom',
+                        afterInit: function(chart) {{ /* zoom registered globally */ }}
+                    }}]
+                }}
+            }});
+        }})();"""
+
+            else:
+                # Standard line/bar chart
+                stacked_opts = ""
+                if stacked:
+                    stacked_opts = """
+                    x: { stacked: true },
+                    y: { stacked: true, title: { display: true, text: '""" + y_label + """' } }"""
+
+                thermal_opts = ""
+                if has_thermal:
+                    thermal_opts = """,
+                    y1: {
+                        position: 'right',
+                        title: { display: true, text: 'Thermal' },
+                        grid: { drawOnChartArea: false },
+                        min: 0,
+                        max: 1,
+                        ticks: {
+                            callback: function(val) {
+                                var map = ['Nominal','Fair','Serious','Critical'];
+                                return map[Math.round(val * 3)] || '';
+                            }
+                        }
+                    }"""
+
+                y_opts = f"title: {{ display: true, text: '{y_label}' }}" if not stacked else ""
+
+                scales = stacked_opts if stacked else f"x: {{}}, y: {{ {y_opts} }}{thermal_opts}"
+
+                chart_scripts += f"""
         new Chart(document.getElementById('{sub_id}'), {{
             type: '{chart_type}',
             data: {{
@@ -531,7 +1166,7 @@ def _render_full_page(tag, sections, chart_configs):
                 interaction: {{ mode: 'index', intersect: false }},
                 plugins: {{ legend: {{ position: 'bottom' }} }},
                 scales: {{
-                    y: {{ title: {{ display: true, text: '{y_label}' }} }}
+                    {scales}
                 }}
             }}
         }});"""
@@ -543,6 +1178,8 @@ def _render_full_page(tag, sections, chart_configs):
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>cpar Perf Report: {tag}</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
@@ -618,9 +1255,81 @@ def _render_full_page(tag, sections, chart_configs):
     margin-top: 10px;
   }}
   .alert-item {{ font-size: 0.85rem; }}
+
+  /* P0: Power summary */
+  .power-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 8px 16px;
+  }}
+  .power-item {{
+    padding: 6px 0;
+  }}
+  .power-bar {{
+    height: 6px;
+    border-radius: 3px;
+    margin-top: 2px;
+    min-width: 2px;
+  }}
+
+  /* P2: WebKit tree */
+  .tree-container {{
+    margin: 8px 0;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.85rem;
+  }}
+  .tree-node {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 0;
+  }}
+  .tree-main {{ font-weight: 600; }}
+  .tree-child {{ padding-left: 16px; color: #cbd5e1; }}
+  .tree-line {{ color: #64748b; }}
+  .tree-icon {{ font-size: 1rem; }}
+  .tree-name {{ color: #e2e8f0; min-width: 200px; }}
+  .tree-badge {{
+    background: #334155;
+    color: #94a3b8;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 0.75rem;
+    font-family: -apple-system, sans-serif;
+  }}
+
+  /* P3: PDF export button */
+  .btn-pdf {{
+    margin-top: 12px;
+    padding: 6px 16px;
+    background: #3b82f6;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    float: right;
+  }}
+  .btn-pdf:hover {{ background: #2563eb; }}
+
+  /* P3: Print styles */
+  @media print {{
+    body {{ background: white; color: black; padding: 0; }}
+    .card {{ background: white; border: 1px solid #ccc; break-inside: avoid; }}
+    .btn-pdf {{ display: none; }}
+    .chart-nav {{ display: none; }}
+    h1, h2, h3 {{ color: black; }}
+    th {{ color: #333; }}
+    .tree-badge {{ background: #eee; color: #333; }}
+    .power-bar {{ print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
+    .bar {{ print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
+    canvas {{ max-height: 300px; }}
+  }}
+
   @media (max-width: 600px) {{
     .chart-grid {{ grid-template-columns: 1fr; }}
     .meta-grid {{ grid-template-columns: 1fr 1fr; }}
+    .power-grid {{ grid-template-columns: 1fr 1fr; }}
   }}
 </style>
 </head>

@@ -120,7 +120,7 @@ __init__ → load YAML → build DAG →
 | `symbolicate.py` | 1,139 | `auto_symbolicate`, `find_dsym_*` | dSYM 符号化 + 5 级自动搜索 (DerivedData→Archives→Spotlight→设备→ASC) |
 | `time_sync.py` | 857 | `TimeSyncAnalyzer` | syslog-xctrace 时间轴对齐 + ±N 秒窗口事件归因 |
 | `deep_export.py` | 855 | `DeepSchemaExporter` | GPU/Network/VM/Metal 四维深度数据导出 |
-| `power_attribution.py` | 1,118 | `PowerAttributor` | 进程级功耗归因 + 异常检测 |
+| `power_attribution.py` | 1,286 | `attribute_power`, `attribute_power_multidim` | 进程级功耗归因 (CPU线性 + 多维GPU/Network拆分) + 异常检测 |
 | `ai_diagnosis.py` | 1,260 | `AIDiagnoser` | AI 辅助诊断 (5种focus+回归分析+离线prompt) |
 | `webcontent.py` | 579 | `WebContentProfiler` | WebKit 进程 Time Profiler + PID 动态刷新 |
 | `dvt_bridge.py` | 692 | `DVTBridge` | pymobiledevice3 DVT 协议桥接 (per-process 指标) |
@@ -317,7 +317,7 @@ cpar run --with-perf --perf-device UDID --perf-attach ProcessName
 │       ├── symbolicate.py    # dSYM 符号化 + 5 级搜索 (1,139行)
 │       ├── time_sync.py      # 时序对齐 (857行)
 │       ├── deep_export.py    # 深度 Schema 导出 (855行)
-│       ├── power_attribution.py # 功耗归因 (1,118行)
+│       ├── power_attribution.py # 功耗归因 + 多维CPU/GPU/Network拆分 (1,286行)
 │       ├── ai_diagnosis.py   # AI 诊断 (1,260行)
 │       ├── device_metrics.py # 电池+进程指标 (355行)
 │       ├── templates.py      # Instruments 模板 (317行)

@@ -69,7 +69,7 @@
 - **dSYM 符号化** (`perf symbolicate`) — 自动从 Xcode DerivedData / Spotlight 查找 dSYM，批量 atos 符号化业务代码调用栈，Swift demangling，JSON 缓存避免重复解析
 - **syslog-xctrace 时序对齐** (`perf time-sync`) — 自动计算 syslog 与 xctrace 时间轴 offset，将日志事件与性能指标对齐到统一时间线，±N 秒窗口事件归因（OOM 前 CPU/内存/功耗变化）
 - **深度 Schema 采集** (`perf deep-export`) — 一键导出 GPU Frame Time / Network Flow / VM Tracking / Metal Performance 四维深度数据，自动探测可用 schema，iterparse 流式解析，P50/P95/P99 统计
-- **进程级功耗归因** (`perf power-attr`) — 按 CPU% 比例将 SystemPowerLevel 总功耗分摊到各进程，回答"到底是谁在耗电"，进程树跟踪 + 僵尸进程/功耗飙升/内存增长异常检测
+- **进程级功耗归因** (`perf power-attr`) — 按 CPU% 比例将 SystemPowerLevel 总功耗分摊到各进程，回答"到底是谁在耗电"。支持**多维归因** (CPU/GPU/Network 子系统级拆分)，进程树跟踪 + 僵尸进程/功耗飙升/内存增长异常检测
 - **AI 辅助诊断** (`perf ai-diag`) — 全 session 数据喂 LLM 生成诊断报告，支持 5 种 focus (general/webkit/power/memory/gpu)，回归分析 (before vs after)，WebKit 专项报告，离线模式输出 prompt
 
 ### 连接可靠性 + Release 分析 (Phase 4.5)
@@ -277,7 +277,7 @@ perf 子命令 (21 个):
   perf symbolicate dSYM 符号化 (5级搜索: DerivedData→Archives→Spotlight→设备→ASC)
   perf time-sync   syslog-xctrace 时序对齐
   perf deep-export 深度 Schema 导出 (GPU/Network/VM/Metal)
-  perf power-attr  进程级功耗归因
+  perf power-attr  进程级功耗归因 (CPU线性 + 多维CPU/GPU/Network拆分)
   perf ai-diag     AI 辅助诊断 (5种focus+回归分析)
   perf webcontent  WebKit 进程采集 (PID动态刷新)
 ```
@@ -312,7 +312,7 @@ claude-parallel/
 │       ├── symbolicate.py      # dSYM 符号化 + 5 级搜索 (1,139 行)
 │       ├── time_sync.py        # syslog-xctrace 时序对齐 (857 行)
 │       ├── deep_export.py      # GPU/网络/VM/Metal 深度导出 (855 行)
-│       ├── power_attribution.py # 进程级功耗归因 (1,118 行)
+│       ├── power_attribution.py # 进程级功耗归因 + 多维CPU/GPU/Network拆分 (1,286 行)
 │       ├── ai_diagnosis.py     # AI 辅助诊断 (1,260 行)
 │       ├── device_metrics.py   # BatteryPoller + ProcessMetrics (355 行)
 │       ├── templates.py        # Instruments 模板管理 (317 行)

@@ -1,0 +1,43 @@
+{
+  "tag": "smoke_device",
+  "repo": "/Users/chunhaixu/claude-parallel",
+  "started_at": 1776396520.992248,
+  "ended_at": 0,
+  "status": "running",
+  "device": "00008120-00164C893AEB401E",
+  "attach": "Soul_New",
+  "templates": "power",
+  "duration_sec": 1800,
+  "baseline_tag": "",
+  "threshold_pct": 0.0,
+  "syslog": {
+    "enabled": true,
+    "pid": 95639,
+    "log": "/Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/logs/syslog_full.log",
+    "reliable": null
+  },
+  "xctrace": {
+    "enabled": false,
+    "pid": 0,
+    "trace": "/Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/traces/power.trace",
+    "stderr": "/Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/logs/xctrace.stderr.log"
+  },
+  "errors": [],
+  "device_metrics": {
+    "enabled": true,
+    "source": "device",
+    "battery_pid": 95640,
+    "battery_jsonl": "/Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/logs/battery.jsonl",
+    "process_pid": 0,
+    "process_jsonl": "/Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/logs/process_metrics.jsonl",
+    "process_note": "tunneld not available; run: sudo pymobiledevice3 remote tunneld"
+  },
+  "sampling": {
+    "enabled": true,
+    "pid": 95648,
+    "interval_sec": 10,
+    "top_n": 10,
+    "retention": 30,
+    "hotspots_file": "/Users/chunhaixu/claude-parallel/.claude-parallel/perf/smoke_device/logs/hotspots.jsonl"
+  }
+}

@@ -155,6 +155,8 @@ class PerfSessionManager:
                             output_dir=dvt_output_dir,
                             cpu_threshold=self.config.dvt_cpu_threshold if hasattr(self.config, 'dvt_cpu_threshold') else 80.0,
                             memory_threshold_mb=self.config.dvt_memory_threshold_mb if hasattr(self.config, 'dvt_memory_threshold_mb') else 1500.0,
+                            collect_network=self.config.collect_network if hasattr(self.config, 'collect_network') else True,
+                            collect_graphics=self.config.collect_graphics if hasattr(self.config, 'collect_graphics') else True,
                         )
                         dvt_result = self.dvt_bridge_thread.start()
                         dvt_started = dvt_result.get("status") in ("started", "starting")
@@ -167,6 +169,8 @@ class PerfSessionManager:
                                 "interval_ms": self.config.metrics_interval_ms,
                                 "process_jsonl": str(dvt_output_dir / "dvt_process.jsonl"),
                                 "system_jsonl": str(dvt_output_dir / "dvt_system.jsonl"),
+                                "network_jsonl": str(dvt_output_dir / "dvt_network.jsonl"),
+                                "graphics_jsonl": str(dvt_output_dir / "dvt_graphics.jsonl"),
                             }
                             meta.setdefault("dvt_bridge", {
                                 "status": "running",

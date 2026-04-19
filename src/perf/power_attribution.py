@@ -44,8 +44,17 @@ class ProcessPower:
     name: str
     pid: int
     avg_cpu_pct: float       # 平均 CPU%
-    power_mw: float          # 归因功耗 (mW)
+    power_mw: float          # 归因功耗 (mW) — 总功耗 (CPU 分摊)
     pct_of_total: float      # 占总功耗百分比
+    # P2: 多维功耗归因字段
+    cpu_power_mw: float = 0.0      # CPU 子系统功耗 (mW)
+    gpu_power_mw: float = 0.0      # GPU 子系统功耗 (mW)
+    network_power_mw: float = 0.0  # 网络子系统功耗 (mW)
+    display_power_mw: float = 0.0  # Display 子系统功耗 (mW)
+    avg_rx_bytes: float = 0.0      # 平均接收字节数 (from DvtBridge network)
+    avg_tx_bytes: float = 0.0      # 平均发送字节数
+    gpu_time_pct: float = 0.0      # GPU 时间占比 (from DvtBridge graphics)
+    source: str = "cpu_linear"      # 归因方法: cpu_linear / multidim
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -54,6 +63,11 @@ class ProcessPower:
             "avg_cpu_pct": round(self.avg_cpu_pct, 2),
             "power_mw": round(self.power_mw, 2),
             "pct_of_total": round(self.pct_of_total, 2),
+            "cpu_power_mw": round(self.cpu_power_mw, 2),
+            "gpu_power_mw": round(self.gpu_power_mw, 2),
+            "network_power_mw": round(self.network_power_mw, 2),
+            "display_power_mw": round(self.display_power_mw, 2),
+            "source": self.source,
         }
 
 
@@ -626,6 +640,142 @@ def attribute_power(
     return results
 
 
+def attribute_power_multidim(
+    power_samples: List[Dict[str, Any]],
+    process_cpu_samples: List[Dict[str, Any]],
+    network_metrics: Optional[List[Dict[str, Any]]] = None,
+    gpu_metrics: Optional[List[Dict[str, Any]]] = None,
+) -> List[ProcessPower]:
+    """
+    多维功耗归因: CPU + GPU + Network + Display 子系统级分摊。
+
+    在 attribute_power() 的 CPU 线性分摊基础上，进一步利用:
+    - power_samples 中已解析的 cpu_mw/gpu_mw/display_mw/network_mw 分项
+    - network_metrics: DvtBridge network 数据 [{pid, name, rx_bytes, tx_bytes}, ...]
+    - gpu_metrics: DvtBridge graphics 数据 [{pid, name, gpu_time_pct}, ...]
+
+    归因策略:
+    - CPU 子系统功耗: 按 CPU% 比例分摊 cpu_mw
+    - GPU 子系统功耗: 按 gpu_time_pct 分摊 gpu_mw (无 gpu_metrics 则按 CPU% 回退)
+    - Network 子系统功耗: 按 rx+tx bytes 比例分摊 network_mw (无数据则按 CPU% 回退)
+    - Display 子系统功耗: 不分摊到进程 (屏幕功耗是共享资源)
+
+    Returns:
+        [ProcessPower, ...] 按总功耗降序，source="multidim"
+    """
+    if not power_samples:
+        return []
+
+    # ── 计算各子系统平均功耗 ──
+    def _avg_field(samples: List[Dict], field: str) -> float:
+        vals = [s.get(field, 0) for s in samples if s.get(field, 0) > 0]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    avg_cpu_mw = _avg_field(power_samples, "cpu_mw")
+    avg_gpu_mw = _avg_field(power_samples, "gpu_mw")
+    avg_net_mw = _avg_field(power_samples, "network_mw")
+    avg_disp_mw = _avg_field(power_samples, "display_mw")
+    avg_total_mw = _avg_field(power_samples, "total_mw")
+
+    if avg_total_mw <= 0:
+        avg_total_mw = avg_cpu_mw + avg_gpu_mw + avg_net_mw + avg_disp_mw
+
+    if avg_total_mw <= 0:
+        return []
+
+    # ── 1. 计算各进程平均 CPU% ──
+    process_cpu_map: Dict[Tuple[str, int], List[float]] = defaultdict(list)
+    for s in process_cpu_samples:
+        pid = s.get("pid", 0)
+        name = s.get("name", "")
+        cpu = s.get("cpu_pct", 0)
+        if name:
+            process_cpu_map[(name, pid)].append(float(cpu))
+
+    process_avg_cpu: Dict[Tuple[str, int], float] = {}
+    for key, cpu_list in process_cpu_map.items():
+        process_avg_cpu[key] = sum(cpu_list) / len(cpu_list) if cpu_list else 0.0
+
+    sum_cpu = sum(process_avg_cpu.values())
+    if sum_cpu <= 0:
+        return []
+
+    # ── 2. 构建 Network 比例 (按 rx+tx bytes) ──
+    process_net_bytes: Dict[Tuple[str, int], float] = {}
+    if network_metrics:
+        for m in network_metrics:
+            key = (m.get("name", ""), m.get("pid", 0))
+            rx = float(m.get("rx_bytes", 0) or 0)
+            tx = float(m.get("tx_bytes", 0) or 0)
+            process_net_bytes[key] = process_net_bytes.get(key, 0) + rx + tx
+
+    sum_net_bytes = sum(process_net_bytes.values())
+
+    # ── 3. 构建 GPU 比例 ──
+    process_gpu_pct: Dict[Tuple[str, int], float] = {}
+    if gpu_metrics:
+        for m in gpu_metrics:
+            key = (m.get("name", ""), m.get("pid", 0))
+            gpu_t = float(m.get("gpu_time_pct", 0) or 0)
+            process_gpu_pct[key] = process_gpu_pct.get(key, 0) + gpu_t
+
+    sum_gpu_pct = sum(process_gpu_pct.values())
+
+    # ── 4. 多维归因 ──
+    results: List[ProcessPower] = []
+    for key, avg_cpu in process_avg_cpu.items():
+        name, pid = key
+        cpu_ratio = avg_cpu / sum_cpu if sum_cpu > 0 else 0.0
+
+        # CPU 子系统: 按 CPU% 比例
+        cpu_power = avg_cpu_mw * cpu_ratio
+
+        # GPU 子系统: 按 gpu_time_pct 比例, 无数据则回退到 CPU% 比例
+        if sum_gpu_pct > 0 and process_gpu_pct.get(key, 0) > 0:
+            gpu_ratio = process_gpu_pct[key] / sum_gpu_pct
+        else:
+            gpu_ratio = cpu_ratio
+        gpu_power = avg_gpu_mw * gpu_ratio
+
+        # Network 子系统: 按 bytes 比例, 无数据则回退到 CPU% 比例
+        if sum_net_bytes > 0 and process_net_bytes.get(key, 0) > 0:
+            net_ratio = process_net_bytes[key] / sum_net_bytes
+        else:
+            net_ratio = cpu_ratio
+        net_power = avg_net_mw * net_ratio
+
+        # 总功耗 = cpu + gpu + net (display 不归因)
+        total_proc_mw = cpu_power + gpu_power + net_power
+        pct_of_total = (total_proc_mw / avg_total_mw) * 100.0 if avg_total_mw > 0 else 0.0
+
+        results.append(ProcessPower(
+            name=name,
+            pid=pid,
+            avg_cpu_pct=avg_cpu,
+            power_mw=total_proc_mw,
+            pct_of_total=pct_of_total,
+            cpu_power_mw=cpu_power,
+            gpu_power_mw=gpu_power,
+            network_power_mw=net_power,
+            display_power_mw=0.0,  # display 不归因到进程
+            avg_rx_bytes=sum(
+                float(m.get("rx_bytes", 0) or 0)
+                for m in (network_metrics or [])
+                if m.get("name") == name and m.get("pid") == pid
+            ),
+            avg_tx_bytes=sum(
+                float(m.get("tx_bytes", 0) or 0)
+                for m in (network_metrics or [])
+                if m.get("name") == name and m.get("pid") == pid
+            ),
+            gpu_time_pct=process_gpu_pct.get(key, 0.0),
+            source="multidim",
+        ))
+
+    results.sort(key=lambda p: p.power_mw, reverse=True)
+    return results
+
+
 # ── 4. 设备进程树发现 ──
 
 
@@ -1051,6 +1201,24 @@ def format_attribution_report(
             f"{i:<4} {name:<18} {p.pid:<7} "
             f"{p.avg_cpu_pct:>6.1f}% {p.power_mw:>10.1f} {p.pct_of_total:>7.1f}%"
         )
+
+        # P2: 多维归因时显示子系统拆分
+        if p.source == "multidim" and (
+            p.cpu_power_mw > 0 or p.gpu_power_mw > 0 or p.network_power_mw > 0
+        ):
+            parts = []
+            if p.cpu_power_mw > 0:
+                parts.append(f"CPU={p.cpu_power_mw:.1f}")
+            if p.gpu_power_mw > 0:
+                parts.append(f"GPU={p.gpu_power_mw:.1f}")
+            if p.network_power_mw > 0:
+                parts.append(f"Net={p.network_power_mw:.1f}")
+            if p.gpu_time_pct > 0:
+                parts.append(f"gpu%={p.gpu_time_pct:.1f}")
+            if p.avg_rx_bytes > 0 or p.avg_tx_bytes > 0:
+                parts.append(f"rx={p.avg_rx_bytes:.0f} tx={p.avg_tx_bytes:.0f}")
+            if parts:
+                lines.append(f"     ^-- {' | '.join(parts)} (mW)")
 
     lines.append(sep)
 
