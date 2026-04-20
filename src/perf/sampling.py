@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -164,6 +164,8 @@ def _parse_time_profile_iterparse(
     frame_map: Dict[str, Tuple[str, str]] = {}  # frame id → (name, addr)
     weight_map: Dict[str, float] = {}           # weight id → ms
     bt_map: Dict[str, List[Tuple[str, str]]] = {}  # tagged-backtrace id → [(name, addr), ...]
+    thread_map: Dict[str, str] = {}             # thread id → "name#tid" (per-thread 聚合关键)
+    process_map: Dict[str, str] = {}            # process id → name
 
     samples: List[Any] = []
     # 当前 row 的临时状态
@@ -171,6 +173,8 @@ def _parse_time_profile_iterparse(
     row_weight: float = 1.0
     row_frames: List[Tuple[str, str]] = []   # (name, addr)
     row_ts: float = 0.0
+    row_thread: str = ""                     # 本 row 的线程标签
+    row_process: str = ""                    # 本 row 的进程名
     current_bt_id: Optional[str] = None
     current_bt_frames: List[Tuple[str, str]] = []
     in_backtrace = False
@@ -185,6 +189,8 @@ def _parse_time_profile_iterparse(
                     row_weight = 1.0
                     row_frames = []
                     row_ts = 0.0
+                    row_thread = ""
+                    row_process = ""
                 elif tag == "tagged-backtrace" and in_row:
                     bt_id = elem.get("id")
                     bt_ref = elem.get("ref")
@@ -211,6 +217,35 @@ def _parse_time_profile_iterparse(
                     name, addr = frame_map.get(fref, ("", ""))
                 if in_backtrace and (name or addr):
                     current_bt_frames.append((name, addr))
+
+            elif tag == "thread":
+                # xctrace XML 中线程元素: <thread id="..." name="..." tid="..."/>
+                # 或引用形式: <thread ref="..."/>
+                tid_id = elem.get("id")
+                tid_ref = elem.get("ref")
+                tname = elem.get("name", "") or elem.get("fmt", "")
+                tid_attr = elem.get("tid", "") or elem.get("thread-id", "")
+                if tid_id:
+                    label = tname if tname else (f"tid#{tid_attr}" if tid_attr else f"thread#{tid_id}")
+                    thread_map[tid_id] = label
+                if in_row:
+                    if tid_id:
+                        row_thread = thread_map.get(tid_id, "")
+                    elif tid_ref:
+                        row_thread = thread_map.get(tid_ref, "")
+
+            elif tag == "process":
+                # 进程元素: <process id="..." name="..." pid="..."/>
+                pid_id = elem.get("id")
+                pid_ref = elem.get("ref")
+                pname = elem.get("name", "") or elem.get("fmt", "")
+                if pid_id:
+                    process_map[pid_id] = pname
+                if in_row:
+                    if pid_id:
+                        row_process = process_map.get(pid_id, "")
+                    elif pid_ref:
+                        row_process = process_map.get(pid_ref, "")
 
             elif tag == "weight":
                 wid = elem.get("id")
@@ -259,6 +294,8 @@ def _parse_time_profile_iterparse(
                                 "ts_offset_s": round(row_ts, 3),
                                 "stack": sym_frames,
                                 "weight": row_weight,
+                                "thread": row_thread,
+                                "process": row_process,
                             })
                     else:
                         # 只取叶子（第一个符号化 frame）
@@ -271,7 +308,8 @@ def _parse_time_profile_iterparse(
                                 leaf_name, leaf_addr = n or f"<0x{a}>", a
                                 break
                         if leaf_name:
-                            samples.append((leaf_name, row_weight, leaf_addr))
+                            # (name, weight, addr, thread)
+                            samples.append((leaf_name, row_weight, leaf_addr, row_thread))
 
                 elem.clear()  # 释放内存
 
@@ -356,8 +394,9 @@ def aggregate_top_n(
     """将原始采样聚合为 Top-N 热点函数（取 leaf 符号）。
 
     samples 可为:
-      [(name, weight)]              旧格式，向后兼容
-      [(name, weight, addr)]        新格式，含原始地址用于 LinkMap 反查
+      [(name, weight)]                       最古老格式
+      [(name, weight, addr)]                 含地址 (LinkMap 反查)
+      [(name, weight, addr, thread)]         含 thread (per-thread 聚合)
     """
     if not samples:
         return []
@@ -389,6 +428,63 @@ def aggregate_top_n(
         if addr:
             item["addr"] = addr
         out.append(item)
+    return out
+
+
+def aggregate_per_thread(
+    samples: List[Tuple], top_threads: int = 10, top_funcs_per_thread: int = 3,
+) -> List[Dict[str, Any]]:
+    """按线程聚合 — 找出"哪条线程最忙 + 它在跑什么"。
+
+    samples 应为 4 元组: (name, weight, addr, thread)
+    旧格式 noop 返回空列表。
+    """
+    if not samples:
+        return []
+    # 跳过没 thread 维度的采样（旧格式）
+    has_thread = any(len(s) >= 4 and s[3] for s in samples)
+    if not has_thread:
+        return []
+
+    # thread → {total_weight, {func: weight}}
+    thread_data: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"total": 0.0, "funcs": defaultdict(float)}
+    )
+    grand_total = 0.0
+    for s in samples:
+        if len(s) < 4:
+            continue
+        frame, weight, _addr, thread = s[0], s[1], s[2], s[3]
+        if not thread:
+            thread = "(unnamed)"
+        leaf = frame.rsplit(" → ", 1)[-1]
+        thread_data[thread]["total"] += weight
+        thread_data[thread]["funcs"][leaf] += weight
+        grand_total += weight
+
+    if grand_total <= 0:
+        return []
+
+    sorted_threads = sorted(
+        thread_data.items(), key=lambda kv: kv[1]["total"], reverse=True
+    )[:top_threads]
+
+    out = []
+    for tname, d in sorted_threads:
+        top_funcs = sorted(d["funcs"].items(), key=lambda x: x[1], reverse=True)
+        out.append({
+            "thread": tname,
+            "weight": int(round(d["total"])),
+            "pct": round(d["total"] / grand_total * 100.0, 1),
+            "top_funcs": [
+                {
+                    "symbol": f,
+                    "pct_in_thread": round(w / d["total"] * 100.0, 1),
+                    "samples": int(round(w)),
+                }
+                for f, w in top_funcs[:top_funcs_per_thread]
+            ],
+        })
     return out
 
 
@@ -510,6 +606,7 @@ class HotspotSnapshot:
     duration_s: int
     sample_count: int
     top: List[Dict[str, Any]]
+    per_thread: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class SamplingProfilerSidecar:
@@ -784,7 +881,10 @@ class SamplingProfilerSidecar:
                 return False
 
             top = aggregate_top_n(samples, self.top_n)
-            total = sum(w for _, w in samples)
+            # 兼容 2/3/4 元组: weight 总在 index 1
+            total = sum(s[1] for s in samples)
+            # per-thread 聚合 (4 元组才有效, 旧格式自动 noop)
+            per_thread = aggregate_per_thread(samples, top_threads=10, top_funcs_per_thread=3)
 
             snapshot = HotspotSnapshot(
                 ts=time.time(),
@@ -792,6 +892,7 @@ class SamplingProfilerSidecar:
                 duration_s=self.interval_sec,
                 sample_count=int(total),
                 top=top,
+                per_thread=per_thread,
             )
             self._append_snapshot(snapshot)
             self._rotate_if_needed()
@@ -852,7 +953,8 @@ class SamplingProfilerSidecar:
             return None
 
         top = aggregate_top_n(samples, self.top_n)
-        total = sum(w for _, w in samples)
+        total = sum(s[1] for s in samples)
+        per_thread = aggregate_per_thread(samples, top_threads=10, top_funcs_per_thread=3)
 
         return HotspotSnapshot(
             ts=time.time(),
@@ -860,6 +962,7 @@ class SamplingProfilerSidecar:
             duration_s=self.interval_sec,
             sample_count=int(total),
             top=top,
+            per_thread=per_thread,
         )
 
     def _record(self, cmd: List[str], cycle_num: int) -> Optional[int]:

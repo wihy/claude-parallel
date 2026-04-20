@@ -550,6 +550,10 @@ _HTML_PAGE = r"""<!doctype html>
       <h2>热点函数 (Sampling Profiler — 多 cycle 趋势聚合)</h2>
       <div id="hotspots">—</div>
     </div>
+    <div class="card" id="card-threads" style="grid-column: 1 / -1;">
+      <h2>线程级 CPU 分布 (Per-Thread Hotspots)</h2>
+      <div id="threads">—</div>
+    </div>
     <div class="card" id="card-tasks" style="grid-column: 1 / -1;"><h2>任务列表</h2><div id="tasks">—</div></div>
     <div class="card" id="card-anomalies" style="grid-column: 1 / -1;"><h2>异常监控 (cpar-anomaly-watch)</h2><div id="anomalies">—</div></div>
     <div class="card" id="card-alerts" style="grid-column: 1 / -1;"><h2>实时告警 (alerts.log)</h2><div id="alerts">—</div></div>
@@ -1139,6 +1143,90 @@ function renderHotspots(p) {
   return html;
 }
 
+function renderThreads(p) {
+  if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
+  const cycles = p.hotspots || [];
+  if (!cycles.length) return '<span class="muted">无 sampling 数据</span>';
+
+  // 跨 cycle 聚合 per_thread
+  const threadAgg = {};
+  let cycleWithThread = 0;
+  for (const c of cycles) {
+    const pt = c.per_thread || [];
+    if (!pt.length) continue;
+    cycleWithThread++;
+    for (const t of pt) {
+      const name = t.thread || '(unnamed)';
+      if (!threadAgg[name]) {
+        threadAgg[name] = { name, totalPct: 0, cycles: 0, peakPct: 0,
+                            funcAgg: {} };
+      }
+      threadAgg[name].totalPct += t.pct || 0;
+      threadAgg[name].cycles += 1;
+      threadAgg[name].peakPct = Math.max(threadAgg[name].peakPct, t.pct || 0);
+      for (const f of (t.top_funcs || [])) {
+        const sym = f.symbol || '?';
+        threadAgg[name].funcAgg[sym] = (threadAgg[name].funcAgg[sym] || 0) + (f.pct_in_thread || 0);
+      }
+    }
+  }
+
+  if (!cycleWithThread) {
+    return `<div class="muted">该 sampling 数据无 thread 维度 (旧采集 / xctrace XML 未含 thread 元素)
+      <br>需重新启动 sampling daemon, 让新采集流程提取 thread 信息</div>`;
+  }
+
+  const threads = Object.values(threadAgg).map(t => ({
+    name: t.name,
+    avgPct: t.totalPct / cycleWithThread,
+    peakPct: t.peakPct,
+    cycles: t.cycles,
+    topFuncs: Object.entries(t.funcAgg)
+      .map(([sym, pct]) => ({ sym, pct: pct / t.cycles }))
+      .sort((a, b) => b.pct - a.pct)
+      .slice(0, 3),
+  })).sort((a, b) => b.avgPct - a.avgPct);
+
+  const total = threads.reduce((s, t) => s + t.avgPct, 0) || 1;
+
+  let html = `
+    <div class="row" style="margin-bottom:8px">
+      <div class="stat"><span class="v">${cycleWithThread}</span><span class="l">含线程数据 cycle</span></div>
+      <div class="stat"><span class="v">${threads.length}</span><span class="l">unique 线程</span></div>
+      <div class="stat"><span class="v">${threads[0]?.name?.slice(0,30) || '—'}</span><span class="l">CPU 头号线程</span></div>
+      <div class="stat"><span class="v ${threads[0]?.avgPct > 40 ? 'err' : threads[0]?.avgPct > 20 ? 'warn' : 'ok'}">${fmt(threads[0]?.avgPct, 1)}%</span><span class="l">头号占比</span></div>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:40px">#</th>
+        <th>线程</th>
+        <th style="width:60px" class="num">均%</th>
+        <th style="width:60px" class="num">峰%</th>
+        <th style="width:80px" class="num">出现率</th>
+        <th>Top 3 函数 (该线程内 %)</th>
+      </tr></thead>
+      <tbody>
+  `;
+  for (let i = 0; i < threads.length; i++) {
+    const t = threads[i];
+    const isMain = /main|UI|MainQueue/i.test(t.name);
+    const cls = t.avgPct > 40 ? 'err' : (t.avgPct > 20 ? 'warn' : '');
+    const mainBadge = isMain ? '<span class="pill" style="background:#dc2626" title="主线程, 卡顿元凶">主线程</span>' : '';
+    const funcsHtml = t.topFuncs.map(f =>
+      `<span style="font-family:Menlo;font-size:11px">${fmt(f.pct,0)}% ${escapeHtml(f.sym.slice(0,40))}</span>`
+    ).join('<br>');
+    html += `<tr class="${cls}">
+      <td>#${i+1}</td>
+      <td>${escapeHtml(t.name)} ${mainBadge} <a class="loc-btn" onclick="copyText('${escapeAttr(t.name)}',this);return false">📋</a></td>
+      <td class="num"><b>${fmt(t.avgPct, 1)}</b></td>
+      <td class="num">${fmt(t.peakPct, 1)}</td>
+      <td class="num">${t.cycles}/${cycleWithThread}</td>
+      <td>${funcsHtml || '<span class="muted">—</span>'}</td>
+    </tr>`;
+  }
+  return html + '</tbody></table>';
+}
+
 function renderAnomalies(p) {
   if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
   const recs = p.anomalies || [];
@@ -1407,6 +1495,7 @@ async function tick() {
     document.getElementById('system').innerHTML = renderSystem(s.perf);
     document.getElementById('process').innerHTML = renderProcess(s.perf);
     document.getElementById('hotspots').innerHTML = renderHotspots(s.perf);
+    document.getElementById('threads').innerHTML = renderThreads(s.perf);
     document.getElementById('gpu').innerHTML = renderGpu(s.perf);
     document.getElementById('net').innerHTML = renderNet(s.perf);
     document.getElementById('anomalies').innerHTML = renderAnomalies(s.perf);
