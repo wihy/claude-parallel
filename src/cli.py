@@ -125,6 +125,88 @@ def build_perf_config_from_args(args) -> PerfConfig:
     )
 
 
+def _maybe_start_web_dashboard(args, orch, perf_cfg):
+    """如启用 --web-dashboard，启动后台 HTTP 仪表盘并返回 server 实例 (否则 None)。"""
+    if not getattr(args, "web_dashboard", False):
+        return None
+    try:
+        from src.web_dashboard import (
+            DashboardServer, collect_orchestrator_state, collect_perf_state,
+        )
+    except ImportError as e:
+        print(f"  [dashboard] 加载失败: {e}")
+        return None
+
+    repo_path = Path(orch.config.repo) if orch.config else Path.cwd()
+    coord_dir = orch.config.coordination_dir if orch.config else ".claude-parallel"
+    perf_tag = perf_cfg.tag if perf_cfg and perf_cfg.enabled else "perf"
+
+    srv = DashboardServer(
+        port=int(getattr(args, "web_port", 8765)),
+        orch_provider=lambda: collect_orchestrator_state(orch),
+        perf_provider=lambda: collect_perf_state(repo_path, coord_dir, perf_tag),
+        title=f"cpar Dashboard — {Path(args.task_file).stem if hasattr(args, 'task_file') else 'run'}",
+    )
+    try:
+        url = srv.start()
+        print(f"  [dashboard] Web UI 已启动: {url}  (perf tag: {perf_tag})")
+        return srv
+    except OSError as e:
+        print(f"  [dashboard] 端口 {args.web_port} 启动失败: {e}")
+        return None
+
+
+def cmd_dashboard(args):
+    """独立 Web Dashboard 模式 — 不需要 orchestrator，纯 perf 监控。
+
+    适用场景: 已经在跑 cpar perf start，想用浏览器看实时电池/CPU/网络/告警。
+    """
+    from src.web_dashboard import DashboardServer, collect_perf_state
+
+    repo = Path(args.repo).expanduser().resolve() if args.repo else Path.cwd().resolve()
+    coord_dir = ".claude-parallel"
+    perf_root = repo / coord_dir / "perf" / args.tag
+    if not perf_root.exists():
+        print(f"  [dashboard] perf 会话目录不存在: {perf_root}")
+        print(f"  [dashboard] 提示: 先用 'cpar perf start --tag {args.tag}' 启动采集")
+        sys.exit(1)
+
+    srv = DashboardServer(
+        port=args.port,
+        host=args.host,
+        orch_provider=lambda: {"enabled": False},
+        perf_provider=lambda: collect_perf_state(repo, coord_dir, args.tag),
+        title=f"cpar Dashboard — perf:{args.tag}",
+    )
+    try:
+        url = srv.start()
+    except OSError as e:
+        print(f"  [dashboard] 启动失败 (端口 {args.port}): {e}")
+        sys.exit(1)
+    print(f"\n  ╔══════════════════════════════════════════════════════╗")
+    print(f"  ║  Web Dashboard 已启动                                ║")
+    print(f"  ║  URL: {url:<48}║")
+    print(f"  ║  Perf 会话: {args.tag:<42}║")
+    print(f"  ║  Ctrl+C 退出                                         ║")
+    print(f"  ╚══════════════════════════════════════════════════════╝\n")
+
+    if not getattr(args, "no_open", False):
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\n  [dashboard] 收到中断，关闭服务...")
+    finally:
+        srv.stop()
+    print("  [dashboard] 已关闭")
+
+
 async def cmd_run(args):
     """执行任务"""
     perf_cfg = build_perf_config_from_args(args)
@@ -153,7 +235,13 @@ async def cmd_run(args):
     )
     orch.load()
 
-    report = await orch.run()
+    # 可选: 启动 Web Dashboard (与 Rich Live 共存; orch 数据通过 provider 暴露)
+    dash_srv = _maybe_start_web_dashboard(args, orch, perf_cfg)
+    try:
+        report = await orch.run()
+    finally:
+        if dash_srv:
+            dash_srv.stop()
 
     if not args.dry:
         print_report(report)
@@ -189,7 +277,12 @@ async def cmd_resume(args):
     )
     orch.load()
 
-    report = await orch.resume()
+    dash_srv = _maybe_start_web_dashboard(args, orch, perf_cfg)
+    try:
+        report = await orch.resume()
+    finally:
+        if dash_srv:
+            dash_srv.stop()
     print_report(report)
 
     perf_gate = report.get("perf", {}).get("gate", {})
@@ -1636,6 +1729,8 @@ def main():
     run_parser.add_argument("--perf-battery-interval", type=int, default=10, help="电池轮询间隔(s)")
     run_parser.add_argument("--perf-attach-webcontent", action="store_true", help="采集 WebContent 进程")
     run_parser.add_argument("--perf-composite", default="auto", help="Composite 模式: auto|full|webperf|power_cpu|gpu_full|memory")
+    run_parser.add_argument("--web-dashboard", action="store_true", help="启动浏览器仪表盘 (替代 Rich Live)")
+    run_parser.add_argument("--web-port", type=int, default=8765, help="dashboard 端口 (默认 8765)")
 
     # ── resume ──
     resume_parser = subparsers.add_parser("resume", help="从中断处恢复执行")
@@ -1662,6 +1757,8 @@ def main():
     resume_parser.add_argument("--perf-metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
     resume_parser.add_argument("--perf-battery-interval", type=int, default=10, help="电池轮询间隔(s)")
     resume_parser.add_argument("--perf-attach-webcontent", action="store_true", help="采集 WebContent 进程")
+    resume_parser.add_argument("--web-dashboard", action="store_true", help="启动浏览器仪表盘")
+    resume_parser.add_argument("--web-port", type=int, default=8765, help="dashboard 端口")
 
     # ── plan ──
     plan_parser = subparsers.add_parser("plan", help="展示执行计划")
@@ -1712,6 +1809,14 @@ def main():
     logs_parser.add_argument("repo", help="项目仓库路径")
     logs_parser.add_argument("--task", "-t", help="指定任务 ID")
     logs_parser.add_argument("--tail", "-n", type=int, default=50, help="最后 N 行")
+
+    # ── dashboard (独立 Web UI 模式) ──
+    dash_parser = subparsers.add_parser("dashboard", help="启动 Web Dashboard 浏览实时调度+功耗")
+    dash_parser.add_argument("--repo", default="", help="项目仓库路径 (默认当前目录)")
+    dash_parser.add_argument("--tag", default="perf", help="perf 会话标签 (默认 perf)")
+    dash_parser.add_argument("--port", type=int, default=8765, help="HTTP 端口 (默认 8765)")
+    dash_parser.add_argument("--host", default="127.0.0.1", help="监听地址 (默认 127.0.0.1)")
+    dash_parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
 
     # ── perf ──
     perf_parser = subparsers.add_parser("perf", help="真机性能采集与报告")
@@ -1930,6 +2035,8 @@ def main():
         asyncio.run(cmd_clean(args))
     elif args.command == "logs":
         asyncio.run(cmd_logs(args))
+    elif args.command == "dashboard":
+        cmd_dashboard(args)
     elif args.command == "perf":
         if args.perf_cmd == "start":
             asyncio.run(cmd_perf_start(args))

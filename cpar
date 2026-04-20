@@ -13,6 +13,7 @@
 #   cpar resume <yaml>     恢复执行
 #   cpar clean <repo>      清理 worktree
 #   cpar logs <repo>       查看日志
+#   cpar dashboard         启动浏览器仪表盘 (实时调度+功耗，独立模式)
 #   cpar perf ...          真机性能采集 (start/stop/tail/report/devices/config/
 #                          live/rules/stream/snapshot/webcontent/dashboard/metrics/
 #                          battery/hotspots/callstack/templates/symbolicate/
@@ -65,6 +66,10 @@ case "${1:-help}" in
         shift
         python3 "$SCRIPT_DIR/run.py" perf "$@"
         ;;
+    dashboard)
+        shift
+        python3 "$SCRIPT_DIR/run.py" dashboard "$@"
+        ;;
     help|--help|-h)
         echo "用法: cpar <command> [args...]"
         echo ""
@@ -80,6 +85,8 @@ case "${1:-help}" in
         echo "  resume <yaml>     从中断处恢复"
         echo "  clean <repo>      清理 worktree 和协调文件"
         echo "  logs <repo>       查看任务日志 (-t TASK -n N)"
+        echo "  dashboard         启动 Web Dashboard 浏览器仪表盘 (替代终端面板)"
+        echo "                    选项: --repo PATH --tag TAG --port 8765 --host 127.0.0.1 --no-open"
         echo "  perf <subcmd>     真机性能采集/分析"
         echo "                    采集: start/stop/tail/report/devices/config"
         echo "                    实时: live/rules/stream/snapshot/metrics/battery"
@@ -100,6 +107,8 @@ case "${1:-help}" in
         echo "  cpar run examples/test-dag.yaml --merge"
         echo "  cpar diff examples/test-dag.yaml"
         echo "  cpar review examples/test-dag.yaml"
+        echo "  cpar dashboard --tag perf                    # 浏览实时电池/CPU/告警"
+        echo "  cpar run examples/test-dag.yaml --web-dashboard  # 调度+perf 一体化面板"
         ;;
     *)
         # 未知命令，直接透传
