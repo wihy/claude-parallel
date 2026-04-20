@@ -1,8 +1,0 @@
-[sampling] cycle 1: xctrace exit=2
-1776393901 cycle 1: xctrace exit=2
-[sampling] cycle 1: xctrace exit=2
-1776393907 cycle 1: xctrace exit=2
-[sampling] cycle 1: xctrace exit=2
-1776393923 cycle 1: xctrace exit=2
-[sampling] auto-stop: 3 consecutive failures
-1776393925 auto-stop: 3 consecutive failures

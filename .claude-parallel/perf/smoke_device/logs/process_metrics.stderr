@@ -1,4 +1,0 @@
-Traceback (most recent call last):
-  File "/opt/homebrew/Caskroom/miniconda/base/bin/pymobiledevice3", line 5, in <module>
-    from opack.__main__ import cli
-ModuleNotFoundError: No module named 'opack.__main__'
