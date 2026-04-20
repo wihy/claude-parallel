@@ -705,6 +705,8 @@ class DvtBridgeThread:
         interval_ms: int = 1000,
         collect_graphics: bool = False,
         collect_network: bool = False,
+        collect_process: bool = True,
+        collect_system: bool = True,
         output_dir: Optional[Path] = None,
         cpu_threshold: float = 80.0,
         memory_threshold_mb: float = 1500.0,
@@ -716,6 +718,8 @@ class DvtBridgeThread:
         self.interval_ms = interval_ms
         self.collect_graphics = collect_graphics
         self.collect_network = collect_network
+        self.collect_process = collect_process
+        self.collect_system = collect_system
         self.cpu_threshold = cpu_threshold
         self.memory_threshold_mb = memory_threshold_mb
         self.on_process_snapshot = on_process_snapshot
@@ -747,6 +751,8 @@ class DvtBridgeThread:
             interval_ms=self.interval_ms,
             collect_graphics=self.collect_graphics,
             collect_network=self.collect_network,
+            collect_process=self.collect_process,
+            collect_system=self.collect_system,
             process_jsonl=self.process_jsonl,
             system_jsonl=self.system_jsonl,
             network_jsonl=self.network_jsonl,

@@ -992,9 +992,13 @@ def _tunneld_start(prompt_password: bool = True) -> tuple[bool, str]:
     if sys.platform != "darwin":
         return False, "非 macOS 系统不支持 osascript 弹密码框"
 
-    cmd_str = f'/bin/sh -c "{pmd3} remote tunneld >> {TUNNELD_LOG_FILE} 2>&1 &"'
+    # osascript "do shell script" 默认走 sh -c，无需 /bin/sh 包裹
+    # 用单引号包裹路径避免双引号嵌套解析错误
+    cmd_inner = f"'{pmd3}' remote tunneld >> '{TUNNELD_LOG_FILE}' 2>&1 &"
+    # AppleScript 字符串中需要把双引号转义为 \"
+    cmd_inner_escaped = cmd_inner.replace('"', '\\"')
     osa = (
-        f'do shell script "{cmd_str}" '
+        f'do shell script "{cmd_inner_escaped}" '
         f'with administrator privileges'
     )
     try:
