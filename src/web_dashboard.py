@@ -325,9 +325,12 @@ _HTML_PAGE = r"""<!doctype html>
     <div class="card" id="card-perf"><h2>真机功耗 (Battery / Power)</h2><div id="battery">—</div></div>
     <div class="card" id="card-system"><h2>系统指标 (System CPU / Mem)</h2><div id="system">—</div></div>
     <div class="card" id="card-process"><h2>进程指标 (Per-Process via DVT)</h2><div id="process">—</div></div>
-    <div class="card" id="card-hot"><h2>热点函数 (Sampling)</h2><div id="hotspots">—</div></div>
     <div class="card" id="card-gpu"><h2>GPU / 帧率 (DVT Graphics)</h2><div id="gpu">—</div></div>
     <div class="card" id="card-net"><h2>网络流 (DVT Network)</h2><div id="net">—</div></div>
+    <div class="card" id="card-hot" style="grid-column: 1 / -1;">
+      <h2>热点函数 (Sampling Profiler — 多 cycle 趋势聚合)</h2>
+      <div id="hotspots">—</div>
+    </div>
     <div class="card" id="card-tasks" style="grid-column: 1 / -1;"><h2>任务列表</h2><div id="tasks">—</div></div>
     <div class="card" id="card-alerts" style="grid-column: 1 / -1;"><h2>实时告警 (alerts.log)</h2><div id="alerts">—</div></div>
   </div>
@@ -479,12 +482,22 @@ function renderProcess(p) {
     </div>
     <div class="muted">最新: ${fmtTs(last.ts)} · pid=${last.pid} · 监控进程 ${Object.keys(byName).length} 个</div>
   `;
-  // 多进程时列表展示
+  // 多进程时列表展示 (按 CPU 降序，含定位按钮)
   if (Object.keys(byName).length > 1) {
     html += '<table style="margin-top:8px"><thead><tr><th>进程</th><th>PID</th><th>CPU</th><th>内存</th><th>线程</th></tr></thead><tbody>';
-    for (const name of Object.keys(byName).sort()) {
+    const sortedNames = Object.keys(byName).sort((a, b) => (byName[b].cpuUsage || 0) - (byName[a].cpuUsage || 0));
+    for (const name of sortedNames) {
       const r = byName[name];
-      html += `<tr><td>${escapeHtml(name)}</td><td>${r.pid}</td><td>${fmt(r.cpuUsage, 1)}%</td><td>${fmt(r.physFootprintMB, 0)}MB</td><td>${r.threadCount}</td></tr>`;
+      const cpu = r.cpuUsage || 0;
+      const cpuCls = cpu > 50 ? 'err' : (cpu > 20 ? 'warn' : '');
+      const memCls = (r.physFootprintMB || 0) > 500 ? 'warn' : '';
+      html += `<tr>
+        <td>${escapeHtml(name)} <a class="loc-btn" title="复制进程名" onclick="copyText('${escapeAttr(name)}', this); return false">📋</a></td>
+        <td>${r.pid}</td>
+        <td class="${cpuCls}">${fmt(cpu, 1)}%</td>
+        <td class="${memCls}">${fmt(r.physFootprintMB, 0)}MB</td>
+        <td>${r.threadCount}</td>
+      </tr>`;
     }
     html += '</tbody></table>';
   }
@@ -687,23 +700,70 @@ function renderHotspots(p) {
   const globalMax = Math.max(...ranked.map(r => r.peak));
 
   let html = `
-    <div class="muted" style="margin-bottom:6px">
-      聚合 ${cycleCount} 个 cycle (跨度 ${fmt(span/60, 1)} 分钟) · 按平均占比排序
+    <div class="row" style="margin-bottom:8px">
+      <div class="stat"><span class="v">${cycleCount}</span><span class="l">cycle 数</span></div>
+      <div class="stat"><span class="v">${fmt(span/60, 1)}min</span><span class="l">采集跨度</span></div>
+      <div class="stat"><span class="v">${ranked.length}</span><span class="l">展示函数</span></div>
+      <div class="stat"><span class="v">${Object.keys(funcMap).length}</span><span class="l">unique 函数</span></div>
+      <div class="stat"><span class="v">${fmt(globalMax, 1)}%</span><span class="l">最高峰值</span></div>
     </div>
+    <style>
+      #hotspots table { font-size: 12px; }
+      #hotspots td.func {
+        max-width: none; white-space: normal; word-break: break-word;
+        font-family: "SF Mono", Menlo, monospace; font-size: 11px;
+        line-height: 1.35; padding: 6px;
+      }
+      #hotspots td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      #hotspots tr:hover { background: #1e2230; }
+      .locators { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; }
+      .loc-btn {
+        display: inline-block; padding: 1px 5px;
+        background: #262a33; border-radius: 3px;
+        cursor: pointer; text-decoration: none; color: #e6e9ef;
+        font-size: 11px; line-height: 1.4;
+        transition: background 0.15s;
+      }
+      .loc-btn:hover { background: #4cc2ff; color: #0f1115; }
+    </style>
   `;
-  html += '<table><thead><tr><th style="width:40px">均%</th><th style="width:36px">峰</th><th>函数</th><th style="width:130px">趋势 (各 cycle)</th><th style="width:30px">趋</th></tr></thead><tbody>';
-  for (const f of ranked) {
-    // 趋势 sparkline: 各 cycle 占比变化
+  html += `<table>
+    <thead><tr>
+      <th style="width:60px">排名</th>
+      <th style="width:60px" class="num">均 %</th>
+      <th style="width:60px" class="num">峰 %</th>
+      <th style="width:80px" class="num">出现率</th>
+      <th>函数 (demangled)</th>
+      <th style="width:160px">各 cycle 趋势</th>
+      <th style="width:80px" class="num">变化</th>
+    </tr></thead>
+    <tbody>`;
+  for (let i = 0; i < ranked.length; i++) {
+    const f = ranked[i];
     const trendColor = f.trend > 1 ? '#f87171' : (f.trend < -1 ? '#4ade80' : '#4cc2ff');
-    const spark = sparkline(f.vals, {w: 120, h: 18, stroke: trendColor, min: 0, max: globalMax});
+    const spark = sparkline(f.vals, {w: 150, h: 22, stroke: trendColor, min: 0, max: globalMax});
     const trendIcon = f.trend > 1 ? '↑' : (f.trend < -1 ? '↓' : '→');
     const trendCls = f.trend > 1 ? 'err' : (f.trend < -1 ? 'ok' : 'muted');
+    const presentPct = (f.inCount / cycleCount * 100).toFixed(0);
+    // 简单分类: 业务 SDK / Apple 系统 / pthread/runtime
+    const sym = f.sym;
+    let badge = '';
+    if (/^realx::/.test(sym)) badge = '<span class="pill" style="background:#7c3aed">RealX SDK</span>';
+    else if (/^WebCore::|^WebKit::|^JSC::/.test(sym)) badge = '<span class="pill" style="background:#2563eb">WebKit</span>';
+    else if (/^CA::|^CG/.test(sym)) badge = '<span class="pill" style="background:#0891b2">CoreAnimation</span>';
+    else if (/^ausdk::|AudioUnit/.test(sym)) badge = '<span class="pill" style="background:#dc2626">Audio</span>';
+    else if (/^_pthread|^objc_|^_platform_|^mach_msg|^__/.test(sym)) badge = '<span class="pill" style="background:#525252">Runtime</span>';
+    else if (/^0x[0-9a-f]+/.test(sym)) badge = '<span class="pill" style="background:#ca8a04">Unsymbolicated</span>';
+    else badge = '<span class="pill" style="background:#16a34a">业务/其他</span>';
+
     html += `<tr>
-      <td><b>${fmt(f.avgAcrossAll, 1)}</b></td>
-      <td>${fmt(f.peak, 1)}</td>
-      <td style="font-family:Menlo,monospace;font-size:11px">${escapeHtml(f.sym)}<br><span class="muted" style="font-size:10px">出现 ${f.inCount}/${cycleCount} cyc · 在场均 ${fmt(f.avgWhenIn,1)}%</span></td>
+      <td>#${i + 1} ${badge}</td>
+      <td class="num"><b>${fmt(f.avgAcrossAll, 1)}</b></td>
+      <td class="num">${fmt(f.peak, 1)}</td>
+      <td class="num">${f.inCount}/${cycleCount}<br><span class="muted" style="font-size:10px">${presentPct}%</span></td>
+      <td class="func">${escapeHtml(f.sym)}${renderLocators(f.sym)}</td>
       <td>${spark}</td>
-      <td><span class="${trendCls}">${trendIcon} ${f.trend >= 0 ? '+' : ''}${fmt(f.trend, 1)}</span></td>
+      <td class="num"><span class="${trendCls}">${trendIcon} ${f.trend >= 0 ? '+' : ''}${fmt(f.trend, 1)}</span></td>
     </tr>`;
   }
   html += '</tbody></table>';
@@ -715,6 +775,83 @@ function renderAlerts(p) {
   const lines = p.alerts || [];
   if (!lines.length) return '<span class="muted">无告警</span>';
   return '<pre>' + escapeHtml(lines.slice(-30).join('\n')) + '</pre>';
+}
+
+// ── 代码定位工具 ──
+
+// 识别符号类型并返回最佳搜索 URL 集合
+function symbolLocators(sym) {
+  const links = [];
+  // 清理：去掉模板参数和函数签名后括号，方便搜索
+  const cleanSym = sym.replace(/\(.*$/, '').replace(/<.*>/g, '');
+  const enc = encodeURIComponent(cleanSym);
+  const encFull = encodeURIComponent(sym);
+
+  if (/^realx::|^Realx::|^RX[A-Z]/.test(sym)) {
+    // 第三方 SDK — GitHub 全局搜
+    links.push({ icon: '🔍', label: 'GitHub', url: `https://github.com/search?q=${enc}&type=code` });
+    links.push({ icon: '📚', label: 'CocoaPods', url: `https://cocoapods.org/?q=${encodeURIComponent('realx')}` });
+  } else if (/^WebCore::|^WebKit::|^JSC::|^bmalloc::/.test(sym)) {
+    // WebKit 开源
+    links.push({ icon: '🌐', label: 'WebKit GitHub', url: `https://github.com/WebKit/WebKit/search?q=${enc}` });
+    links.push({ icon: '📚', label: 'Apple Dev', url: `https://developer.apple.com/search/?q=${enc}` });
+  } else if (/^CA::|^CG[A-Z]|^CF[A-Z]|^NS[A-Z]|^UI[A-Z]/.test(sym)) {
+    // Apple 系统符号
+    links.push({ icon: '🍎', label: 'Apple Dev', url: `https://developer.apple.com/search/?q=${enc}` });
+    links.push({ icon: '🔍', label: 'Google', url: `https://www.google.com/search?q=${enc}+site:developer.apple.com` });
+  } else if (/^ausdk::|AudioUnit|CoreAudio/.test(sym)) {
+    links.push({ icon: '🍎', label: 'Audio Docs', url: `https://developer.apple.com/search/?q=${enc}` });
+  } else if (/^_pthread|^pthread_/.test(sym)) {
+    links.push({ icon: '📖', label: 'man', url: `https://www.man7.org/linux/man-pages/man3/${enc.replace('_pthread_', 'pthread_')}.3.html` });
+  } else if (/^objc_|^_objc_/.test(sym)) {
+    links.push({ icon: '🍎', label: 'objc4', url: `https://github.com/apple-oss-distributions/objc4/search?q=${enc}` });
+  } else if (/^mach_|^_mach_/.test(sym)) {
+    links.push({ icon: '🍎', label: 'XNU', url: `https://github.com/apple-oss-distributions/xnu/search?q=${enc}` });
+  } else if (/^0x[0-9a-fA-F]+/.test(sym)) {
+    // 未符号化的地址 — 提示需要 dSYM
+    links.push({ icon: '⚠️', label: '需 dSYM', url: '#' });
+  } else {
+    // 业务/未分类 — 多种搜索
+    links.push({ icon: '🔍', label: 'GitHub', url: `https://github.com/search?q=${enc}&type=code` });
+    links.push({ icon: '🌐', label: 'Google', url: `https://www.google.com/search?q=${encFull}` });
+  }
+  return links;
+}
+
+// 渲染函数名旁边的定位按钮组
+function renderLocators(sym) {
+  const links = symbolLocators(sym);
+  let html = ` <span class="locators">`;
+  // 复制按钮
+  html += `<a class="loc-btn" title="复制函数名" onclick="copyText('${escapeAttr(sym)}', this); return false">📋</a>`;
+  // 跳转按钮
+  for (const l of links) {
+    if (l.url === '#') {
+      html += `<span class="loc-btn" style="opacity:0.5" title="${l.label}">${l.icon}</span>`;
+    } else {
+      html += `<a class="loc-btn" target="_blank" rel="noopener" href="${l.url}" title="${l.label}: ${escapeAttr(sym)}">${l.icon}</a>`;
+    }
+  }
+  return html + '</span>';
+}
+
+function escapeAttr(s) {
+  return String(s).replace(/'/g, "\\'").replace(/"/g, '&quot;');
+}
+
+function copyText(text, el) {
+  navigator.clipboard.writeText(text).then(() => {
+    if (el) {
+      const orig = el.innerHTML;
+      el.innerHTML = '✓';
+      el.style.color = '#4ade80';
+      setTimeout(() => { el.innerHTML = orig; el.style.color = ''; }, 800);
+    }
+  }).catch(err => {
+    console.error('copy failed:', err);
+    // fallback: 弹 prompt
+    prompt('Ctrl+C 复制:', text);
+  });
 }
 
 // SVG sparkline — 极简折线图
