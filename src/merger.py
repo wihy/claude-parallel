@@ -198,27 +198,101 @@ class WorktreeMerger:
         """Merge all successful worktrees back to main in dependency order.
 
         Returns a MergeReport summarising the outcome.
+
+        Safety guarantees:
+        - 预飞行检查: 主分支必须干净，否则拒绝合并避免污染
+        - 保存 rollback 起点 (pre-merge HEAD) 到 coord_dir/merge-rollback.txt
+        - 任一任务异常后强制 cherry-pick --abort 并校验主仓库干净，否则中止后续合并
         """
         report = MergeReport()
 
         print("[merger] Starting merge of worktrees into main branch...")
 
+        # 预飞行: 校验主仓库工作区干净
+        dirty, dirty_msg = await self._check_main_clean()
+        if dirty:
+            report.errors["__preflight__"] = dirty_msg
+            print(f"  [merger] ABORT: 主仓库工作区不干净，拒绝开始合并以避免污染")
+            print(f"  [merger]   {dirty_msg}")
+            print(f"  [merger]   请先 commit/stash 后重试")
+            return report
+
+        # 记录 pre-merge HEAD 作为 rollback 起点
+        pre_head, _, _ = await self._git(
+            ["rev-parse", "HEAD"], cwd=self._main_repo, check=False
+        )
+        if pre_head:
+            await self._save_rollback_point(pre_head)
+            print(f"  [merger] 已记录 rollback 起点: {pre_head[:12]} → {self.coord_dir}/merge-rollback.txt")
+
         # Step 1: auto-commit any uncommitted worktree changes
         await self.auto_commit_worktrees()
 
         # Step 2: iterate through dependency levels
+        aborted = False
         for level_idx, level_tasks in enumerate(self._levels):
+            if aborted:
+                break
             print(f"\n[merger] --- Dependency level {level_idx} ({len(level_tasks)} tasks) ---")
 
             for task_id in level_tasks:
                 try:
-                    merged = await self._merge_one(task_id, report)
+                    await self._merge_one(task_id, report)
                 except Exception as exc:
                     report.errors[task_id] = str(exc)
                     print(f"  [merger] ERROR merging {task_id}: {exc}")
+                    # 异常后强制清理 cherry-pick 中间态
+                    await self._git(
+                        ["cherry-pick", "--abort"], cwd=self._main_repo, check=False
+                    )
+
+                # 每个任务后都验证主仓库依然干净；如不干净说明前次操作残留
+                dirty, dirty_msg = await self._check_main_clean()
+                if dirty:
+                    report.errors.setdefault(task_id, "")
+                    report.errors[task_id] += f" | 主仓库残留未清理: {dirty_msg}"
+                    print(f"  [merger] ABORT: {task_id} 后主仓库未恢复干净状态，停止后续合并")
+                    print(f"  [merger]   如需回滚，执行: git -C {self._main_repo} reset --hard {pre_head[:12] if pre_head else 'HEAD@{1}'}")
+                    aborted = True
+                    break
 
         print(f"\n{report.summary()}")
+        if pre_head and (report.errors or report.conflicts_unresolved):
+            print(f"\n  Rollback 命令: git -C {self._main_repo} reset --hard {pre_head[:12]}")
         return report
+
+    async def _check_main_clean(self) -> tuple[bool, str]:
+        """检查主仓库工作区是否干净。返回 (dirty?, 描述)"""
+        stdout, _, rc = await self._git(
+            ["status", "--porcelain"], cwd=self._main_repo, check=False
+        )
+        if rc != 0:
+            return True, "git status 失败"
+        if stdout.strip():
+            preview = stdout.strip().splitlines()[:3]
+            return True, "未提交变更: " + " | ".join(preview)
+        # 检查 cherry-pick / merge / rebase 中间态
+        git_dir = self._main_repo / ".git"
+        for marker in ("CHERRY_PICK_HEAD", "MERGE_HEAD", "REBASE_HEAD"):
+            if (git_dir / marker).exists():
+                return True, f"git 中间态文件存在: {marker}"
+        return False, ""
+
+    async def _save_rollback_point(self, commit_hash: str) -> None:
+        """保存 pre-merge HEAD 到协调目录，便于事故回滚"""
+        try:
+            import time as _time
+            from .fs_utils import atomic_write_text
+            rb_file = self.coord_dir / "merge-rollback.txt"
+            text = (
+                f"# Pre-merge HEAD (saved by WorktreeMerger)\n"
+                f"# 回滚命令: git -C {self._main_repo} reset --hard {commit_hash}\n"
+                f"timestamp={int(_time.time())}\n"
+                f"commit={commit_hash}\n"
+            )
+            atomic_write_text(rb_file, text)
+        except Exception as exc:
+            print(f"  [merger] 警告: 保存 rollback 点失败: {exc}")
 
     async def _merge_one(self, task_id: str, report: MergeReport) -> bool:
         """Merge a single worktree's HEAD commit into the main branch.

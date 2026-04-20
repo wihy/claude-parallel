@@ -186,41 +186,76 @@ class Worker:
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _drain_stderr(self):
-        """持续读取 stderr 流，实时写入日志文件"""
+        """持续读取 stderr 流，实时写入日志文件。
+
+        使用单一持久 file handle 避免每行都 open/close（FD 抖动）。
+        异常不再静默吞掉：CancelledError 上抛，其他异常落日志。
+        """
         if not self.process or not self.process.stderr:
             return
         try:
-            while True:
-                line = await self.process.stderr.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    self._stderr_lines.append(text)
-                    # 实时写入日志
-                    with open(self.logger.log_file, "a", encoding="utf-8") as f:
+            # buffering=1 = 行缓冲；保证 tail -f 可见
+            with open(self.logger.log_file, "a", encoding="utf-8", buffering=1) as f:
+                while True:
+                    line = await self.process.stderr.readline()
+                    if not line:
+                        break
+                    text = line.decode("utf-8", errors="replace").rstrip()
+                    if text:
+                        self._stderr_lines.append(text)
                         f.write(f"  [stderr] {text}\n")
-        except Exception:
-            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # 不能再吞掉异常 — 至少留下痕迹
+            try:
+                self.logger.warning(f"_drain_stderr 异常 ({type(e).__name__}): {e}")
+            except Exception:
+                pass
+
+    # stdout 上限 — 防止子进程日志爆炸导致 OOM
+    MAX_STDOUT_BYTES = 50 * 1024 * 1024  # 50 MB
 
     async def wait(self, timeout: float = 600) -> WorkerResult:
         """等待 Worker 完成，返回结果"""
         if not self.process:
             raise RuntimeError(f"Worker {self.task.id} 未启动")
 
+        stdout_chunks: list[bytes] = []
+        bytes_read = 0
+        truncated = False
+
+        async def _read_stdout():
+            nonlocal bytes_read, truncated
+            while True:
+                chunk = await self.process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if bytes_read > self.MAX_STDOUT_BYTES:
+                    if not truncated:
+                        truncated = True
+                        self.logger.warning(
+                            f"stdout 超过 {self.MAX_STDOUT_BYTES // (1024*1024)}MB，已截断"
+                        )
+                    # 继续 drain 避免子进程因管道写满阻塞
+                    continue
+                stdout_chunks.append(chunk)
+
         try:
             # 只读 stdout; stderr 由 _drain_stderr 负责读取
             # 不能用 communicate()，因为它会同时读 stderr 造成冲突
-            stdout = await asyncio.wait_for(
-                self.process.stdout.read(),
-                timeout=timeout,
-            )
+            await asyncio.wait_for(_read_stdout(), timeout=timeout)
             # 等待进程退出
             await asyncio.wait_for(self.process.wait(), timeout=10)
         except asyncio.TimeoutError:
             await self._kill()
             if hasattr(self, "_stderr_task"):
                 self._stderr_task.cancel()
+                try:
+                    await self._stderr_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             self.logger.error(f"超时 ({timeout}s)")
             self.result = WorkerResult(
                 task_id=self.task.id,
@@ -232,15 +267,25 @@ class Worker:
             self._write_status_file("TIMEOUT")
             return self.result
 
-        # 等待 stderr drain 完成
+        # 等待 stderr drain 完成 — 子进程已退出，drain 应快速 EOF
+        # 给较大的兜底超时 (30s)，避免极端情况下永久阻塞
         if hasattr(self, "_stderr_task"):
             try:
-                await asyncio.wait_for(self._stderr_task, timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(self._stderr_task, timeout=30)
+            except asyncio.TimeoutError:
+                self.logger.warning("stderr drain 30s 内未完成，强制取消")
+                self._stderr_task.cancel()
+                try:
+                    await self._stderr_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except asyncio.CancelledError:
                 pass
 
         duration = time.time() - self.start_time
 
+        # 拼接 stdout (可能被截断)
+        stdout = b"".join(stdout_chunks)
         # 解析 JSON 输出
         stdout_text = stdout.decode("utf-8", errors="replace").strip()
         stderr_text = "\n".join(self._stderr_lines)

@@ -23,6 +23,7 @@ from src.orchestrator import Orchestrator
 from src.validator import TaskValidator
 from src.perf import PerfConfig, PerfSessionManager
 from src.perf.perf_defaults import PerfDefaults
+from src.fs_utils import safe_read_json
 
 VERSION = "0.3.0"
 
@@ -138,7 +139,8 @@ async def cmd_run(args):
         )
         if not validator.validate():
             validator.print_report()
-            return
+            print(f"\n  ✗ 配置校验失败，请修复后重试 (跳过校验请加 --no-validate)")
+            sys.exit(1)
         validator.print_report()
 
     orch = Orchestrator(
@@ -252,33 +254,34 @@ async def cmd_merge(args):
     orch = Orchestrator(task_file=args.task_file)
     orch.load()
 
-    # 加载已有结果
+    # 加载已有结果（safe_read_json 可吃掉并发半写产生的损坏文件）
     from src.worker import WorkerResult
     coord_dir = orch.coord_dir
     for task in orch.tasks:
         result_file = coord_dir / "coord" / f"{task.id}.result"
-        if result_file.exists():
-            try:
-                data = json.loads(result_file.read_text())
-                orch.results[task.id] = WorkerResult(
-                    task_id=data["task_id"],
-                    success=data["success"],
-                    cost_usd=data.get("cost_usd", 0),
-                    duration_s=data.get("duration_s", 0),
-                    num_turns=data.get("num_turns", 0),
-                    model_used=data.get("model_used", ""),
-                    worktree_path=data.get("worktree_path", ""),
-                    output=data.get("output_summary", ""),
-                    error=data.get("error", ""),
-                )
-                if data["success"]:
-                    task.status = "done"
-                elif data.get("status") == "cancelled":
-                    task.status = "cancelled"
-                else:
-                    task.status = "failed"
-            except (json.JSONDecodeError, KeyError):
-                pass
+        data = safe_read_json(result_file, None)
+        if not data or "task_id" not in data:
+            continue
+        try:
+            orch.results[task.id] = WorkerResult(
+                task_id=data["task_id"],
+                success=data["success"],
+                cost_usd=data.get("cost_usd", 0),
+                duration_s=data.get("duration_s", 0),
+                num_turns=data.get("num_turns", 0),
+                model_used=data.get("model_used", ""),
+                worktree_path=data.get("worktree_path", ""),
+                output=data.get("output_summary", ""),
+                error=data.get("error", ""),
+            )
+            if data["success"]:
+                task.status = "done"
+            elif data.get("status") == "cancelled":
+                task.status = "cancelled"
+            else:
+                task.status = "failed"
+        except KeyError:
+            continue
 
     await cmd_merge_impl(args, orch)
 
@@ -288,21 +291,22 @@ async def cmd_diff(args):
     orch = Orchestrator(task_file=args.task_file)
     orch.load()
 
-    # 加载已有结果
+    # 加载已有结果（safe_read_json 防并发半写）
     from src.worker import WorkerResult
     coord_dir = orch.coord_dir
     for task in orch.tasks:
         result_file = coord_dir / "coord" / f"{task.id}.result"
-        if result_file.exists():
-            try:
-                data = json.loads(result_file.read_text())
-                orch.results[task.id] = WorkerResult(
-                    task_id=data["task_id"],
-                    success=data["success"],
-                    worktree_path=data.get("worktree_path", ""),
-                )
-            except (json.JSONDecodeError, KeyError):
-                pass
+        data = safe_read_json(result_file, None)
+        if not data or "task_id" not in data:
+            continue
+        try:
+            orch.results[task.id] = WorkerResult(
+                task_id=data["task_id"],
+                success=data["success"],
+                worktree_path=data.get("worktree_path", ""),
+            )
+        except KeyError:
+            continue
 
     from src.merger import WorktreeMerger
     merger = WorktreeMerger(
@@ -320,28 +324,29 @@ async def cmd_review(args):
     orch = Orchestrator(task_file=args.task_file)
     orch.load()
 
-    # 加载已有结果
+    # 加载已有结果（safe_read_json 防并发半写）
     from src.worker import WorkerResult
     coord_dir = orch.coord_dir
     for task in orch.tasks:
         result_file = coord_dir / "coord" / f"{task.id}.result"
-        if result_file.exists():
-            try:
-                data = json.loads(result_file.read_text())
-                orch.results[task.id] = WorkerResult(
-                    task_id=data["task_id"],
-                    success=data["success"],
-                    worktree_path=data.get("worktree_path", ""),
-                    output=data.get("output_summary", ""),
-                )
-                if data["success"]:
-                    task.status = "done"
-                elif data.get("status") == "cancelled":
-                    task.status = "cancelled"
-                else:
-                    task.status = "failed"
-            except (json.JSONDecodeError, KeyError):
-                pass
+        data = safe_read_json(result_file, None)
+        if not data or "task_id" not in data:
+            continue
+        try:
+            orch.results[task.id] = WorkerResult(
+                task_id=data["task_id"],
+                success=data["success"],
+                worktree_path=data.get("worktree_path", ""),
+                output=data.get("output_summary", ""),
+            )
+            if data["success"]:
+                task.status = "done"
+            elif data.get("status") == "cancelled":
+                task.status = "cancelled"
+            else:
+                task.status = "failed"
+        except KeyError:
+            continue
 
     from src.reviewer import CodeReviewer
     reviewer = CodeReviewer(
@@ -430,6 +435,16 @@ async def cmd_clean(args):
 
         print(f"  轮转完成: 清理 {removed} 个过期文件/目录 (保留近 {keep_days} 天 / results 保留 {keep_last} 份)")
         return
+
+    # 占用检查: 拒绝清理正在被其他 cpar 实例使用的协调目录
+    from src.fs_utils import list_active_locks
+    locks_dir = coord_root / ".locks"
+    active = list_active_locks(locks_dir, exclude_self=True)
+    if active and not getattr(args, "force", False):
+        print(f"  [clean] 拒绝清理: 检测到 {len(active)} 个其他 cpar 实例正在运行 (PID: {active})")
+        print(f"  [clean] 锁目录: {locks_dir}")
+        print(f"  [clean] 如确认无冲突，加 --force 绕过检查")
+        sys.exit(2)
 
     def _delete_cp_branch(name: str):
         """删除 cp-* 分支；失败（分支不存在或被占用）静默跳过"""
@@ -1686,6 +1701,10 @@ def main():
     clean_parser.add_argument(
         "--keep-last", type=int, default=20,
         help="results/ 目录最多保留最近 N 份报告 (配合 --prune-logs, 默认 20)",
+    )
+    clean_parser.add_argument(
+        "--force", action="store_true",
+        help="跳过其他活动 cpar 实例的占用检查 (危险)",
     )
 
     # ── logs ──

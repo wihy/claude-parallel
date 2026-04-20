@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .fs_utils import atomic_write_json, atomic_write_text, safe_read_json
+from .fs_utils import (
+    atomic_write_json, atomic_write_text, safe_read_json,
+    acquire_pid_lock, release_pid_lock, list_active_locks,
+)
 from .task_parser import (
     Task, ProjectConfig, parse_task_file,
     topological_levels, get_task_map,
@@ -219,6 +222,9 @@ class Orchestrator:
 
         signal.signal(signal.SIGINT, _sigint_handler)
 
+        # 注册 PID 锁，让 cleanup 类操作能识别本实例正在使用
+        lock_file = acquire_pid_lock(self.coord_dir / ".locks")
+
         try:
             # 启动监控面板
             self.monitor = Monitor(self)
@@ -258,6 +264,8 @@ class Orchestrator:
                 self.monitor.stop()
             if self.perf_integrator:
                 self.perf_report = self.perf_integrator.on_run_end()
+            # 释放 PID 锁
+            release_pid_lock(lock_file)
 
         # 汇总报告
         report = self._generate_report()
@@ -289,14 +297,25 @@ class Orchestrator:
                 # 封禁防护: 调用速率检查
                 await self._rate_limit_check()
 
-                # 检查上游是否全部成功
-                deps_ok = all(
-                    self.results.get(dep_id) and self.results[dep_id].success
-                    for dep_id in task.depends_on
-                )
-                if not deps_ok and task.depends_on:
-                    self._cancel_task(task, "上游依赖任务失败")
-                    return
+                # 检查上游是否全部成功；区分 cancelled 与 failed 给出更准确的原因
+                if task.depends_on:
+                    bad_deps = []
+                    for dep_id in task.depends_on:
+                        dep_res = self.results.get(dep_id)
+                        if not dep_res or not dep_res.success:
+                            dep_task = self.task_map.get(dep_id)
+                            dep_status = (dep_task.status if dep_task else "unknown")
+                            bad_deps.append(f"{dep_id}({dep_status})")
+                    if bad_deps:
+                        # 任一上游为 cancelled → 当前任务也属于级联取消，而非"失败"
+                        cascade_cancelled = any(
+                            self.task_map.get(dep_id)
+                            and self.task_map[dep_id].status == "cancelled"
+                            for dep_id in task.depends_on
+                        )
+                        prefix = "上游级联取消" if cascade_cancelled else "上游依赖任务失败"
+                        self._cancel_task(task, f"{prefix}: {', '.join(bad_deps)}")
+                        return
 
                 # 检查预算
                 if self._budget_exceeded():
@@ -480,6 +499,9 @@ class Orchestrator:
         original_sigint = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, lambda s, f: setattr(self, '_cancelled', True))
 
+        # PID 锁: resume 期间也持有，防止并发 cleanup
+        lock_file = acquire_pid_lock(self.coord_dir / ".locks")
+
         try:
             self.monitor = Monitor(self)
             self.monitor.start()
@@ -511,6 +533,7 @@ class Orchestrator:
                 self.monitor.stop()
             if self.perf_integrator:
                 self.perf_report = self.perf_integrator.on_run_end()
+            release_pid_lock(lock_file)
 
         self.stats.end_time = time.time()
         self.stats.total_duration_s = self.stats.end_time - self.stats.start_time
@@ -738,9 +761,20 @@ class Orchestrator:
 
         return len(merged) == len(successful)
 
-    async def cleanup_worktrees(self):
-        """清理所有 worktree"""
+    async def cleanup_worktrees(self, force: bool = False):
+        """清理所有 worktree。
+
+        默认会检查 coord_dir/.locks/ 下是否有其他活动 cpar 实例；存在则拒绝清理。
+        force=True 可绕过检查（仅在确认无人使用时使用）。
+        """
         if not self.config:
+            return
+
+        # 占用检查: 防止并行实例的 worktree 被误删
+        active = list_active_locks(self.coord_dir / ".locks", exclude_self=True)
+        if active and not force:
+            print(f"  [cleanup] 拒绝清理: 检测到 {len(active)} 个其他 cpar 实例正在运行 (PID: {active})")
+            print(f"  [cleanup] 如确认无冲突，使用 force=True 绕过检查")
             return
 
         for task_id in self.task_map:

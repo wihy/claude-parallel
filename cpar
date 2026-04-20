@@ -13,7 +13,10 @@
 #   cpar resume <yaml>     恢复执行
 #   cpar clean <repo>      清理 worktree
 #   cpar logs <repo>       查看日志
-#   cpar perf ...          真机性能采集 (start/stop/tail/report/devices)
+#   cpar perf ...          真机性能采集 (start/stop/tail/report/devices/config/
+#                          live/rules/stream/snapshot/webcontent/dashboard/metrics/
+#                          battery/hotspots/callstack/templates/symbolicate/
+#                          time-sync/deep-export/power-attr/ai-diag)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -77,7 +80,12 @@ case "${1:-help}" in
         echo "  resume <yaml>     从中断处恢复"
         echo "  clean <repo>      清理 worktree 和协调文件"
         echo "  logs <repo>       查看任务日志 (-t TASK -n N)"
-        echo "  perf <subcmd>     真机性能采集/分析 (start/stop/tail/report/devices/live/rules/stream/snapshot/callstack/templates)"
+        echo "  perf <subcmd>     真机性能采集/分析"
+        echo "                    采集: start/stop/tail/report/devices/config"
+        echo "                    实时: live/rules/stream/snapshot/metrics/battery"
+        echo "                    深入: webcontent/dashboard/hotspots/callstack/templates"
+        echo "                    高级: symbolicate/time-sync/deep-export/power-attr/ai-diag"
+        echo "                    完整列表: cpar perf --help"
         echo ""
         echo "示例:"
         echo "  cpar chat                                     # 交互式对话"
