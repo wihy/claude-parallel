@@ -718,6 +718,115 @@ async def cmd_perf_stop(args):
     meta = perf.stop()
     print(json.dumps(meta, ensure_ascii=False, indent=2))
 
+    # 询问/执行清理
+    session_dir = Path(repo) / ".claude-parallel" / "perf" / tag
+    _maybe_clean_session(
+        session_dir,
+        force_clean=getattr(args, "clean", False),
+        force_keep=getattr(args, "no_clean", False),
+        keep_report=getattr(args, "keep_report", False),
+    )
+
+
+def _format_size(bytes_val: int) -> str:
+    """字节数转人类可读"""
+    for unit in ("B", "KB", "MB", "GB"):
+        if bytes_val < 1024:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f} TB"
+
+
+def _dir_size(path: Path) -> int:
+    """递归计算目录字节数"""
+    if not path.exists():
+        return 0
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _maybe_clean_session(
+    session_dir: Path,
+    force_clean: bool = False,
+    force_keep: bool = False,
+    keep_report: bool = False,
+) -> None:
+    """停止/结束分析后询问清理。
+
+    force_clean: --clean → 直接清，不问
+    force_keep:  --no-clean → 直接保留，不问
+    其它情况：交互式询问 (非 TTY 默认保留以防误删)
+    keep_report: 清理时保留 report.html/report.json，只删 logs/traces
+    """
+    import shutil
+    if not session_dir.exists():
+        return
+
+    size = _dir_size(session_dir)
+    size_human = _format_size(size)
+
+    # 决定是否清理
+    do_clean = False
+    if force_clean and force_keep:
+        print(f"\n  [clean] --clean 与 --no-clean 同时指定，按保留处理")
+        do_clean = False
+    elif force_clean:
+        do_clean = True
+    elif force_keep:
+        do_clean = False
+    else:
+        # 交互模式
+        if not sys.stdin.isatty():
+            print(f"\n  [clean] 非交互环境，默认保留 session 数据 ({size_human})")
+            print(f"  [clean] 路径: {session_dir}")
+            print(f"  [clean] 如需清理请加 --clean")
+            return
+        print(f"\n  ┌──────────────────────────────────────────")
+        print(f"  │  本次会话占用: {size_human}")
+        print(f"  │  路径: {session_dir}")
+        print(f"  └──────────────────────────────────────────")
+        try:
+            ans = input(
+                "  ▸ 是否清理本次采集数据? [y]es / [N]o / [r] 仅清理 logs+traces 保留 report: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  [clean] 已取消，保留数据")
+            return
+        if ans in ("y", "yes"):
+            do_clean = True
+            keep_report = False
+        elif ans in ("r", "report"):
+            do_clean = True
+            keep_report = True
+        else:
+            print(f"  [clean] 保留: {session_dir}")
+            return
+
+    # 执行清理
+    if not do_clean:
+        return
+    if keep_report:
+        # 只清 logs/ + traces/ + exports/，保留 report.html/.json + meta.json
+        removed = 0
+        for sub in ("logs", "traces", "exports"):
+            sub_dir = session_dir / sub
+            if sub_dir.exists():
+                shutil.rmtree(sub_dir, ignore_errors=True)
+                removed += 1
+        new_size = _dir_size(session_dir)
+        freed = size - new_size
+        print(f"  ✓ 已清理 {removed} 个子目录 (logs/traces/exports)，释放 {_format_size(freed)}")
+        print(f"  ✓ 保留: report.html / report.json / meta.json (共 {_format_size(new_size)})")
+    else:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        print(f"  ✓ 已清理 session: {session_dir}  (释放 {size_human})")
+
 
 async def cmd_perf_tail(args):
     repo, tag, _ = _resolve_perf_repo_tag(args)
@@ -780,6 +889,14 @@ async def cmd_perf_report(args):
 
         html_path = generate_html_report(rep, meta, session_dir, output_path=out_path)
         print(f"  HTML report: {html_path}")
+
+    # 报告生成完成，询问是否清理
+    _maybe_clean_session(
+        perf.root,
+        force_clean=getattr(args, "clean", False),
+        force_keep=getattr(args, "no_clean", False),
+        keep_report=getattr(args, "keep_report", True),  # report 命令默认保留 report 文件
+    )
 
 
 async def cmd_perf_devices(args):
@@ -1863,6 +1980,12 @@ def main():
     perf_stop = perf_sub.add_parser("stop", help="停止 perf 采集")
     perf_stop.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
     perf_stop.add_argument("--tag", default="perf", help="会话标签")
+    perf_stop.add_argument("--clean", action="store_true",
+                           help="停止后直接清理本次 session 数据 (跳过询问)")
+    perf_stop.add_argument("--no-clean", action="store_true",
+                           help="停止后不清理 (跳过询问，保留数据)")
+    perf_stop.add_argument("--keep-report", action="store_true",
+                           help="清理时保留 report.html / report.json (清理 logs/traces)")
 
     perf_tail = perf_sub.add_parser("tail", help="查看实时 syslog")
     perf_tail.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
@@ -1879,6 +2002,12 @@ def main():
     perf_report.add_argument("--json", action="store_true", help="JSON 格式输出")
     perf_report.add_argument("--html", action="store_true", help="生成自包含 HTML 报告 (chart.js)")
     perf_report.add_argument("--html-output", default="", help="HTML 输出路径 (默认 <session>/report.html)")
+    perf_report.add_argument("--clean", action="store_true",
+                             help="生成报告后清理 logs/traces (默认会询问)")
+    perf_report.add_argument("--no-clean", action="store_true",
+                             help="生成报告后不询问清理")
+    perf_report.add_argument("--keep-report", action="store_true", default=True,
+                             help="清理时保留 report.html/json (默认 True)")
 
     perf_devices = perf_sub.add_parser("devices", help="列出 xctrace 设备")
 
