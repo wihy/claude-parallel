@@ -88,7 +88,7 @@ case "${1:-help}" in
         echo "  dashboard         启动 Web Dashboard 浏览器仪表盘 (替代终端面板)"
         echo "                    选项: --repo PATH --tag TAG --port 8765 --host 127.0.0.1 --no-open"
         echo "  perf <subcmd>     真机性能采集/分析"
-        echo "                    采集: start/stop/tail/report/devices/config"
+        echo "                    采集: start/stop/tail/report/devices/config/tunneld"
         echo "                    实时: live/rules/stream/snapshot/metrics/battery"
         echo "                    深入: webcontent/dashboard/hotspots/callstack/templates"
         echo "                    高级: symbolicate/time-sync/deep-export/power-attr/ai-diag"

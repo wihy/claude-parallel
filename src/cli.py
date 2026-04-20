@@ -681,6 +681,10 @@ async def cmd_perf_start(args):
     repo, tag, defaults = _resolve_perf_repo_tag(args)
     if not repo:
         return
+
+    # iOS 17+ DVT 通道需要 tunneld；自动检测/启动
+    _ensure_tunneld_for_perf(args)
+
     attach = defaults.resolve("attach", getattr(args, "attach", None), "")
     cfg = PerfConfig(
         enabled=True,
@@ -897,6 +901,243 @@ async def cmd_perf_report(args):
         force_keep=getattr(args, "no_clean", False),
         keep_report=getattr(args, "keep_report", True),  # report 命令默认保留 report 文件
     )
+
+
+# ── tunneld 守护 (iOS 17+ DVT 必需) ──────────────────────────────
+
+TUNNELD_PID_FILE = Path.home() / ".cpar-tunneld.pid"
+TUNNELD_LOG_FILE = Path.home() / ".cpar-tunneld.log"
+
+
+def _tunneld_running() -> tuple[bool, int, bool]:
+    """检查 tunneld 状态。
+
+    返回 (process_alive, pid, devices_visible)
+      process_alive: pgrep 找到 tunneld 进程
+      devices_visible: 通过 API 真的能列出设备（即 tunneld 服务正常）
+    """
+    import subprocess
+    pid = 0
+    alive = False
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "pymobiledevice3 remote tunneld"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode == 0:
+            pids = [int(p) for p in out.stdout.split() if p.isdigit()]
+            # 取最年轻的 (sudo wrapper 通常较老)
+            pid = pids[-1] if pids else 0
+            alive = pid > 0
+    except Exception:
+        pass
+
+    if not alive:
+        return False, 0, False
+
+    # API 验证: 真的能从 tunneld 拿到设备
+    visible = False
+    try:
+        import asyncio as _a
+        async def _check():
+            try:
+                from pymobiledevice3.tunneld.api import get_tunneld_devices, TUNNELD_DEFAULT_ADDRESS
+                devs = await _a.wait_for(
+                    get_tunneld_devices(TUNNELD_DEFAULT_ADDRESS), timeout=2.0
+                )
+                return len(devs) > 0
+            except Exception:
+                return False
+        visible = _a.run(_check())
+    except Exception:
+        visible = False
+    return alive, pid, visible
+
+
+def _tunneld_start(prompt_password: bool = True) -> tuple[bool, str]:
+    """启动 tunneld 守护进程。
+
+    macOS 优先用 osascript 弹原生密码框，避免依赖 TTY。
+    把 sudo 子进程的 PID 记录到 ~/.cpar-tunneld.pid。
+    """
+    import subprocess
+    import shutil
+
+    pmd3 = shutil.which("pymobiledevice3")
+    if not pmd3:
+        return False, "pymobiledevice3 未安装 (pip install pymobiledevice3)"
+
+    # 1) 先试 sudo -n (无密码缓存或 sudoers NOPASSWD)
+    try:
+        proc = subprocess.Popen(
+            ["sudo", "-n", pmd3, "remote", "tunneld"],
+            stdout=open(TUNNELD_LOG_FILE, "a"),
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # 给它 2s 看是否能启动，未失败即 OK
+        time.sleep(2)
+        if proc.poll() is None:
+            TUNNELD_PID_FILE.write_text(str(proc.pid))
+            return True, f"已启动 (sudo 缓存有效) PID={proc.pid}"
+        # 立即退出说明 sudo 要密码，下沉到 osascript
+    except Exception:
+        pass
+
+    if not prompt_password:
+        return False, "sudo 需密码且 --no-prompt 已禁用密码框"
+
+    # 2) 用 osascript 弹密码框（macOS 原生）
+    if sys.platform != "darwin":
+        return False, "非 macOS 系统不支持 osascript 弹密码框"
+
+    cmd_str = f'/bin/sh -c "{pmd3} remote tunneld >> {TUNNELD_LOG_FILE} 2>&1 &"'
+    osa = (
+        f'do shell script "{cmd_str}" '
+        f'with administrator privileges'
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", osa],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "用户长时间未输入密码 (osascript 超时)"
+    except Exception as e:
+        return False, f"osascript 调用失败: {e}"
+
+    if result.returncode != 0:
+        return False, f"osascript 失败: {result.stderr.strip()[:200]}"
+
+    # 等 3 秒让 tunneld 起来
+    time.sleep(3)
+    alive, pid, visible = _tunneld_running()
+    if alive:
+        TUNNELD_PID_FILE.write_text(str(pid))
+        return True, f"已启动 (osascript) PID={pid}, 可见设备={visible}"
+    return False, "osascript 返回成功但 tunneld 进程未检测到"
+
+
+def _tunneld_stop() -> tuple[bool, str]:
+    """停止 tunneld。需要 sudo 权限。"""
+    import subprocess
+    alive, pid, _ = _tunneld_running()
+    if not alive:
+        TUNNELD_PID_FILE.unlink(missing_ok=True)
+        return True, "tunneld 未运行"
+    # tunneld 是 root 进程，需要 sudo kill
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "pkill", "-f", "pymobiledevice3 remote tunneld"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            TUNNELD_PID_FILE.unlink(missing_ok=True)
+            return True, "已停止"
+    except Exception:
+        pass
+
+    # 降级 osascript
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'do shell script "pkill -f \'pymobiledevice3 remote tunneld\'" '
+                 'with administrator privileges'],
+                capture_output=True, timeout=60,
+            )
+            time.sleep(1)
+            alive2, _, _ = _tunneld_running()
+            if not alive2:
+                TUNNELD_PID_FILE.unlink(missing_ok=True)
+                return True, "已停止 (osascript)"
+        except Exception as e:
+            return False, f"osascript stop 失败: {e}"
+    return False, f"无法停止 PID={pid}"
+
+
+def cmd_perf_tunneld(args):
+    """管理 tunneld。"""
+    action = getattr(args, "action", "status") or "status"
+
+    if action == "status":
+        alive, pid, visible = _tunneld_running()
+        if alive:
+            print(f"  ✓ tunneld 运行中 PID={pid}")
+            print(f"  ✓ 设备可见: {visible}")
+            print(f"    日志: {TUNNELD_LOG_FILE}")
+        else:
+            print("  ✗ tunneld 未运行")
+            print(f"    启动: cpar perf tunneld start")
+        return
+
+    if action == "ensure":
+        alive, pid, visible = _tunneld_running()
+        if alive and visible:
+            print(f"  ✓ tunneld 已运行且设备可见 (PID={pid})")
+            return
+        if alive and not visible:
+            print(f"  ⚠ tunneld 进程在但未发现设备，重启...")
+            _tunneld_stop()
+        # 落到 start 流程
+        action = "start"
+
+    if action == "start":
+        alive, pid, _ = _tunneld_running()
+        if alive:
+            print(f"  · tunneld 已运行 PID={pid}，跳过启动")
+            return
+        prompt = not getattr(args, "no_prompt", False)
+        print("  ▶ 正在启动 tunneld..." + (" (将弹出密码框)" if prompt else " (sudo 缓存)"))
+        ok, msg = _tunneld_start(prompt_password=prompt)
+        prefix = "  ✓" if ok else "  ✗"
+        print(f"{prefix} {msg}")
+        if ok:
+            # 验证设备可见
+            time.sleep(1)
+            _, _, visible = _tunneld_running()
+            print(f"    设备可见: {visible}")
+        else:
+            sys.exit(1)
+        return
+
+    if action == "stop":
+        ok, msg = _tunneld_stop()
+        print(("  ✓ " if ok else "  ✗ ") + msg)
+        if not ok:
+            sys.exit(1)
+        return
+
+
+def _ensure_tunneld_for_perf(args):
+    """perf start 前自动确保 tunneld 可用 (iOS 17+ DVT 通道需要)。
+
+    如果用户加 --no-tunneld 跳过；否则:
+      已运行 → 跳过
+      未运行 → 弹密码框启动 (osascript)
+      启动失败 → 仅警告，不阻止 (battery + sampling 仍可工作)
+    """
+    if getattr(args, "no_tunneld", False):
+        return
+    alive, pid, visible = _tunneld_running()
+    if alive and visible:
+        print(f"  ✓ tunneld 已运行 PID={pid} (DVT 通道就绪)")
+        return
+    if alive and not visible:
+        print(f"  ⚠ tunneld 进程在但未发现设备，重启...")
+        _tunneld_stop()
+        time.sleep(1)
+    print("  ▶ tunneld 未运行 (iOS 17+ DVT 必需)，自动启动...")
+    print("    📱 macOS 将弹出系统密码框，请输入登录密码")
+    ok, msg = _tunneld_start(prompt_password=True)
+    if ok:
+        print(f"  ✓ tunneld {msg}")
+    else:
+        print(f"  ⚠ tunneld 启动失败: {msg}")
+        print(f"  ⚠ DVT 通道 (GPU/Network/Process 进程指标) 不可用")
+        print(f"  → battery + sampling 热点 仍会正常采集")
+        print(f"  → 手动启动: cpar perf tunneld start")
 
 
 async def cmd_perf_devices(args):
@@ -1976,6 +2217,8 @@ def main():
         "--composite", default="auto",
         help="Composite 模式: auto|full|webperf|power_cpu|gpu_full|memory|power+time+network|\"\"",
     )
+    perf_start.add_argument("--no-tunneld", action="store_true",
+                            help="跳过自动启动 tunneld (iOS 17+ DVT 通道将不可用)")
 
     perf_stop = perf_sub.add_parser("stop", help="停止 perf 采集")
     perf_stop.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
@@ -2010,6 +2253,21 @@ def main():
                              help="清理时保留 report.html/json (默认 True)")
 
     perf_devices = perf_sub.add_parser("devices", help="列出 xctrace 设备")
+
+    # ── perf tunneld (iOS 17+ DVT 通道守护) ──
+    perf_tunneld = perf_sub.add_parser(
+        "tunneld",
+        help="管理 pymobiledevice3 RemoteXPC tunneld (iOS 17+ DVT 必需，需 sudo)",
+    )
+    perf_tunneld.add_argument(
+        "action", nargs="?", default="status",
+        choices=["start", "stop", "status", "ensure"],
+        help="status=查看 / start=启动 / stop=停止 / ensure=不存在则启动 (默认 status)",
+    )
+    perf_tunneld.add_argument(
+        "--no-prompt", action="store_true",
+        help="不弹 osascript 密码框 (start 时若无 sudo 缓存则失败)",
+    )
 
     # ── perf config (默认配置管理) ──
     perf_config = perf_sub.add_parser("config", help="查看/修改 perf 默认配置")
@@ -2191,6 +2449,8 @@ def main():
             asyncio.run(cmd_perf_tail(args))
         elif args.perf_cmd == "report":
             asyncio.run(cmd_perf_report(args))
+        elif args.perf_cmd == "tunneld":
+            cmd_perf_tunneld(args)
         elif args.perf_cmd == "devices":
             asyncio.run(cmd_perf_devices(args))
         elif args.perf_cmd == "config":
