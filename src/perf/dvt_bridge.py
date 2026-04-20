@@ -177,6 +177,8 @@ class DvtBridgeSession(ReconnectableMixin):
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._snapshot_count = 0
+        # 缓存 ProcessesAttributes — sysmontap 在系统 row 中宣告，进程 row 中使用
+        self._proc_attrs_cache: list = []
         self._error_count = 0
         self._start_ts: float = 0
 
@@ -254,13 +256,14 @@ class DvtBridgeSession(ReconnectableMixin):
             self._log_error(f"pymobiledevice3 import failed: {e}")
             return
 
-        # 建立 lockdown 连接
-        try:
-            lockdown = await create_using_usbmux(serial=self.device_udid)
-        except Exception as e:
-            # 尝试通过 tunneld 连接 (iOS 17+)
-            lockdown = await self._try_tunneld()
-            if lockdown is None:
+        # 优先尝试 tunneld (iOS 17+ DVT 服务必须走 RemoteServiceDiscovery)；
+        # 失败则降级 USBMux (iOS 16 及更早)
+        lockdown = await self._try_tunneld()
+        used_tunneld = lockdown is not None
+        if lockdown is None:
+            try:
+                lockdown = await create_using_usbmux(serial=self.device_udid)
+            except Exception as e:
                 self._log_error(f"无法连接设备 {self.device_udid}: {e}")
                 return
 
@@ -269,8 +272,22 @@ class DvtBridgeSession(ReconnectableMixin):
         try:
             await dvt_provider.connect()
         except Exception as e:
-            self._log_error(f"DVT 连接失败: {e} (设备可能被 Instruments 占用)")
-            return
+            # USBMux 路径在 iOS 17+ 上 DVT 服务受限，回退 tunneld 重试一次
+            if not used_tunneld:
+                self._log_error(f"DVT (USBMux) 连接失败: {e}，尝试 tunneld 降级...")
+                lockdown = await self._try_tunneld()
+                if lockdown is None:
+                    self._log_error("tunneld 不可用，放弃")
+                    return
+                dvt_provider = DvtProvider(lockdown)
+                try:
+                    await dvt_provider.connect()
+                except Exception as e2:
+                    self._log_error(f"DVT (tunneld) 连接也失败: {e2}")
+                    return
+            else:
+                self._log_error(f"DVT 连接失败: {e} (设备可能被 Instruments 占用)")
+                return
 
         try:
             # 启动 sysmontap
@@ -350,60 +367,180 @@ class DvtBridgeSession(ReconnectableMixin):
         return None
 
     async def _process_sysmon_snapshot(self, snapshot_data):
-        """处理单次 sysmon 采样"""
+        """处理单次 sysmon 采样。
+
+        pymobiledevice3 9.10+ 格式:
+          dict 快照含 SystemAttributes (列名) + System (值数组) + SystemCPUUsage (CPU dict)
+          + ProcessesAttributes (列名) + Processes (list of value-array)
+          stream 中混入 'k'/'heart' 等心跳 str，需要忽略
+        旧 list-of-dict 格式做向后兼容。
+        """
         now = time.time()
 
-        # 解析进程数据
-        if isinstance(snapshot_data, list):
-            for entry in snapshot_data:
-                if not isinstance(entry, dict):
-                    continue
+        if not isinstance(snapshot_data, dict):
+            return  # 'k' / 'heart' 等心跳消息
 
-                name = entry.get("name", "")
-                pid = entry.get("pid", 0)
+        # 缓存进程列名（系统 row 中宣告，进程 row 中复用）
+        if isinstance(snapshot_data.get("ProcessesAttributes"), list):
+            self._proc_attrs_cache = snapshot_data["ProcessesAttributes"]
 
-                # 如果指定了进程名过滤
-                if self.process_names and name not in self.process_names:
-                    continue
+        # ── 进程 row: dict {pid: [values]} ──
+        processes = snapshot_data.get("Processes")
+        if isinstance(processes, dict) and self._proc_attrs_cache:
+            await self._handle_proc_dict(now, self._proc_attrs_cache, processes)
+            return  # 进程 row 不含 system 数据，提早返回
 
-                # 构建快照
-                snap = DvtProcessSnapshot(
-                    ts=now,
-                    pid=pid,
-                    name=name,
-                    cpu_usage=entry.get("cpuUsage"),
-                    phys_footprint_mb=_bytes_to_mb(entry.get("physFootprint")),
-                    mem_anon_mb=_bytes_to_mb(entry.get("memAnon")),
-                    mem_virtual_mb=_bytes_to_mb(entry.get("memVirtualSize")),
-                    disk_bytes_read=entry.get("diskBytesRead", 0) or 0,
-                    disk_bytes_written=entry.get("diskBytesWritten", 0) or 0,
-                    thread_count=entry.get("threadCount", 0) or 0,
-                )
+        # ── 系统数据: SystemAttributes + System 数组对齐 → dict ──
+        sys_attrs = snapshot_data.get("SystemAttributes")
+        sys_vals = snapshot_data.get("System")
+        sys_map: dict = {}
+        if isinstance(sys_attrs, list) and isinstance(sys_vals, list) and len(sys_attrs) == len(sys_vals):
+            sys_map = dict(zip(sys_attrs, sys_vals))
 
-                # 写入 JSONL
-                self._append_jsonl(self.process_jsonl, snap.to_dict())
+        # CPU 总负载 — 优先用 SystemCPUUsage dict
+        cpu_info = snapshot_data.get("SystemCPUUsage")
+        cpu_total = None
+        if isinstance(cpu_info, dict):
+            cpu_total = cpu_info.get("CPU_TotalLoad") or cpu_info.get("CPU_UserLoad")
 
-                # 阈值检查
-                self._check_thresholds(snap)
+        # 内存: vmFreeCount/vmInactiveCount 是 page 数 (iOS arm64 page = 16K)
+        page_size = 16 * 1024
+        free_pages = sys_map.get("vmFreeCount")
+        used_pages = (sys_map.get("vmInactiveCount", 0) or 0) + (sys_map.get("vmCompressorPageCount", 0) or 0)
 
-                # 回调
-                if self.on_process_snapshot:
-                    try:
-                        self.on_process_snapshot(snap)
-                    except Exception as e:
-                        logger.debug("[dvt_bridge] on_process_snapshot 回调异常: %s", e)
+        if sys_map or cpu_total is not None:
+            sys_snap = DvtSystemSnapshot(
+                ts=now,
+                cpu_total=_safe_float(cpu_total),
+                phys_memory_free_mb=(free_pages * page_size / (1024 * 1024)) if free_pages else None,
+                phys_memory_used_mb=(used_pages * page_size / (1024 * 1024)) if used_pages else None,
+            )
+            self._append_jsonl(self.system_jsonl, sys_snap.to_dict())
 
-        # 解析系统数据 (snapshot_data 可能包含 "System" key 的 dict)
-        elif isinstance(snapshot_data, dict):
-            sys_data = snapshot_data.get("System")
-            if sys_data:
-                sys_snap = DvtSystemSnapshot(
-                    ts=now,
-                    cpu_total=_safe_float(getattr(sys_data, "cpuTotalUsage", None)),
-                    phys_memory_free_mb=_bytes_to_mb(getattr(sys_data, "physMemoryFree", None)),
-                    phys_memory_used_mb=_bytes_to_mb(getattr(sys_data, "physMemoryUsed", None)),
-                )
-                self._append_jsonl(self.system_jsonl, sys_snap.to_dict())
+        # ── 进程数据: ProcessesAttributes + Processes 二维数组 ──
+        proc_attrs = snapshot_data.get("ProcessesAttributes")
+        procs = snapshot_data.get("Processes") or snapshot_data.get("ProcessesData")
+        if isinstance(proc_attrs, list) and isinstance(procs, list):
+            await self._handle_proc_rows(now, proc_attrs, procs)
+        elif isinstance(procs, list):
+            # 旧式 list-of-dict 兼容路径
+            await self._handle_proc_dicts(now, procs)
+
+    async def _handle_proc_dict(self, now: float, attrs: list, processes: dict):
+        """新格式: Processes 是 {pid: [values...]} 字典，values 与 attrs 同长。"""
+        try:
+            name_idx = attrs.index("name")
+        except ValueError:
+            return
+        pid_idx = attrs.index("pid") if "pid" in attrs else -1
+        cpu_idx = attrs.index("cpuUsage") if "cpuUsage" in attrs else -1
+        # 9.10 sysmontap 用 physFootprint 而非 memResidentSize
+        mem_res_idx = (attrs.index("physFootprint") if "physFootprint" in attrs
+                       else attrs.index("memResidentSize") if "memResidentSize" in attrs else -1)
+        mem_anon_idx = attrs.index("memAnon") if "memAnon" in attrs else -1
+        mem_virt_idx = attrs.index("memVirtualSize") if "memVirtualSize" in attrs else -1
+        disk_r_idx = attrs.index("diskBytesRead") if "diskBytesRead" in attrs else -1
+        disk_w_idx = attrs.index("diskBytesWritten") if "diskBytesWritten" in attrs else -1
+        th_idx = attrs.index("threadCount") if "threadCount" in attrs else -1
+
+        for pid_key, vals in processes.items():
+            if not isinstance(vals, list) or len(vals) <= name_idx:
+                continue
+            name = vals[name_idx]
+            if self.process_names and name not in self.process_names:
+                continue
+            try:
+                pid = int(pid_key) if pid_idx < 0 else int(vals[pid_idx])
+            except (TypeError, ValueError):
+                pid = 0
+            snap = DvtProcessSnapshot(
+                ts=now,
+                pid=pid,
+                name=name,
+                cpu_usage=_safe_float(vals[cpu_idx]) if cpu_idx >= 0 else None,
+                phys_footprint_mb=_bytes_to_mb(vals[mem_res_idx]) if mem_res_idx >= 0 else None,
+                mem_anon_mb=_bytes_to_mb(vals[mem_anon_idx]) if mem_anon_idx >= 0 else None,
+                mem_virtual_mb=_bytes_to_mb(vals[mem_virt_idx]) if mem_virt_idx >= 0 else None,
+                disk_bytes_read=vals[disk_r_idx] if disk_r_idx >= 0 else 0,
+                disk_bytes_written=vals[disk_w_idx] if disk_w_idx >= 0 else 0,
+                thread_count=vals[th_idx] if th_idx >= 0 else 0,
+            )
+            self._append_jsonl(self.process_jsonl, snap.to_dict())
+            self._check_thresholds(snap)
+            if self.on_process_snapshot:
+                try:
+                    self.on_process_snapshot(snap)
+                except Exception as e:
+                    logger.debug("[dvt_bridge] on_process_snapshot 回调异常: %s", e)
+
+    async def _handle_proc_rows(self, now: float, attrs: list, procs: list):
+        """新格式: 每个 proc 是与 attrs 等长的值数组"""
+        try:
+            name_idx = attrs.index("name")
+            pid_idx = attrs.index("pid") if "pid" in attrs else -1
+            cpu_idx = attrs.index("cpuUsage") if "cpuUsage" in attrs else -1
+            mem_res_idx = attrs.index("memResidentSize") if "memResidentSize" in attrs else -1
+            mem_anon_idx = attrs.index("memAnon") if "memAnon" in attrs else -1
+            mem_virt_idx = attrs.index("memVirtualSize") if "memVirtualSize" in attrs else -1
+            disk_r_idx = attrs.index("diskBytesRead") if "diskBytesRead" in attrs else -1
+            disk_w_idx = attrs.index("diskBytesWritten") if "diskBytesWritten" in attrs else -1
+            th_idx = attrs.index("threadCount") if "threadCount" in attrs else -1
+        except ValueError:
+            return  # name 字段都没有 → 不是合法 sysmon 行
+
+        for row in procs:
+            if not isinstance(row, list) or len(row) <= name_idx:
+                continue
+            name = row[name_idx]
+            if self.process_names and name not in self.process_names:
+                continue
+            snap = DvtProcessSnapshot(
+                ts=now,
+                pid=row[pid_idx] if pid_idx >= 0 else 0,
+                name=name,
+                cpu_usage=_safe_float(row[cpu_idx]) if cpu_idx >= 0 else None,
+                phys_footprint_mb=_bytes_to_mb(row[mem_res_idx]) if mem_res_idx >= 0 else None,
+                mem_anon_mb=_bytes_to_mb(row[mem_anon_idx]) if mem_anon_idx >= 0 else None,
+                mem_virtual_mb=_bytes_to_mb(row[mem_virt_idx]) if mem_virt_idx >= 0 else None,
+                disk_bytes_read=row[disk_r_idx] if disk_r_idx >= 0 else 0,
+                disk_bytes_written=row[disk_w_idx] if disk_w_idx >= 0 else 0,
+                thread_count=row[th_idx] if th_idx >= 0 else 0,
+            )
+            self._append_jsonl(self.process_jsonl, snap.to_dict())
+            self._check_thresholds(snap)
+            if self.on_process_snapshot:
+                try:
+                    self.on_process_snapshot(snap)
+                except Exception as e:
+                    logger.debug("[dvt_bridge] on_process_snapshot 回调异常: %s", e)
+
+    async def _handle_proc_dicts(self, now: float, entries: list):
+        """旧格式向后兼容: 每个 proc 是 dict"""
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name", "")
+            if self.process_names and name not in self.process_names:
+                continue
+            snap = DvtProcessSnapshot(
+                ts=now,
+                pid=entry.get("pid", 0),
+                name=name,
+                cpu_usage=entry.get("cpuUsage"),
+                phys_footprint_mb=_bytes_to_mb(entry.get("physFootprint")),
+                mem_anon_mb=_bytes_to_mb(entry.get("memAnon")),
+                mem_virtual_mb=_bytes_to_mb(entry.get("memVirtualSize")),
+                disk_bytes_read=entry.get("diskBytesRead", 0) or 0,
+                disk_bytes_written=entry.get("diskBytesWritten", 0) or 0,
+                thread_count=entry.get("threadCount", 0) or 0,
+            )
+            self._append_jsonl(self.process_jsonl, snap.to_dict())
+            self._check_thresholds(snap)
+            if self.on_process_snapshot:
+                try:
+                    self.on_process_snapshot(snap)
+                except Exception as e:
+                    logger.debug("[dvt_bridge] on_process_snapshot 回调异常: %s", e)
 
     def _check_thresholds(self, snap: DvtProcessSnapshot):
         """检查阈值并触发告警"""
@@ -911,3 +1048,9 @@ def _read_jsonl(path: Path, last_n: int = 0) -> List[Dict[str, Any]]:
     if last_n > 0:
         records = records[-last_n:]
     return records
+
+
+if __name__ == "__main__":
+    # 修复: dvt_bridge_main 之前未绑定 __main__，导致 `python -m src.perf.dvt_bridge`
+    # 仅 print parser.parse_args 然后退出。session.py 也未通过子进程启动。
+    dvt_bridge_main()

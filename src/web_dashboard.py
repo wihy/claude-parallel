@@ -105,13 +105,17 @@ def collect_perf_state(repo: Optional[Path], coord_dir: str, tag: str, tail_n: i
     hotspots_path = logs_dir / "hotspots.jsonl"
     state["hotspots"] = _tail_jsonl(hotspots_path, 5)
 
-    # DVT 进程指标 (network / graphics)
-    dvt_proc_path = logs_dir / "dvt_process.jsonl"
-    if dvt_proc_path.exists():
-        state["dvt_process"] = _tail_jsonl(dvt_proc_path, tail_n)
-    dvt_sys_path = logs_dir / "dvt_system.jsonl"
-    if dvt_sys_path.exists():
-        state["dvt_system"] = _tail_jsonl(dvt_sys_path, tail_n)
+    # DVT 进程指标 — 实际文件在 logs/dvt/ 子目录；兼容旧路径
+    for key, fname in (
+        ("dvt_process", "dvt_process.jsonl"),
+        ("dvt_system",  "dvt_system.jsonl"),
+        ("dvt_network", "dvt_network.jsonl"),
+        ("dvt_graphics", "dvt_graphics.jsonl"),
+    ):
+        for cand in (logs_dir / "dvt" / fname, logs_dir / fname):
+            if cand.exists():
+                state[key] = _tail_jsonl(cand, tail_n)
+                break
 
     # 实时告警 (普通文本日志, 取最后 N 行)
     alerts_path = logs_dir / "alerts.log"
@@ -311,14 +315,16 @@ _HTML_PAGE = r"""<!doctype html>
 </style>
 </head>
 <body>
-  <h1 id="title">__TITLE__</h1>
+  <h1 id="title">__TITLE__ <span id="hb" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#4ade80;margin-left:8px;vertical-align:middle;transition:opacity .2s;"></span></h1>
   <div class="sub" id="sub">连接中... · 自动刷新 1s</div>
 
   <div class="grid">
     <div class="card" id="card-orch"><h2>调度概况 (Orchestrator)</h2><div id="orch">—</div></div>
     <div class="card" id="card-perf"><h2>真机功耗 (Battery / Power)</h2><div id="battery">—</div></div>
-    <div class="card" id="card-metrics"><h2>实时指标 (CPU / Network)</h2><div id="metrics">—</div></div>
+    <div class="card" id="card-system"><h2>系统指标 (System CPU / Mem)</h2><div id="system">—</div></div>
+    <div class="card" id="card-process"><h2>进程指标 (Per-Process via DVT)</h2><div id="process">—</div></div>
     <div class="card" id="card-hot"><h2>热点函数 (Sampling)</h2><div id="hotspots">—</div></div>
+    <div class="card" id="card-net"><h2>网络流 (DVT Network)</h2><div id="net">—</div></div>
     <div class="card" id="card-tasks" style="grid-column: 1 / -1;"><h2>任务列表</h2><div id="tasks">—</div></div>
     <div class="card" id="card-alerts" style="grid-column: 1 / -1;"><h2>实时告警 (alerts.log)</h2><div id="alerts">—</div></div>
   </div>
@@ -388,24 +394,110 @@ function renderBattery(p) {
   `;
 }
 
-function renderMetrics(p) {
+function renderSystem(p) {
   if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
-  const recs = p.metrics || [];
-  if (!recs.length) return '<span class="muted">无指标 (metrics.jsonl 缺失或为空)</span>';
+  // 优先使用 dvt_system (新版 sysmontap)，fallback 到 metrics (xctrace 模式)
+  const dvtSys = p.dvt_system || [];
+  const metrics = p.metrics || [];
+  if (dvtSys.length) {
+    const last = dvtSys[dvtSys.length - 1];
+    const win = dvtSys.length >= 5 ? dvtSys.slice(-5) : dvtSys;
+    const avgCpu = win.reduce((s, r) => s + (r.cpuTotal || 0), 0) / win.length;
+    const peakCpu = Math.max(...win.map(r => r.cpuTotal || 0));
+    const cpuPctOfCore = (last.cpuTotal || 0) / 6;  // 6 核 iPhone15,2 估算
+    const memFree = last.physMemoryFreeMB;
+    const memUsed = last.physMemoryUsedMB;
+    return `
+      <div class="row">
+        <div class="stat"><span class="v">${fmt(last.cpuTotal, 1)}</span><span class="l">CPU 总负载</span></div>
+        <div class="stat"><span class="v">${fmt(cpuPctOfCore, 1)}%</span><span class="l">单核均值</span></div>
+        <div class="stat"><span class="v ${peakCpu > 400 ? 'err' : peakCpu > 200 ? 'warn' : 'ok'}">${fmt(peakCpu, 0)}</span><span class="l">5s 峰值</span></div>
+        <div class="stat"><span class="v">${memUsed != null ? fmt(memUsed, 0) + 'MB' : '—'}</span><span class="l">已用内存</span></div>
+        <div class="stat"><span class="v">${dvtSys.length}</span><span class="l">采样</span></div>
+      </div>
+      <div class="muted">最新: ${fmtTs(last.ts)} · 来源: dvt_bridge sysmontap</div>
+    `;
+  }
+  if (metrics.length) {
+    const last = metrics[metrics.length - 1];
+    const cpu = last.cpu_avg ?? last.cpu ?? null;
+    const net = last.networking_avg ?? last.net ?? null;
+    return `
+      <div class="row">
+        <div class="stat"><span class="v">${cpu != null ? fmt(cpu, 1) : '—'}</span><span class="l">CPU</span></div>
+        <div class="stat"><span class="v">${net != null ? fmt(net, 1) : '—'}</span><span class="l">Network</span></div>
+        <div class="stat"><span class="v">${metrics.length}</span><span class="l">样本</span></div>
+      </div>
+      <div class="muted">最新: ${fmtTs(last.ts)} · 来源: xctrace metrics.jsonl</div>
+    `;
+  }
+  return '<span class="muted">无系统指标 — 启动 dvt_bridge 后自动出现</span>';
+}
+
+function renderProcess(p) {
+  if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
+  const recs = p.dvt_process || [];
+  if (!recs.length) return '<span class="muted">无进程数据 — 检查 dvt_bridge daemon 是否启动</span>';
+  // 按进程名分组，取每个进程最新一条
+  const byName = {};
+  for (const r of recs) {
+    if (!byName[r.name] || r.ts > byName[r.name].ts) byName[r.name] = r;
+  }
+  // 最近 30s 计算 CPU/MEM 趋势
+  const recent = recs.slice(-30);
   const last = recs[recs.length - 1];
-  // 兼容多种字段
-  const cpu = last.cpu_avg ?? last.cpu ?? last.cpu_pct ?? null;
-  const net = last.networking_avg ?? last.net ?? last.networking ?? null;
-  const display = last.display_avg ?? last.display ?? null;
-  return `
+  const cpuAvg = recent.reduce((s, r) => s + (r.cpuUsage || 0), 0) / recent.length;
+  const cpuPeak = Math.max(...recent.map(r => r.cpuUsage || 0));
+  const memDelta = recent.length > 1
+    ? (recent[recent.length - 1].physFootprintMB || 0) - (recent[0].physFootprintMB || 0)
+    : 0;
+  let html = `
     <div class="row">
-      <div class="stat"><span class="v">${cpu != null ? fmt(cpu, 1) : '—'}</span><span class="l">CPU</span></div>
-      <div class="stat"><span class="v">${net != null ? fmt(net, 1) : '—'}</span><span class="l">Network</span></div>
-      <div class="stat"><span class="v">${display != null ? fmt(display, 1) : '—'}</span><span class="l">Display</span></div>
-      <div class="stat"><span class="v">${recs.length}</span><span class="l">样本</span></div>
+      <div class="stat"><span class="v ${last.cpuUsage > 80 ? 'err' : last.cpuUsage > 50 ? 'warn' : 'ok'}">${fmt(last.cpuUsage, 1)}%</span><span class="l">${escapeHtml(last.name)} CPU</span></div>
+      <div class="stat"><span class="v">${fmt(cpuAvg, 1)}%</span><span class="l">30s 均值</span></div>
+      <div class="stat"><span class="v ${cpuPeak > 80 ? 'err' : 'warn'}">${fmt(cpuPeak, 1)}%</span><span class="l">30s 峰值</span></div>
+      <div class="stat"><span class="v">${fmt(last.physFootprintMB, 0)}MB</span><span class="l">物理内存</span></div>
+      <div class="stat"><span class="v ${memDelta > 50 ? 'err' : memDelta > 10 ? 'warn' : 'muted'}">${memDelta > 0 ? '+' : ''}${fmt(memDelta, 1)}MB</span><span class="l">30s 变化</span></div>
+      <div class="stat"><span class="v">${last.threadCount}</span><span class="l">线程数</span></div>
     </div>
-    <div class="muted">最新更新: ${fmtTs(last.ts)}</div>
+    <div class="muted">最新: ${fmtTs(last.ts)} · pid=${last.pid} · 监控进程 ${Object.keys(byName).length} 个</div>
   `;
+  // 多进程时列表展示
+  if (Object.keys(byName).length > 1) {
+    html += '<table style="margin-top:8px"><thead><tr><th>进程</th><th>PID</th><th>CPU</th><th>内存</th><th>线程</th></tr></thead><tbody>';
+    for (const name of Object.keys(byName).sort()) {
+      const r = byName[name];
+      html += `<tr><td>${escapeHtml(name)}</td><td>${r.pid}</td><td>${fmt(r.cpuUsage, 1)}%</td><td>${fmt(r.physFootprintMB, 0)}MB</td><td>${r.threadCount}</td></tr>`;
+    }
+    html += '</tbody></table>';
+  }
+  return html;
+}
+
+function renderNet(p) {
+  if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
+  const recs = p.dvt_network || [];
+  if (!recs.length) {
+    // 退化展示磁盘 IO（来自 dvt_process）
+    const procs = p.dvt_process || [];
+    if (procs.length >= 2) {
+      const first = procs[0]; const last = procs[procs.length - 1];
+      const dt = (last.ts - first.ts) || 1;
+      const readKB = ((last.diskBytesRead - first.diskBytesRead) / 1024 / dt).toFixed(1);
+      const writeKB = ((last.diskBytesWritten - first.diskBytesWritten) / 1024 / dt).toFixed(1);
+      return `
+        <div class="muted">无 dvt_network.jsonl，展示磁盘 I/O 替代 (来自 dvt_process)</div>
+        <div class="row">
+          <div class="stat"><span class="v">${readKB} KB/s</span><span class="l">磁盘读</span></div>
+          <div class="stat"><span class="v">${writeKB} KB/s</span><span class="l">磁盘写</span></div>
+          <div class="stat"><span class="v">${fmt(dt, 0)}s</span><span class="l">观察窗口</span></div>
+        </div>
+      `;
+    }
+    return '<span class="muted">无网络/磁盘数据</span>';
+  }
+  const last = recs[recs.length - 1];
+  return '<pre>' + escapeHtml(JSON.stringify(last, null, 2)) + '</pre>';
 }
 
 function renderHotspots(p) {
@@ -437,21 +529,35 @@ function escapeHtml(s) {
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+let _tickCount = 0;
 async function tick() {
+  const hb = document.getElementById('hb');
   try {
     const r = await fetch('/api/state', { cache: 'no-store' });
     if (!r.ok) throw new Error('http ' + r.status);
     const s = await r.json();
-    document.getElementById('title').textContent = s.title || 'cpar Dashboard';
-    document.getElementById('sub').textContent = `更新: ${fmtTs(s.ts)} · 自动刷新 1s`;
+    _tickCount++;
+    // 心跳: 闪一下 (绿)
+    hb.style.opacity = '0.2';
+    setTimeout(() => { hb.style.opacity = '1'; }, 150);
+
+    const p = s.perf || {};
+    const counts = `battery:${(p.battery||[]).length} · metrics:${(p.metrics||[]).length} · dvt_proc:${(p.dvt_process||[]).length} · dvt_net:${(p.dvt_network||[]).length} · dvt_gfx:${(p.dvt_graphics||[]).length} · hotspots:${(p.hotspots||[]).length} · alerts:${(p.alerts||[]).length}`;
+
+    document.getElementById('sub').innerHTML =
+      `更新 #${_tickCount} · ${fmtTs(s.ts)} · 自动刷新 1s · 数据量: <span class="muted">${counts}</span>`;
+
     document.getElementById('orch').innerHTML = renderOrch(s.orchestrator);
     document.getElementById('tasks').innerHTML = renderTasks(s.orchestrator);
     document.getElementById('battery').innerHTML = renderBattery(s.perf);
-    document.getElementById('metrics').innerHTML = renderMetrics(s.perf);
+    document.getElementById('system').innerHTML = renderSystem(s.perf);
+    document.getElementById('process').innerHTML = renderProcess(s.perf);
     document.getElementById('hotspots').innerHTML = renderHotspots(s.perf);
+    document.getElementById('net').innerHTML = renderNet(s.perf);
     document.getElementById('alerts').innerHTML = renderAlerts(s.perf);
   } catch (e) {
-    document.getElementById('sub').innerHTML = '<span class="err">连接错误: ' + escapeHtml(e.message) + '</span>';
+    hb.style.background = '#f87171';
+    document.getElementById('sub').innerHTML = '<span class="err">连接错误 #' + _tickCount + ': ' + escapeHtml(e.message) + '</span>';
   }
 }
 
