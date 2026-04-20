@@ -182,6 +182,25 @@ def cmd_dashboard(args):
             p = Path(spec).expanduser()
             sources_dict[p.name or "default"] = str(p)
 
+    # 自动加载 LinkMap (启用 hotspots 二次符号化)
+    try:
+        from src.perf.linkmap import MultiLinkMap, find_linkmaps
+        from src.web_dashboard import set_global_linkmap
+        # 优先扫 DerivedData; 也可加 --linkmap-project 自定义
+        project = getattr(args, "linkmap_project", "Soul_New")
+        files = find_linkmaps(project_name=project, arch="arm64")
+        if files:
+            print(f"  ▶ 加载 {len(files)} 个 LinkMap (project={project})...")
+            mlm = MultiLinkMap.warm_all_from_derived_data(project_name=project, max_workers=4)
+            set_global_linkmap(mlm)
+            stats = mlm.stats()
+            print(f"  ✓ LinkMap 就绪: {stats['total_symbols']:,} 符号 "
+                  f"(业务 {stats['biz_symbols']:,} OC {stats['objc_symbols']:,})")
+        else:
+            print(f"  · 未找到 LinkMap (project={project}), hotspots 不做二次符号化")
+    except Exception as e:
+        print(f"  ⚠ LinkMap 加载失败: {e}")
+
     srv = DashboardServer(
         port=args.port,
         host=args.host,
@@ -2340,6 +2359,8 @@ def main():
     dash_parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     dash_parser.add_argument("--source", action="append", default=[],
                              help="源码仓库 NAME=PATH，可重复指定 (如: --source soul=~/SoulApp --source pods=~/Pods)")
+    dash_parser.add_argument("--linkmap-project", default="Soul_New",
+                             help="LinkMap 工程名 (DerivedData 下匹配, 默认 Soul_New)")
 
     # ── perf ──
     perf_parser = subparsers.add_parser("perf", help="真机性能采集与报告")

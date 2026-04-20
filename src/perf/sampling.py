@@ -160,18 +160,19 @@ def _parse_time_profile_iterparse(
     from xml.etree.ElementTree import iterparse
 
     # id → value 映射（渐进构建）
-    frame_map: Dict[str, str] = {}    # frame id → name
-    weight_map: Dict[str, float] = {} # weight id → ms
-    bt_map: Dict[str, List[str]] = {} # tagged-backtrace id → [frame names]
+    # frame_map 存 (name, addr) 二元组, addr 用于后续 LinkMap 反查
+    frame_map: Dict[str, Tuple[str, str]] = {}  # frame id → (name, addr)
+    weight_map: Dict[str, float] = {}           # weight id → ms
+    bt_map: Dict[str, List[Tuple[str, str]]] = {}  # tagged-backtrace id → [(name, addr), ...]
 
     samples: List[Any] = []
     # 当前 row 的临时状态
     in_row = False
     row_weight: float = 1.0
-    row_frames: List[str] = []
+    row_frames: List[Tuple[str, str]] = []   # (name, addr)
     row_ts: float = 0.0
     current_bt_id: Optional[str] = None
-    current_bt_frames: List[str] = []
+    current_bt_frames: List[Tuple[str, str]] = []
     in_backtrace = False
 
     try:
@@ -202,12 +203,14 @@ def _parse_time_profile_iterparse(
                 fid = elem.get("id")
                 fref = elem.get("ref")
                 name = elem.get("name", "")
-                if fid and name:
-                    frame_map[fid] = name
+                # 提取地址 (xctrace XML 通常用 addr 属性, 兼容 address)
+                addr = elem.get("addr") or elem.get("address") or ""
+                if fid and (name or addr):
+                    frame_map[fid] = (name, addr)
                 if fref:
-                    name = frame_map.get(fref, "")
-                if in_backtrace and name:
-                    current_bt_frames.append(name)
+                    name, addr = frame_map.get(fref, ("", ""))
+                if in_backtrace and (name or addr):
+                    current_bt_frames.append((name, addr))
 
             elif tag == "weight":
                 wid = elem.get("id")
@@ -246,8 +249,11 @@ def _parse_time_profile_iterparse(
                             continue
 
                     if keep_full_stack:
-                        # 过滤出符号化的 frames
-                        sym_frames = [f for f in row_frames if _is_symbolicated(f)]
+                        # 过滤出符号化的 frames - 保留 (name, addr)
+                        sym_frames = [
+                            {"name": n, "addr": a} for (n, a) in row_frames
+                            if _is_symbolicated(n) or a
+                        ]
                         if sym_frames:
                             samples.append({
                                 "ts_offset_s": round(row_ts, 3),
@@ -256,13 +262,16 @@ def _parse_time_profile_iterparse(
                             })
                     else:
                         # 只取叶子（第一个符号化 frame）
-                        symbol = None
-                        for f in row_frames:
-                            if _is_symbolicated(f):
-                                symbol = f
+                        leaf_name, leaf_addr = "", ""
+                        for (n, a) in row_frames:
+                            if _is_symbolicated(n):
+                                leaf_name, leaf_addr = n, a
                                 break
-                        if symbol:
-                            samples.append((symbol, row_weight))
+                            elif a:  # 未符号化但有 addr - 保留以便 LinkMap 反查
+                                leaf_name, leaf_addr = n or f"<0x{a}>", a
+                                break
+                        if leaf_name:
+                            samples.append((leaf_name, row_weight, leaf_addr))
 
                 elem.clear()  # 释放内存
 
@@ -342,30 +351,45 @@ def _parse_legacy_timeprofiler_format(text: str) -> List[Tuple[str, float]]:
 
 
 def aggregate_top_n(
-    samples: List[Tuple[str, float]], top_n: int,
+    samples: List[Tuple], top_n: int,
 ) -> List[Dict[str, Any]]:
-    """将原始采样聚合为 Top-N 热点函数（取 leaf 符号）。"""
+    """将原始采样聚合为 Top-N 热点函数（取 leaf 符号）。
+
+    samples 可为:
+      [(name, weight)]              旧格式，向后兼容
+      [(name, weight, addr)]        新格式，含原始地址用于 LinkMap 反查
+    """
     if not samples:
         return []
 
-    func_weight: Dict[str, float] = defaultdict(float)
-    for frame, weight in samples:
+    # (leaf_name, addr) → weight
+    # 保留 addr 让后续 resymbolize 阶段能 LinkMap 反查
+    bucket: Dict[Tuple[str, str], float] = defaultdict(float)
+    for s in samples:
+        if len(s) >= 3:
+            frame, weight, addr = s[0], s[1], s[2]
+        else:
+            frame, weight = s[0], s[1]
+            addr = ""
         leaf = frame.rsplit(" → ", 1)[-1]
-        func_weight[leaf] += weight
+        bucket[(leaf, addr)] += weight
 
-    total = sum(func_weight.values())
+    total = sum(bucket.values())
     if total <= 0:
         return []
 
-    hot = sorted(func_weight.items(), key=lambda x: x[1], reverse=True)
-    return [
-        {
+    hot = sorted(bucket.items(), key=lambda x: x[1], reverse=True)
+    out = []
+    for (func, addr), w in hot[:top_n]:
+        item = {
             "symbol": func,
             "samples": int(round(w)),
             "pct": round(w / total * 100.0, 1),
         }
-        for func, w in hot[:top_n]
-    ]
+        if addr:
+            item["addr"] = addr
+        out.append(item)
+    return out
 
 
 # ── JSONL read / format helpers ──
