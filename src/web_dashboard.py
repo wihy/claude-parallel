@@ -324,6 +324,7 @@ _HTML_PAGE = r"""<!doctype html>
     <div class="card" id="card-system"><h2>系统指标 (System CPU / Mem)</h2><div id="system">—</div></div>
     <div class="card" id="card-process"><h2>进程指标 (Per-Process via DVT)</h2><div id="process">—</div></div>
     <div class="card" id="card-hot"><h2>热点函数 (Sampling)</h2><div id="hotspots">—</div></div>
+    <div class="card" id="card-gpu"><h2>GPU / 帧率 (DVT Graphics)</h2><div id="gpu">—</div></div>
     <div class="card" id="card-net"><h2>网络流 (DVT Network)</h2><div id="net">—</div></div>
     <div class="card" id="card-tasks" style="grid-column: 1 / -1;"><h2>任务列表</h2><div id="tasks">—</div></div>
     <div class="card" id="card-alerts" style="grid-column: 1 / -1;"><h2>实时告警 (alerts.log)</h2><div id="alerts">—</div></div>
@@ -474,6 +475,31 @@ function renderProcess(p) {
   return html;
 }
 
+function renderGpu(p) {
+  if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
+  const recs = p.dvt_graphics || [];
+  if (!recs.length) return '<span class="muted">无 GPU 数据 — 启动 dvt_bridge 时加 --collect-graphics</span>';
+  const last = recs[recs.length - 1];
+  const recent = recs.slice(-30);
+  const fpsVals = recent.map(r => r.fps).filter(v => v != null);
+  const gpuVals = recent.map(r => r.gpu_util).filter(v => v != null);
+  const avgFps = fpsVals.length ? fpsVals.reduce((a,b)=>a+b,0)/fpsVals.length : null;
+  const minFps = fpsVals.length ? Math.min(...fpsVals) : null;
+  const avgGpu = gpuVals.length ? gpuVals.reduce((a,b)=>a+b,0)/gpuVals.length : null;
+  const peakGpu = gpuVals.length ? Math.max(...gpuVals) : null;
+  return `
+    <div class="row">
+      <div class="stat"><span class="v ${last.fps && last.fps < 30 ? 'err' : last.fps && last.fps < 50 ? 'warn' : 'ok'}">${last.fps != null ? fmt(last.fps, 0) : '—'}</span><span class="l">FPS</span></div>
+      <div class="stat"><span class="v">${avgFps != null ? fmt(avgFps, 1) : '—'}</span><span class="l">30s 均 FPS</span></div>
+      <div class="stat"><span class="v ${minFps && minFps < 24 ? 'err' : 'warn'}">${minFps != null ? fmt(minFps, 0) : '—'}</span><span class="l">最低 FPS</span></div>
+      <div class="stat"><span class="v ${last.gpu_util > 80 ? 'err' : last.gpu_util > 50 ? 'warn' : 'ok'}">${last.gpu_util != null ? fmt(last.gpu_util, 1) + '%' : '—'}</span><span class="l">GPU 利用率</span></div>
+      <div class="stat"><span class="v">${avgGpu != null ? fmt(avgGpu, 1) + '%' : '—'}</span><span class="l">30s GPU 均值</span></div>
+      <div class="stat"><span class="v">${peakGpu != null ? fmt(peakGpu, 1) + '%' : '—'}</span><span class="l">峰值</span></div>
+    </div>
+    <div class="muted">最新: ${fmtTs(last.ts)} · ${recs.length} 条采样</div>
+  `;
+}
+
 function renderNet(p) {
   if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
   const recs = p.dvt_network || [];
@@ -553,6 +579,7 @@ async function tick() {
     document.getElementById('system').innerHTML = renderSystem(s.perf);
     document.getElementById('process').innerHTML = renderProcess(s.perf);
     document.getElementById('hotspots').innerHTML = renderHotspots(s.perf);
+    document.getElementById('gpu').innerHTML = renderGpu(s.perf);
     document.getElementById('net').innerHTML = renderNet(s.perf);
     document.getElementById('alerts').innerHTML = renderAlerts(s.perf);
   } catch (e) {

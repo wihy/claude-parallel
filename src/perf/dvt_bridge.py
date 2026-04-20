@@ -596,127 +596,76 @@ class DvtBridgeSession(ReconnectableMixin):
     # ── Network / Graphics 采集流 ──
 
     async def _stream_network(self, dvt_provider) -> None:
-        """
-        通过 DVT raw channel 采集网络数据。
+        """采集网络监控事件 (pymobiledevice3 9.10+ 官方 NetworkMonitor service)。
 
-        使用 com.apple.instruments.server.services.networking channel。
-        数据写入 network_jsonl，格式: {ts, pid, name, rx_bytes, tx_bytes, connections}
+        events 包含 InterfaceDetectionEvent / ConnectionDetectionEvent / ConnectionUpdateEvent。
         """
-        channel_name = "com.apple.instruments.server.services.networking"
         try:
-            channel = await dvt_provider.open_channel(channel_name)
-        except Exception as e:
-            self._log_error(f"无法打开 NetworkMonitor channel: {e}")
+            from pymobiledevice3.services.dvt.instruments.network_monitor import NetworkMonitor
+        except ImportError as e:
+            self._log_error(f"NetworkMonitor service 不可用: {e}")
             return
 
         try:
-            # 启动监控
-            try:
-                await channel.call_method("start")
-            except Exception:
-                # 某些版本可能不需要 start，忽略
-                pass
-
-            while self._running:
-                try:
-                    # 从 channel 读取数据（带超时以响应 stop）
-                    try:
-                        data = await asyncio.wait_for(channel.next(), timeout=5.0)
-                    except asyncio.TimeoutError:
+            async with NetworkMonitor(dvt_provider) as nm:
+                async for event in nm:
+                    if not self._running:
+                        break
+                    if event is None:
                         continue
-
-                    if data is None:
-                        continue
-
                     now = time.time()
-
-                    # 解析 channel 返回的数据
-                    # 网络数据通常是 dict 或包含多个 dict 的列表
-                    entries = data if isinstance(data, list) else [data]
-                    for entry in entries:
-                        if not isinstance(entry, dict):
-                            continue
-
-                        record = {
-                            "ts": now,
-                            "pid": entry.get("pid", 0),
-                            "name": entry.get("name", ""),
-                            "rx_bytes": entry.get("rxBytes", 0),
-                            "tx_bytes": entry.get("txBytes", 0),
-                            "connections": entry.get("connections", 0),
-                        }
-                        self._append_jsonl(self.network_jsonl, record)
-
-                except Exception as e:
-                    logger.debug("[dvt_bridge] network 数据解析异常: %s", e)
-                    await asyncio.sleep(0.1)
-
+                    # event 是 dataclass：InterfaceDetectionEvent / ConnectionDetectionEvent / ConnectionUpdateEvent
+                    record = {
+                        "ts": now,
+                        "type": type(event).__name__,
+                    }
+                    if hasattr(event, '__dict__'):
+                        for k, v in vars(event).items():
+                            if not k.startswith('_'):
+                                # 转 bytes/复杂对象到 str
+                                try:
+                                    record[k] = v if isinstance(v, (int, float, str, bool, type(None))) else str(v)
+                                except Exception:
+                                    pass
+                    self._append_jsonl(self.network_jsonl, record)
         except Exception as e:
             self._log_error(f"NetworkMonitor 流异常退出: {e!r}")
-        finally:
-            try:
-                await channel.stopMonitoring()
-            except Exception:
-                pass
+        # NetworkMonitor.__aexit__ 已自动 stop_monitoring，无需手动清理
 
     async def _stream_graphics(self, dvt_provider) -> None:
-        """
-        通过 DVT raw channel 采集图形/GPU 数据。
+        """采集 GPU/CoreAnimation 帧率指标 (pymobiledevice3 9.10+ 官方 Graphics service)。
 
-        使用 com.apple.instruments.server.services.graphics channel。
-        数据写入 graphics_jsonl，格式: {ts, pid, name, fps, gpu_time_ms, draw_calls}
+        每个 event 形如: {CoreAnimationFramesPerSecond, GPU Hardware Utilization, ...}
         """
-        channel_name = "com.apple.instruments.server.services.graphics"
         try:
-            channel = await dvt_provider.open_channel(channel_name)
-        except Exception as e:
-            self._log_error(f"无法打开 Graphics channel: {e}")
+            from pymobiledevice3.services.dvt.instruments.graphics import Graphics
+        except ImportError as e:
+            self._log_error(f"Graphics service 不可用: {e}")
             return
 
         try:
-            # 启动监控
-            try:
-                await channel.call_method("startSamplingAtTime", 0.0)
-            except Exception:
-                # 某些版本可能不支持此方法，尝试 start
-                try:
-                    await channel.call_method("start")
-                except Exception:
-                    pass
-
-            while self._running:
-                try:
-                    # 从 channel 读取数据（带超时以响应 stop）
-                    try:
-                        data = await asyncio.wait_for(channel.next(), timeout=5.0)
-                    except asyncio.TimeoutError:
+            async with Graphics(dvt_provider) as graphics:
+                async for event in graphics:
+                    if not self._running:
+                        break
+                    if event is None:
                         continue
-
-                    if data is None:
-                        continue
-
                     now = time.time()
-
-                    # 解析 channel 返回的数据
-                    entries = data if isinstance(data, list) else [data]
-                    for entry in entries:
-                        if not isinstance(entry, dict):
-                            continue
-
-                        record = {
-                            "ts": now,
-                            "pid": entry.get("pid", 0),
-                            "name": entry.get("name", ""),
-                            "fps": entry.get("fps"),
-                            "gpu_time_ms": entry.get("gpuTimeMS"),
-                            "draw_calls": entry.get("drawCalls", 0),
-                        }
-                        self._append_jsonl(self.graphics_jsonl, record)
-
-                except Exception as e:
-                    logger.debug("[dvt_bridge] graphics 数据解析异常: %s", e)
-                    await asyncio.sleep(0.1)
-
+                    # event 可能是 dict 或 dataclass
+                    data = event if isinstance(event, dict) else getattr(event, '__dict__', {})
+                    if not data:
+                        continue
+                    record = {
+                        "ts": now,
+                        "fps": data.get("CoreAnimationFramesPerSecond")
+                              or data.get("fps"),
+                        "gpu_util": data.get("Device Utilization %")
+                                   or data.get("GPU Hardware Utilization"),
+                        "tiler_util": data.get("Tiler Utilization %"),
+                        "renderer_util": data.get("Renderer Utilization %"),
+                        "raw": {k: v for k, v in data.items() if not str(k).startswith('_')},
+                    }
+                    self._append_jsonl(self.graphics_jsonl, record)
         except Exception as e:
             self._log_error(f"Graphics 流异常退出: {e!r}")
         finally:
@@ -902,6 +851,10 @@ def dvt_bridge_main():
     parser.add_argument("--output-dir", required=True, help="输出目录")
     parser.add_argument("--cpu-threshold", type=float, default=80.0, help="CPU 告警阈值 (%)")
     parser.add_argument("--memory-threshold", type=float, default=1500.0, help="内存告警阈值 (MB)")
+    parser.add_argument("--collect-graphics", action="store_true",
+                        help="采集 GPU/CoreAnimation 帧率指标 → dvt_graphics.jsonl")
+    parser.add_argument("--collect-network", action="store_true",
+                        help="采集网络流字节数 → dvt_network.jsonl")
     args = parser.parse_args()
 
     running = True
@@ -919,6 +872,8 @@ def dvt_bridge_main():
         device_udid=args.device,
         process_names=args.process,
         interval_ms=args.interval,
+        collect_graphics=args.collect_graphics,
+        collect_network=args.collect_network,
         output_dir=output_dir,
         cpu_threshold=args.cpu_threshold,
         memory_threshold_mb=args.memory_threshold,
