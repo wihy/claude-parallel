@@ -151,6 +151,8 @@ class DvtBridgeSession(ReconnectableMixin):
         interval_ms: int = 1000,
         collect_graphics: bool = False,
         collect_network: bool = False,
+        collect_process: bool = True,
+        collect_system: bool = True,
         process_jsonl: Optional[Path] = None,
         system_jsonl: Optional[Path] = None,
         network_jsonl: Optional[Path] = None,
@@ -165,6 +167,8 @@ class DvtBridgeSession(ReconnectableMixin):
         self.interval_ms = interval_ms
         self.collect_graphics = collect_graphics
         self.collect_network = collect_network
+        self.collect_process = collect_process
+        self.collect_system = collect_system
         self.process_jsonl = process_jsonl
         self.system_jsonl = system_jsonl
         self.network_jsonl = network_jsonl
@@ -387,8 +391,13 @@ class DvtBridgeSession(ReconnectableMixin):
         # ── 进程 row: dict {pid: [values]} ──
         processes = snapshot_data.get("Processes")
         if isinstance(processes, dict) and self._proc_attrs_cache:
-            await self._handle_proc_dict(now, self._proc_attrs_cache, processes)
+            if self.collect_process:
+                await self._handle_proc_dict(now, self._proc_attrs_cache, processes)
             return  # 进程 row 不含 system 数据，提早返回
+
+        # 系统通道关闭则不写
+        if not self.collect_system:
+            return
 
         # ── 系统数据: SystemAttributes + System 数组对齐 → dict ──
         sys_attrs = snapshot_data.get("SystemAttributes")
@@ -851,10 +860,20 @@ def dvt_bridge_main():
     parser.add_argument("--output-dir", required=True, help="输出目录")
     parser.add_argument("--cpu-threshold", type=float, default=80.0, help="CPU 告警阈值 (%)")
     parser.add_argument("--memory-threshold", type=float, default=1500.0, help="内存告警阈值 (MB)")
+    # 默认全开，提供反向禁用开关
+    parser.add_argument("--no-graphics", action="store_true",
+                        help="关闭 GPU/CoreAnimation 帧率采集（默认开启）")
+    parser.add_argument("--no-network", action="store_true",
+                        help="关闭网络监控（默认开启）")
+    parser.add_argument("--no-process", action="store_true",
+                        help="关闭进程级指标采集（默认开启）")
+    parser.add_argument("--no-system", action="store_true",
+                        help="关闭系统级指标采集（默认开启）")
+    # 兼容旧标志（已废弃，仍可用）
     parser.add_argument("--collect-graphics", action="store_true",
-                        help="采集 GPU/CoreAnimation 帧率指标 → dvt_graphics.jsonl")
+                        help="[已废弃] 默认即开启，使用 --no-graphics 关闭")
     parser.add_argument("--collect-network", action="store_true",
-                        help="采集网络流字节数 → dvt_network.jsonl")
+                        help="[已废弃] 默认即开启，使用 --no-network 关闭")
     args = parser.parse_args()
 
     running = True
@@ -872,12 +891,22 @@ def dvt_bridge_main():
         device_udid=args.device,
         process_names=args.process,
         interval_ms=args.interval,
-        collect_graphics=args.collect_graphics,
-        collect_network=args.collect_network,
+        collect_graphics=not args.no_graphics,
+        collect_network=not args.no_network,
+        collect_process=not args.no_process,
+        collect_system=not args.no_system,
         output_dir=output_dir,
         cpu_threshold=args.cpu_threshold,
         memory_threshold_mb=args.memory_threshold,
     )
+
+    enabled = []
+    if not args.no_process: enabled.append("process")
+    if not args.no_system: enabled.append("system")
+    if not args.no_graphics: enabled.append("graphics")
+    if not args.no_network: enabled.append("network")
+    print(f"[dvt_bridge] enabled channels: {', '.join(enabled) if enabled else '(none)'}",
+          flush=True)
 
     bridge.start()
 

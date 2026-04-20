@@ -106,15 +106,17 @@ def collect_perf_state(repo: Optional[Path], coord_dir: str, tag: str, tail_n: i
     state["hotspots"] = _tail_jsonl(hotspots_path, 5)
 
     # DVT 进程指标 — 实际文件在 logs/dvt/ 子目录；兼容旧路径
-    for key, fname in (
-        ("dvt_process", "dvt_process.jsonl"),
-        ("dvt_system",  "dvt_system.jsonl"),
-        ("dvt_network", "dvt_network.jsonl"),
-        ("dvt_graphics", "dvt_graphics.jsonl"),
-    ):
+    # network 事件流频率高 (每连接每秒一条 update)，单独给更大窗口
+    dvt_specs = (
+        ("dvt_process",  "dvt_process.jsonl",  tail_n),
+        ("dvt_system",   "dvt_system.jsonl",   tail_n),
+        ("dvt_network",  "dvt_network.jsonl",  max(tail_n * 10, 600)),
+        ("dvt_graphics", "dvt_graphics.jsonl", tail_n),
+    )
+    for key, fname, n in dvt_specs:
         for cand in (logs_dir / "dvt" / fname, logs_dir / fname):
             if cand.exists():
-                state[key] = _tail_jsonl(cand, tail_n)
+                state[key] = _tail_jsonl(cand, n)
                 break
 
     # 实时告警 (普通文本日志, 取最后 N 行)
@@ -478,7 +480,29 @@ function renderProcess(p) {
 function renderGpu(p) {
   if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
   const recs = p.dvt_graphics || [];
-  if (!recs.length) return '<span class="muted">无 GPU 数据 — 启动 dvt_bridge 时加 --collect-graphics</span>';
+
+  // 关联：主进程及 WebKit.GPU 进程的 CPU% (作为 per-process GPU 间接指标)
+  const procRecs = (p.dvt_process || []).slice(-60);
+  const byName = {};
+  for (const r of procRecs) {
+    if (!byName[r.name] || r.ts > byName[r.name].ts) byName[r.name] = r;
+  }
+  const soulCpu = byName['Soul_New']?.cpuUsage;
+  const wkGpuCpu = byName['com.apple.WebKit.GPU']?.cpuUsage;
+  const wkContentCpu = byName['com.apple.WebKit.WebContent']?.cpuUsage;
+
+  if (!recs.length) {
+    let html = '<span class="muted">无设备级 GPU 数据 — 启动 dvt_bridge 时加 --collect-graphics</span>';
+    if (soulCpu != null || wkGpuCpu != null) {
+      html += '<div class="row" style="margin-top:8px">';
+      if (soulCpu != null) html += `<div class="stat"><span class="v">${fmt(soulCpu,1)}%</span><span class="l">Soul_New CPU</span></div>`;
+      if (wkGpuCpu != null) html += `<div class="stat"><span class="v">${fmt(wkGpuCpu,1)}%</span><span class="l">WebKit.GPU 进程 CPU</span></div>`;
+      if (wkContentCpu != null) html += `<div class="stat"><span class="v">${fmt(wkContentCpu,1)}%</span><span class="l">WebKit.WebContent</span></div>`;
+      html += '</div>';
+    }
+    return html;
+  }
+
   const last = recs[recs.length - 1];
   const recent = recs.slice(-30);
   const fpsVals = recent.map(r => r.fps).filter(v => v != null);
@@ -487,43 +511,115 @@ function renderGpu(p) {
   const minFps = fpsVals.length ? Math.min(...fpsVals) : null;
   const avgGpu = gpuVals.length ? gpuVals.reduce((a,b)=>a+b,0)/gpuVals.length : null;
   const peakGpu = gpuVals.length ? Math.max(...gpuVals) : null;
-  return `
+
+  let html = `
     <div class="row">
-      <div class="stat"><span class="v ${last.fps && last.fps < 30 ? 'err' : last.fps && last.fps < 50 ? 'warn' : 'ok'}">${last.fps != null ? fmt(last.fps, 0) : '—'}</span><span class="l">FPS</span></div>
+      <div class="stat"><span class="v ${last.fps && last.fps < 30 ? 'err' : last.fps && last.fps < 50 ? 'warn' : 'ok'}">${last.fps != null ? fmt(last.fps, 0) : '—'}</span><span class="l">FPS (设备)</span></div>
       <div class="stat"><span class="v">${avgFps != null ? fmt(avgFps, 1) : '—'}</span><span class="l">30s 均 FPS</span></div>
-      <div class="stat"><span class="v ${minFps && minFps < 24 ? 'err' : 'warn'}">${minFps != null ? fmt(minFps, 0) : '—'}</span><span class="l">最低 FPS</span></div>
-      <div class="stat"><span class="v ${last.gpu_util > 80 ? 'err' : last.gpu_util > 50 ? 'warn' : 'ok'}">${last.gpu_util != null ? fmt(last.gpu_util, 1) + '%' : '—'}</span><span class="l">GPU 利用率</span></div>
-      <div class="stat"><span class="v">${avgGpu != null ? fmt(avgGpu, 1) + '%' : '—'}</span><span class="l">30s GPU 均值</span></div>
+      <div class="stat"><span class="v ${minFps && minFps < 24 ? 'err' : 'warn'}">${minFps != null ? fmt(minFps, 0) : '—'}</span><span class="l">最低</span></div>
+      <div class="stat"><span class="v ${last.gpu_util > 80 ? 'err' : last.gpu_util > 50 ? 'warn' : 'ok'}">${last.gpu_util != null ? fmt(last.gpu_util, 1) + '%' : '—'}</span><span class="l">GPU 利用率 (设备)</span></div>
+      <div class="stat"><span class="v">${avgGpu != null ? fmt(avgGpu, 1) + '%' : '—'}</span><span class="l">30s 均值</span></div>
       <div class="stat"><span class="v">${peakGpu != null ? fmt(peakGpu, 1) + '%' : '—'}</span><span class="l">峰值</span></div>
     </div>
-    <div class="muted">最新: ${fmtTs(last.ts)} · ${recs.length} 条采样</div>
   `;
+  // 进程级 CPU 关联 (iOS DVT 不暴露 per-process GPU 拆分，
+  // 用 WebKit.GPU 进程 CPU% 作为 H5 GPU 占用代理)
+  if (soulCpu != null || wkGpuCpu != null || wkContentCpu != null) {
+    html += '<div class="muted" style="margin-top:8px">主进程关联 (per-process CPU 作为 GPU 归因代理):</div>';
+    html += '<div class="row">';
+    if (soulCpu != null)
+      html += `<div class="stat"><span class="v ${soulCpu > 60 ? 'warn' : 'ok'}">${fmt(soulCpu,1)}%</span><span class="l">Soul_New 主进程</span></div>`;
+    if (wkGpuCpu != null)
+      html += `<div class="stat"><span class="v ${wkGpuCpu > 20 ? 'warn' : 'ok'}">${fmt(wkGpuCpu,1)}%</span><span class="l">WebKit.GPU (H5)</span></div>`;
+    if (wkContentCpu != null)
+      html += `<div class="stat"><span class="v ${wkContentCpu > 20 ? 'warn' : 'ok'}">${fmt(wkContentCpu,1)}%</span><span class="l">WebKit.WebContent</span></div>`;
+    html += '</div>';
+  }
+  html += `<div class="muted">最新: ${fmtTs(last.ts)} · ${recs.length} 条 GPU 采样</div>`;
+  return html;
 }
 
 function renderNet(p) {
   if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
   const recs = p.dvt_network || [];
-  if (!recs.length) {
-    // 退化展示磁盘 IO（来自 dvt_process）
-    const procs = p.dvt_process || [];
-    if (procs.length >= 2) {
-      const first = procs[0]; const last = procs[procs.length - 1];
-      const dt = (last.ts - first.ts) || 1;
-      const readKB = ((last.diskBytesRead - first.diskBytesRead) / 1024 / dt).toFixed(1);
-      const writeKB = ((last.diskBytesWritten - first.diskBytesWritten) / 1024 / dt).toFixed(1);
-      return `
-        <div class="muted">无 dvt_network.jsonl，展示磁盘 I/O 替代 (来自 dvt_process)</div>
-        <div class="row">
-          <div class="stat"><span class="v">${readKB} KB/s</span><span class="l">磁盘读</span></div>
-          <div class="stat"><span class="v">${writeKB} KB/s</span><span class="l">磁盘写</span></div>
-          <div class="stat"><span class="v">${fmt(dt, 0)}s</span><span class="l">观察窗口</span></div>
-        </div>
-      `;
-    }
-    return '<span class="muted">无网络/磁盘数据</span>';
+  if (!recs.length) return '<span class="muted">无网络数据 — 启动 dvt_bridge 时加 --collect-network</span>';
+
+  // 分类
+  const ifaces = recs.filter(r => r.type === 'InterfaceDetectionEvent');
+  const conns = recs.filter(r => r.type === 'ConnectionDetectionEvent');
+  const updates = recs.filter(r => r.type === 'ConnectionUpdateEvent');
+
+  // 按 connection_serial 取每条连接的最新累计字节
+  const lastByConn = {};
+  for (const u of updates) {
+    const s = u.connection_serial;
+    if (s == null) continue;
+    if (!lastByConn[s] || u.ts > lastByConn[s].ts) lastByConn[s] = u;
   }
-  const last = recs[recs.length - 1];
-  return '<pre>' + escapeHtml(JSON.stringify(last, null, 2)) + '</pre>';
+  const activeConns = Object.values(lastByConn);
+
+  // 累计 rx/tx
+  const totalRx = activeConns.reduce((s,r)=> s + (r.rx_bytes||0), 0);
+  const totalTx = activeConns.reduce((s,r)=> s + (r.tx_bytes||0), 0);
+
+  // 30s 流量速率：取 30s 前 vs 最新的累计差
+  const now = updates.length ? updates[updates.length-1].ts : 0;
+  const oldUpdates = updates.filter(u => u.ts >= now - 30);
+  let rateRx = 0, rateTx = 0, dt = 0;
+  if (oldUpdates.length >= 2) {
+    const oldByConn = {};
+    for (const u of oldUpdates) {
+      const s = u.connection_serial;
+      if (!oldByConn[s] || u.ts < oldByConn[s].ts) oldByConn[s] = u;
+    }
+    let oldRx = 0, oldTx = 0;
+    for (const s of Object.keys(lastByConn)) {
+      if (oldByConn[s]) {
+        oldRx += oldByConn[s].rx_bytes || 0;
+        oldTx += oldByConn[s].tx_bytes || 0;
+      }
+    }
+    dt = (oldUpdates[oldUpdates.length-1].ts - oldUpdates[0].ts) || 1;
+    rateRx = (totalRx - oldRx) / dt;
+    rateTx = (totalTx - oldTx) / dt;
+  }
+
+  const fmtBytes = (b) => {
+    if (b < 1024) return `${b.toFixed(0)}B`;
+    if (b < 1024*1024) return `${(b/1024).toFixed(1)}KB`;
+    if (b < 1024*1024*1024) return `${(b/(1024*1024)).toFixed(1)}MB`;
+    return `${(b/(1024*1024*1024)).toFixed(2)}GB`;
+  };
+  const fmtRate = (bps) => bps > 0 ? `${fmtBytes(bps)}/s` : '0';
+
+  // Top 5 流量连接
+  const topConns = activeConns
+    .map(c => ({...c, total: (c.rx_bytes||0) + (c.tx_bytes||0)}))
+    .sort((a,b) => b.total - a.total)
+    .slice(0, 5);
+
+  let html = `
+    <div class="row">
+      <div class="stat"><span class="v">${activeConns.length}</span><span class="l">活跃连接</span></div>
+      <div class="stat"><span class="v">${ifaces.length}</span><span class="l">网卡事件</span></div>
+      <div class="stat"><span class="v">${conns.length}</span><span class="l">新建连接</span></div>
+      <div class="stat"><span class="v ${rateRx > 100*1024 ? 'warn' : ''}">${fmtRate(rateRx)}</span><span class="l">↓ 速率 (30s)</span></div>
+      <div class="stat"><span class="v ${rateTx > 100*1024 ? 'warn' : ''}">${fmtRate(rateTx)}</span><span class="l">↑ 速率 (30s)</span></div>
+      <div class="stat"><span class="v">${fmtBytes(totalRx + totalTx)}</span><span class="l">累计总流量</span></div>
+    </div>
+  `;
+  if (topConns.length) {
+    html += '<table style="margin-top:8px"><thead><tr><th>连接#</th><th>↓ Rx</th><th>↑ Tx</th><th>合计</th><th>包数 ↓/↑</th></tr></thead><tbody>';
+    for (const c of topConns) {
+      html += `<tr><td>${c.connection_serial}</td><td>${fmtBytes(c.rx_bytes||0)}</td><td>${fmtBytes(c.tx_bytes||0)}</td><td>${fmtBytes(c.total)}</td><td>${c.rx_packets||0} / ${c.tx_packets||0}</td></tr>`;
+    }
+    html += '</tbody></table>';
+  }
+  if (ifaces.length) {
+    const ifList = ifaces.map(i => `${i.name}(${i.interface_index})`).join(' · ');
+    html += `<div class="muted" style="margin-top:6px">网卡: ${escapeHtml(ifList)}</div>`;
+  }
+  return html;
 }
 
 function renderHotspots(p) {
