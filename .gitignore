@@ -12,3 +12,6 @@ test-project-new/
 dist/
 build/
 .venv/
+
+# perf 采集运行时数据 (jsonl/syslog/trace)，体积大且与 commit 无关
+.claude-parallel/
