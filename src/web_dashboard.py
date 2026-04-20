@@ -123,6 +123,10 @@ def collect_perf_state(repo: Optional[Path], coord_dir: str, tag: str, tail_n: i
     alerts_path = logs_dir / "alerts.log"
     state["alerts"] = _tail_text(alerts_path, 30)
 
+    # 异常监控守护输出 (cpar-anomaly-watch.py)
+    anomalies_path = logs_dir / "anomalies.jsonl"
+    state["anomalies"] = _tail_jsonl(anomalies_path, 50)
+
     # session meta
     meta_path = perf_root / "session.json"
     if meta_path.exists():
@@ -519,6 +523,7 @@ _HTML_PAGE = r"""<!doctype html>
       <div id="hotspots">—</div>
     </div>
     <div class="card" id="card-tasks" style="grid-column: 1 / -1;"><h2>任务列表</h2><div id="tasks">—</div></div>
+    <div class="card" id="card-anomalies" style="grid-column: 1 / -1;"><h2>异常监控 (cpar-anomaly-watch)</h2><div id="anomalies">—</div></div>
     <div class="card" id="card-alerts" style="grid-column: 1 / -1;"><h2>实时告警 (alerts.log)</h2><div id="alerts">—</div></div>
   </div>
 
@@ -839,10 +844,60 @@ function renderNet(p) {
   return html;
 }
 
+// 系统/Apple 库符号识别 (用于过滤热点)
+function isSystemSymbol(sym) {
+  if (!sym) return true;
+  // 未符号化地址
+  if (/^0x[0-9a-fA-F]+/.test(sym)) return true;
+  // C 运行时 / pthread / mach / libsystem
+  if (/^(_pthread_|pthread_|mach_|_mach_|__|_dispatch_|dispatch_|_kernelrpc_|kevent|select|accept|read|write|libsystem_)/.test(sym)) return true;
+  // libpas (Apple 高性能 malloc)
+  if (/^pas_/.test(sym)) return true;
+  // bmalloc (WebKit 内部 malloc)
+  if (/^bmalloc::/.test(sym)) return true;
+  // Objective-C runtime
+  if (/^(_)?objc_|^_objc_|^objc_msgSend/.test(sym)) return true;
+  // C++ STL
+  if (/^std::/.test(sym)) return true;
+  // Apple frameworks (NS/UI/CA/CG/CF/CT/AV...)
+  if (/^(NS|UI|CA|CG|CF|CT|AV|CL|CT|MK|SK|HM|SC|MP)[A-Z][a-zA-Z]/.test(sym)) return true;
+  // Apple OC 方法 -[NS...] -[UI...] +[NS...] 等
+  if (/^[+-]\[(NS|UI|CA|CG|CF|CT|AV|CL|MP|SK|HM|SC)[A-Z]/.test(sym)) return true;
+  // CoreAnimation C++ namespace
+  if (/^CA::/.test(sym)) return true;
+  // CoreFoundation/Graphics
+  if (/^(CGS|CGB|CFR|CFD|kCG)/.test(sym)) return true;
+  // WebKit 内部 (WebCore/JSC/WTF — 是 Apple 系统库的一部分, 业务无法直接改)
+  if (/^(WebCore|WebKit|JSC|WTF)::/.test(sym)) return true;
+  // AudioUnit / CoreAudio
+  if (/^(ausdk|CoreAudio|AudioToolbox|AVAudio|AVCapture)::/.test(sym)) return true;
+  // libcompiler_rt
+  if (/^(_platform_|_OSAtomic|_swift_)/.test(sym)) return true;
+  // Apple 私有
+  if (/^_(NSCF|CG|CA|CF|UI)[A-Z]/.test(sym)) return true;
+  return false;
+}
+
+// 业务/SDK 分类标签
+function symbolCategory(sym) {
+  if (/^realx::|^Realx::|^RX[A-Z]/.test(sym)) return { name: 'RealX SDK', color: '#7c3aed' };
+  if (/^(WebCore|WebKit|JSC)::/.test(sym)) return { name: 'WebKit', color: '#2563eb' };
+  if (/^CA::|^CG/.test(sym)) return { name: 'CoreAnimation', color: '#0891b2' };
+  if (/^ausdk::|AudioUnit|CoreAudio|AVAudio/.test(sym)) return { name: 'Audio', color: '#dc2626' };
+  if (/^(_pthread|^objc_|^_platform_|^mach_msg|^__|^pas_|^bmalloc::|^std::)/.test(sym)) return { name: 'Runtime', color: '#525252' };
+  if (/^0x[0-9a-fA-F]+/.test(sym)) return { name: 'Unsymbolicated', color: '#ca8a04' };
+  if (/^[+-]\[SO|^SO[A-Z]|Soul/.test(sym)) return { name: 'Soul 业务', color: '#16a34a' };
+  if (/^(tencent|agora|volc|bytedance|alibaba|ali|gaode|baidu|zego|netease)::/.test(sym)) return { name: '三方 SDK', color: '#7c3aed' };
+  return { name: '业务/其他', color: '#16a34a' };
+}
+
 function renderHotspots(p) {
   if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
   const recs = p.hotspots || [];
   if (!recs.length) return '<span class="muted">无热点数据 (hotspots.jsonl 缺失)</span>';
+
+  // 过滤模式 (持久化到 localStorage)
+  const filterMode = window._hotspotFilter || localStorage.getItem('hotspot_filter') || 'biz';
 
   // 多 cycle 聚合：每个函数收集所有 cycle 的占比
   // 函数缺席的 cycle 记 0（说明本 cycle 跌出 top）
@@ -860,7 +915,7 @@ function renderHotspots(p) {
     }
   }
   // 计算每个函数的平均、峰值、出现率
-  const ranked = Object.values(funcMap).map(f => {
+  const allRanked = Object.values(funcMap).map(f => {
     const vals = f.vals;
     const inCount = vals.filter(v => v > 0).length;
     const sum = vals.reduce((a,b)=>a+b, 0);
@@ -877,8 +932,27 @@ function renderHotspots(p) {
           - (vals.slice(0, Math.ceil(vals.length/3)).reduce((a,b)=>a+b,0) / Math.ceil(vals.length/3))
         : 0,
     };
-  }).sort((a, b) => b.avgAcrossAll - a.avgAcrossAll).slice(0, 12);
+  }).sort((a, b) => b.avgAcrossAll - a.avgAcrossAll);
 
+  // 过滤
+  let ranked, filteredOutSum = 0, filteredOutCount = 0;
+  if (filterMode === 'biz') {
+    const sysList = allRanked.filter(f => isSystemSymbol(f.sym));
+    filteredOutCount = sysList.length;
+    filteredOutSum = sysList.reduce((s,f) => s + f.avgAcrossAll, 0);
+    ranked = allRanked.filter(f => !isSystemSymbol(f.sym)).slice(0, 15);
+  } else if (filterMode === 'sys') {
+    ranked = allRanked.filter(f => isSystemSymbol(f.sym)).slice(0, 12);
+  } else {
+    ranked = allRanked.slice(0, 15);
+  }
+
+  if (!ranked.length && filterMode === 'biz') {
+    return `<div class="muted">当前过滤模式 [仅业务/SDK] 无匹配。
+      系统符号 ${filteredOutCount} 个 (合计 ${fmt(filteredOutSum,1)}%)。
+      <br>切换: <a class="loc-btn" onclick="setHotspotFilter('all')">全部</a>
+      <a class="loc-btn" onclick="setHotspotFilter('sys')">仅系统</a></div>`;
+  }
   if (!ranked.length) return '<span class="muted">所有 cycle 无热点条目</span>';
 
   // 计算总时间跨度
@@ -889,12 +963,22 @@ function renderHotspots(p) {
   // 全局最大 pct（用于柱状条比例）
   const globalMax = Math.max(...ranked.map(r => r.peak));
 
-  let html = `
+  // 过滤切换按钮
+  const filterBtns = `
+    <div style="margin-bottom:8px">
+      <span class="muted" style="font-size:11px">显示模式:</span>
+      <a class="loc-btn" style="${filterMode==='biz'?'background:#16a34a;color:#fff':''}" onclick="setHotspotFilter('biz')">仅业务/SDK</a>
+      <a class="loc-btn" style="${filterMode==='sys'?'background:#525252;color:#fff':''}" onclick="setHotspotFilter('sys')">仅系统</a>
+      <a class="loc-btn" style="${filterMode==='all'?'background:#4cc2ff;color:#000':''}" onclick="setHotspotFilter('all')">全部</a>
+      ${filterMode==='biz' && filteredOutCount>0 ? `<span class="muted" style="font-size:11px;margin-left:10px">(已过滤 ${filteredOutCount} 个系统符号, 合计 ${fmt(filteredOutSum,1)}%)</span>` : ''}
+    </div>
+  `;
+  let html = filterBtns + `
     <div class="row" style="margin-bottom:8px">
       <div class="stat"><span class="v">${cycleCount}</span><span class="l">cycle 数</span></div>
       <div class="stat"><span class="v">${fmt(span/60, 1)}min</span><span class="l">采集跨度</span></div>
       <div class="stat"><span class="v">${ranked.length}</span><span class="l">展示函数</span></div>
-      <div class="stat"><span class="v">${Object.keys(funcMap).length}</span><span class="l">unique 函数</span></div>
+      <div class="stat"><span class="v">${allRanked.length}</span><span class="l">unique 函数</span></div>
       <div class="stat"><span class="v">${fmt(globalMax, 1)}%</span><span class="l">最高峰值</span></div>
     </div>
     <style>
@@ -958,6 +1042,41 @@ function renderHotspots(p) {
   }
   html += '</tbody></table>';
   return html;
+}
+
+function renderAnomalies(p) {
+  if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
+  const recs = p.anomalies || [];
+  if (!recs.length) return '<span class="muted">无异常 ✓ (异常监控守护未运行 or 阈值未触发)</span>';
+  // 按 code 分组取最新
+  const byCode = {};
+  for (const r of recs) {
+    if (!byCode[r.code] || r.ts > byCode[r.code].ts) byCode[r.code] = r;
+  }
+  const items = Object.values(byCode).sort((a,b) => b.ts - a.ts);
+  // 统计
+  const counts = {critical: 0, warn: 0, info: 0};
+  for (const r of recs) counts[r.level] = (counts[r.level]||0)+1;
+  let html = `
+    <div class="row" style="margin-bottom:8px">
+      <div class="stat"><span class="v err">${counts.critical}</span><span class="l">🔴 严重</span></div>
+      <div class="stat"><span class="v warn">${counts.warn}</span><span class="l">🟡 警告</span></div>
+      <div class="stat"><span class="v">${counts.info||0}</span><span class="l">ℹ️ 信息</span></div>
+      <div class="stat"><span class="v">${items.length}</span><span class="l">unique 类型</span></div>
+      <div class="stat"><span class="v">${recs.length}</span><span class="l">总告警次数</span></div>
+    </div>
+    <table><thead><tr><th>级别</th><th>code</th><th>消息</th><th>时间</th></tr></thead><tbody>`;
+  for (const r of items.slice(0, 30)) {
+    const icon = r.level === 'critical' ? '🔴' : (r.level === 'warn' ? '🟡' : 'ℹ️');
+    const cls = r.level === 'critical' ? 'err' : (r.level === 'warn' ? 'warn' : '');
+    html += `<tr class="${cls}">
+      <td>${icon}</td>
+      <td><code style="font-size:11px">${escapeHtml(r.code)}</code></td>
+      <td>${escapeHtml(r.msg)}</td>
+      <td class="muted" style="font-size:11px">${fmtTs(r.ts)}</td>
+    </tr>`;
+  }
+  return html + '</tbody></table>';
 }
 
 function renderAlerts(p) {
@@ -1091,6 +1210,13 @@ function showLocateModal(sym, data) {
   modal.style.display = 'block';
 }
 
+function setHotspotFilter(mode) {
+  window._hotspotFilter = mode;
+  try { localStorage.setItem('hotspot_filter', mode); } catch (e) {}
+  // 立刻刷一次
+  tick();
+}
+
 function closeLocateModal() {
   const modal = document.getElementById('locate-modal');
   if (modal) modal.style.display = 'none';
@@ -1188,6 +1314,7 @@ async function tick() {
     document.getElementById('hotspots').innerHTML = renderHotspots(s.perf);
     document.getElementById('gpu').innerHTML = renderGpu(s.perf);
     document.getElementById('net').innerHTML = renderNet(s.perf);
+    document.getElementById('anomalies').innerHTML = renderAnomalies(s.perf);
     document.getElementById('alerts').innerHTML = renderAlerts(s.perf);
   } catch (e) {
     hb.style.background = '#f87171';
