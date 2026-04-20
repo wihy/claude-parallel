@@ -101,9 +101,9 @@ def collect_perf_state(repo: Optional[Path], coord_dir: str, tag: str, tail_n: i
     metrics_path = logs_dir / "metrics.jsonl"
     state["metrics"] = _tail_jsonl(metrics_path, tail_n)
 
-    # 采样热点
+    # 采样热点（多 cycle 趋势分析需要更长历史）
     hotspots_path = logs_dir / "hotspots.jsonl"
-    state["hotspots"] = _tail_jsonl(hotspots_path, 5)
+    state["hotspots"] = _tail_jsonl(hotspots_path, max(tail_n, 50))
 
     # DVT 进程指标 — 实际文件在 logs/dvt/ 子目录；兼容旧路径
     # network 事件流频率高 (每连接每秒一条 update)，单独给更大窗口
@@ -386,14 +386,28 @@ function renderBattery(p) {
   const first = recs[0];
   const drain = (first.level_pct != null && last.level_pct != null) ? (first.level_pct - last.level_pct) : null;
   const window = (first.ts && last.ts) ? Math.round(last.ts - first.ts) : 0;
+  // 折算耗电速率 %/min
+  const drainRate = (drain != null && window > 0) ? (drain * 60 / window) : null;
+
+  // sparkline 数据
+  const levels = recs.map(r => r.level_pct).filter(v => v != null);
+  // 颜色: 充电=绿，放电=黄/红
+  const sparkColor = last.is_charging ? '#4ade80' : (drainRate > 0.5 ? '#f87171' : '#fbbf24');
+  const sparkSvg = sparkline(levels, {w: 260, h: 36, stroke: sparkColor});
+
   return `
     <div class="row">
       <div class="stat"><span class="v">${last.level_pct ?? '—'}%</span><span class="l">当前电量</span></div>
-      <div class="stat"><span class="v ${drain && drain > 0 ? 'err' : 'ok'}">${drain != null ? (drain > 0 ? '-' : '+') + Math.abs(drain) : '—'}%</span><span class="l">变化 (${window}s)</span></div>
+      <div class="stat"><span class="v ${drain && drain > 0 ? 'err' : 'ok'}">${drain != null ? (drain > 0 ? '-' : '+') + Math.abs(drain) : '—'}%</span><span class="l">总变化</span></div>
+      <div class="stat"><span class="v ${drainRate != null && drainRate > 0.3 ? 'warn' : 'ok'}">${drainRate != null ? fmt(drainRate, 2) + '/min' : '—'}</span><span class="l">耗电速率</span></div>
       <div class="stat"><span class="v">${last.is_charging ? '充电中' : '放电中'}</span><span class="l">状态</span></div>
-      <div class="stat"><span class="v">${recs.length}</span><span class="l">采样数</span></div>
+      <div class="stat"><span class="v">${recs.length}</span><span class="l">采样</span></div>
     </div>
-    <div class="muted">最新: ${fmtTs(last.ts)} · session=${p.tag || '?'}</div>
+    <div style="margin-top:10px;padding:6px;background:#0a0c10;border-radius:4px">
+      <div class="muted" style="font-size:10px;margin-bottom:2px">电量曲线 · 窗口 ${fmt(window/60, 1)} 分钟</div>
+      ${sparkSvg}
+    </div>
+    <div class="muted">最新: ${fmtTs(last.ts)} · ${last.fully_charged ? '已充满' : ''}</div>
   `;
 }
 
@@ -626,17 +640,74 @@ function renderHotspots(p) {
   if (!p || !p.enabled) return '<span class="muted">未启用 perf 采集</span>';
   const recs = p.hotspots || [];
   if (!recs.length) return '<span class="muted">无热点数据 (hotspots.jsonl 缺失)</span>';
-  // 取最新一条快照中的 top
-  const latest = recs[recs.length - 1];
-  const top = (latest.top || latest.functions || []).slice(0, 8);
-  if (!top.length) return '<span class="muted">最新快照无热点条目</span>';
-  let html = '<table><thead><tr><th>占比</th><th>函数</th></tr></thead><tbody>';
-  for (const h of top) {
-    const pct = h.percentage ?? h.pct ?? h.weight ?? null;
-    const sym = h.symbol ?? h.name ?? h.function ?? '?';
-    html += `<tr><td>${pct != null ? fmt(pct, 1) + '%' : '—'}</td><td>${escapeHtml(sym)}</td></tr>`;
+
+  // 多 cycle 聚合：每个函数收集所有 cycle 的占比
+  // 函数缺席的 cycle 记 0（说明本 cycle 跌出 top）
+  const cycleCount = recs.length;
+  const funcMap = {};
+  for (const cycle of recs) {
+    const top = cycle.top || cycle.functions || [];
+    const seenInCycle = new Set();
+    for (const h of top) {
+      const sym = (h.symbol ?? h.name ?? h.function ?? '?').slice(0, 90);
+      const pct = h.percentage ?? h.pct ?? h.weight ?? 0;
+      if (!funcMap[sym]) funcMap[sym] = { sym, vals: new Array(cycleCount).fill(0), cyclesIn: 0 };
+      seenInCycle.add(sym);
+      funcMap[sym].vals[recs.indexOf(cycle)] = pct;
+    }
   }
-  return html + '</tbody></table>';
+  // 计算每个函数的平均、峰值、出现率
+  const ranked = Object.values(funcMap).map(f => {
+    const vals = f.vals;
+    const inCount = vals.filter(v => v > 0).length;
+    const sum = vals.reduce((a,b)=>a+b, 0);
+    const avgAcrossAll = sum / cycleCount;     // 跨所有 cycle 的均值（0 算入）
+    const avgWhenIn = inCount ? sum / inCount : 0;  // 仅出现的 cycle 内均值
+    const peak = Math.max(...vals);
+    const last = vals[vals.length - 1];
+    return {
+      sym: f.sym, vals, inCount, peak, last,
+      avgAcrossAll, avgWhenIn,
+      // 趋势：最后 1/3 cycle 均值 vs 最早 1/3
+      trend: vals.length >= 3
+        ? (vals.slice(-Math.ceil(vals.length/3)).reduce((a,b)=>a+b,0) / Math.ceil(vals.length/3))
+          - (vals.slice(0, Math.ceil(vals.length/3)).reduce((a,b)=>a+b,0) / Math.ceil(vals.length/3))
+        : 0,
+    };
+  }).sort((a, b) => b.avgAcrossAll - a.avgAcrossAll).slice(0, 12);
+
+  if (!ranked.length) return '<span class="muted">所有 cycle 无热点条目</span>';
+
+  // 计算总时间跨度
+  const tFirst = recs[0].ts || 0;
+  const tLast = recs[recs.length - 1].ts || 0;
+  const span = tLast - tFirst;
+
+  // 全局最大 pct（用于柱状条比例）
+  const globalMax = Math.max(...ranked.map(r => r.peak));
+
+  let html = `
+    <div class="muted" style="margin-bottom:6px">
+      聚合 ${cycleCount} 个 cycle (跨度 ${fmt(span/60, 1)} 分钟) · 按平均占比排序
+    </div>
+  `;
+  html += '<table><thead><tr><th style="width:40px">均%</th><th style="width:36px">峰</th><th>函数</th><th style="width:130px">趋势 (各 cycle)</th><th style="width:30px">趋</th></tr></thead><tbody>';
+  for (const f of ranked) {
+    // 趋势 sparkline: 各 cycle 占比变化
+    const trendColor = f.trend > 1 ? '#f87171' : (f.trend < -1 ? '#4ade80' : '#4cc2ff');
+    const spark = sparkline(f.vals, {w: 120, h: 18, stroke: trendColor, min: 0, max: globalMax});
+    const trendIcon = f.trend > 1 ? '↑' : (f.trend < -1 ? '↓' : '→');
+    const trendCls = f.trend > 1 ? 'err' : (f.trend < -1 ? 'ok' : 'muted');
+    html += `<tr>
+      <td><b>${fmt(f.avgAcrossAll, 1)}</b></td>
+      <td>${fmt(f.peak, 1)}</td>
+      <td style="font-family:Menlo,monospace;font-size:11px">${escapeHtml(f.sym)}<br><span class="muted" style="font-size:10px">出现 ${f.inCount}/${cycleCount} cyc · 在场均 ${fmt(f.avgWhenIn,1)}%</span></td>
+      <td>${spark}</td>
+      <td><span class="${trendCls}">${trendIcon} ${f.trend >= 0 ? '+' : ''}${fmt(f.trend, 1)}</span></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
 }
 
 function renderAlerts(p) {
@@ -644,6 +715,48 @@ function renderAlerts(p) {
   const lines = p.alerts || [];
   if (!lines.length) return '<span class="muted">无告警</span>';
   return '<pre>' + escapeHtml(lines.slice(-30).join('\n')) + '</pre>';
+}
+
+// SVG sparkline — 极简折线图
+function sparkline(values, opts) {
+  opts = opts || {};
+  const w = opts.w || 120, h = opts.h || 28;
+  const stroke = opts.stroke || '#4cc2ff';
+  const fill = opts.fill || 'none';
+  const showDot = opts.showDot !== false;
+  const baseline = opts.baseline;  // 可选基线值，画虚线
+  if (!values || values.length === 0) return '';
+  const vs = values.filter(v => v != null && !isNaN(v));
+  if (!vs.length) return '';
+  const min = opts.min != null ? opts.min : Math.min(...vs);
+  const max = opts.max != null ? opts.max : Math.max(...vs);
+  const range = (max - min) || 1;
+  const step = vs.length > 1 ? w / (vs.length - 1) : 0;
+  const pts = vs.map((v, i) => `${(i*step).toFixed(1)},${(h - ((v - min) / range) * (h - 4) - 2).toFixed(1)}`);
+  const polyline = `<polyline fill="${fill}" stroke="${stroke}" stroke-width="1.5" points="${pts.join(' ')}"/>`;
+  let dot = '';
+  if (showDot && pts.length) {
+    const last = pts[pts.length - 1].split(',');
+    dot = `<circle cx="${last[0]}" cy="${last[1]}" r="2.5" fill="${stroke}"/>`;
+  }
+  let baseLine = '';
+  if (baseline != null && baseline >= min && baseline <= max) {
+    const y = (h - ((baseline - min) / range) * (h - 4) - 2).toFixed(1);
+    baseLine = `<line x1="0" y1="${y}" x2="${w}" y2="${y}" stroke="#444" stroke-dasharray="2,2"/>`;
+  }
+  return `<svg width="${w}" height="${h}" style="vertical-align:middle;display:inline-block">
+    ${baseLine}${polyline}${dot}
+  </svg>`;
+}
+
+// SVG 横向柱状条 (单值)
+function bar(value, max, w, color) {
+  w = w || 80;
+  const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0;
+  const c = color || '#4cc2ff';
+  return `<span style="display:inline-block;width:${w}px;height:6px;background:#262a33;border-radius:3px;vertical-align:middle">
+    <span style="display:block;width:${pct.toFixed(1)}%;height:100%;background:${c};border-radius:3px"></span>
+  </span>`;
 }
 
 function escapeHtml(s) {
