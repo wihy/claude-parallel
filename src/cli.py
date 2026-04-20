@@ -171,12 +171,24 @@ def cmd_dashboard(args):
         print(f"  [dashboard] 提示: 先用 'cpar perf start --tag {args.tag}' 启动采集")
         sys.exit(1)
 
+    # 解析 --source NAME=PATH 列表
+    sources_dict = {}
+    for spec in (getattr(args, "source", None) or []):
+        if "=" in spec:
+            name, path = spec.split("=", 1)
+            sources_dict[name.strip()] = path.strip()
+        else:
+            # 没有 NAME，用路径最后一段
+            p = Path(spec).expanduser()
+            sources_dict[p.name or "default"] = str(p)
+
     srv = DashboardServer(
         port=args.port,
         host=args.host,
         orch_provider=lambda: {"enabled": False},
         perf_provider=lambda: collect_perf_state(repo, coord_dir, args.tag),
         title=f"cpar Dashboard — perf:{args.tag}",
+        sources=sources_dict,
     )
     try:
         url = srv.start()
@@ -187,6 +199,8 @@ def cmd_dashboard(args):
     print(f"  ║  Web Dashboard 已启动                                ║")
     print(f"  ║  URL: {url:<48}║")
     print(f"  ║  Perf 会话: {args.tag:<42}║")
+    if srv.sources:
+        print(f"  ║  源码定位: {len(srv.sources)} 个 repo: {', '.join(srv.sources.keys())[:38]:<38}║")
     print(f"  ║  Ctrl+C 退出                                         ║")
     print(f"  ╚══════════════════════════════════════════════════════╝\n")
 
@@ -1817,6 +1831,8 @@ def main():
     dash_parser.add_argument("--port", type=int, default=8765, help="HTTP 端口 (默认 8765)")
     dash_parser.add_argument("--host", default="127.0.0.1", help="监听地址 (默认 127.0.0.1)")
     dash_parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
+    dash_parser.add_argument("--source", action="append", default=[],
+                             help="源码仓库 NAME=PATH，可重复指定 (如: --source soul=~/SoulApp --source pods=~/Pods)")
 
     # ── perf ──
     perf_parser = subparsers.add_parser("perf", help="真机性能采集与报告")

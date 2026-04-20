@@ -192,12 +192,17 @@ class DashboardServer:
         orch_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         perf_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         title: str = "cpar Dashboard",
+        sources: Optional[Dict[str, str]] = None,
     ):
         self.port = port
         self.host = host
         self.orch_provider = orch_provider or (lambda: {"enabled": False})
         self.perf_provider = perf_provider or (lambda: {"enabled": False})
         self.title = title
+        # 源码定位: name → 仓库路径
+        self.sources = {k: str(Path(v).expanduser().resolve())
+                        for k, v in (sources or {}).items()
+                        if v and Path(v).expanduser().exists()}
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -232,15 +237,23 @@ class DashboardServer:
 
             def do_GET(self):  # noqa: N802
                 if self.path == "/" or self.path == "/index.html":
-                    self._respond(200, "text/html; charset=utf-8", _HTML_PAGE.replace("__TITLE__", outer.title))
+                    html = _HTML_PAGE.replace("__TITLE__", outer.title)
+                    # 注入 sources 列表给前端用
+                    src_js = json.dumps(list(outer.sources.keys()))
+                    html = html.replace("__SOURCES__", src_js)
+                    self._respond(200, "text/html; charset=utf-8", html)
                 elif self.path.startswith("/api/state"):
                     state = {
                         "ts": int(time.time()),
                         "title": outer.title,
+                        "sources": list(outer.sources.keys()),
                         "orchestrator": _safe_call(outer.orch_provider),
                         "perf": _safe_call(outer.perf_provider),
                     }
                     self._respond(200, "application/json", json.dumps(state, ensure_ascii=False))
+                elif self.path.startswith("/api/locate"):
+                    result = locate_in_sources(outer.sources, self.path)
+                    self._respond(200, "application/json", json.dumps(result, ensure_ascii=False))
                 else:
                     self._respond(404, "text/plain", "not found")
 
@@ -254,6 +267,169 @@ class DashboardServer:
                 self.wfile.write(payload)
 
         return _Handler
+
+
+def locate_in_sources(sources: Dict[str, str], path: str) -> Dict[str, Any]:
+    """处理 /api/locate?sym=X&max=15&context=2&types=swift,m,h"""
+    import subprocess
+    import shutil
+    from urllib.parse import urlparse, parse_qs
+
+    qs = parse_qs(urlparse(path).query)
+    sym = (qs.get("sym", [""])[0] or "").strip()
+    if not sym:
+        return {"error": "missing sym parameter"}
+
+    if not sources:
+        return {"error": "no source repos configured", "matches": []}
+
+    rg_path = shutil.which("rg")
+    if not rg_path:
+        return {"error": "ripgrep (rg) not found in PATH", "matches": []}
+
+    max_total = int(qs.get("max", ["20"])[0])
+    context = int(qs.get("context", ["1"])[0])
+    types_filter = qs.get("types", [""])[0]
+
+    # 智能查询: 函数全名通常含模板参数和 namespace, 需要变体
+    # 1) 原样
+    # 2) 去掉模板参数（< > 之间）
+    # 3) 只取最后一个 ::xxx 部分
+    queries = [sym]
+    cleaned = sym
+    while "<" in cleaned and ">" in cleaned:
+        # 移除最外层模板
+        depth = 0
+        out = []
+        for c in cleaned:
+            if c == "<":
+                depth += 1
+                continue
+            if c == ">":
+                depth -= 1
+                continue
+            if depth == 0:
+                out.append(c)
+        cleaned2 = "".join(out)
+        if cleaned2 == cleaned:
+            break
+        cleaned = cleaned2
+    if cleaned != sym:
+        queries.append(cleaned)
+    # 取函数本名
+    if "::" in cleaned:
+        short = cleaned.split("::")[-1].split("(")[0].strip()
+        if short and short != cleaned:
+            queries.append(short)
+    elif "(" in cleaned:
+        short = cleaned.split("(")[0].strip()
+        if short and short != cleaned:
+            queries.append(short)
+
+    matches_by_repo: Dict[str, Any] = {}
+    queries_used = []
+
+    for query in queries:
+        if not query or len(query) < 3:
+            continue
+        # 转义 ripgrep 正则特殊字符
+        escaped = "".join(["\\" + c if c in r".+*?^$()[]{}|\/" else c for c in query])
+        for repo_name, repo_path in sources.items():
+            if matches_by_repo.get(repo_name, {}).get("count", 0) >= max_total:
+                continue
+            cmd = [
+                rg_path, "--no-config", "--no-heading", "-n", "--color=never",
+                "--max-count=10",
+                "-C", str(context),
+                "-S",  # smart-case
+                escaped, repo_path,
+            ]
+            if types_filter:
+                for t in types_filter.split(","):
+                    if t.strip():
+                        cmd[6:6] = ["-t", t.strip()]
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                matches_by_repo.setdefault(repo_name, {"matches": [], "count": 0})
+                matches_by_repo[repo_name]["timeout"] = True
+                continue
+            except Exception as e:
+                matches_by_repo.setdefault(repo_name, {"matches": [], "count": 0})
+                matches_by_repo[repo_name]["error"] = str(e)
+                continue
+
+            if proc.returncode not in (0, 1):  # 0=有匹配, 1=无匹配, 其他=错
+                continue
+
+            entry = matches_by_repo.setdefault(repo_name, {"matches": [], "count": 0, "path": repo_path})
+            for line in proc.stdout.splitlines():
+                if entry["count"] >= max_total:
+                    break
+                # rg 输出格式: file:line:content (匹配行) 或 file-line-content (上下文)
+                # 简化: 第一段拆 file 与剩余
+                m = _parse_rg_line(line, repo_path)
+                if m:
+                    # 去重: 同一文件:行号只保留首条
+                    key = (m["file"], m["line"])
+                    if not any((mm["file"], mm["line"]) == key for mm in entry["matches"]):
+                        entry["matches"].append(m)
+                        if m.get("matched"):
+                            entry["count"] += 1
+        queries_used.append(query)
+
+    # 整理输出
+    total = sum(r.get("count", 0) for r in matches_by_repo.values())
+    return {
+        "sym": sym,
+        "queries_tried": queries_used,
+        "total_matches": total,
+        "repos": matches_by_repo,
+    }
+
+
+def _parse_rg_line(line: str, repo_path: str):
+    """解析 rg 行输出。文件路径相对 repo 根目录。"""
+    # 匹配行: file:LINE:content
+    # 上下文: file-LINE-content
+    # 区分: 找到第一个 ':' 后再找 ':' 或 '-'
+    m_file_end = line.find(":")
+    if m_file_end <= 0:
+        return None
+    file_full = line[:m_file_end]
+    rest = line[m_file_end + 1:]
+    # 兼容上下文: 用 - 分割
+    sep = ":" if rest and rest[0].isdigit() and ":" in rest else None
+    matched = True
+    if not sep:
+        # 试 -  上下文
+        m2 = rest.find("-")
+        if m2 > 0 and rest[:m2].isdigit():
+            line_no = int(rest[:m2])
+            content = rest[m2 + 1:]
+            matched = False
+        else:
+            # 解析失败，整行当 content
+            return None
+    else:
+        idx = rest.find(":")
+        if idx <= 0 or not rest[:idx].isdigit():
+            return None
+        line_no = int(rest[:idx])
+        content = rest[idx + 1:]
+
+    rel = file_full
+    if file_full.startswith(repo_path):
+        rel = file_full[len(repo_path):].lstrip("/")
+    return {
+        "file": rel,
+        "line": line_no,
+        "content": content[:200],
+        "matched": matched,
+        "abs_path": file_full,
+    }
 
 
 def _safe_call(fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
@@ -314,6 +490,17 @@ _HTML_PAGE = r"""<!doctype html>
   .muted { color: var(--muted); }
   .spark { display: inline-block; }
   footer { color: var(--muted); font-size: 11px; margin-top: 14px; text-align: center; }
+  /* locate modal */
+  #locate-modal { position: fixed; inset: 0; z-index: 9999; display: none; }
+  #locate-modal-bg { position: absolute; inset: 0; background: rgba(0,0,0,0.7); }
+  #locate-modal-content {
+    position: relative; max-width: 90vw; width: 1100px; max-height: 80vh;
+    margin: 5vh auto; background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; padding: 16px;
+    overflow: auto; box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+  }
+  #locate-modal-content table { font-size: 12px; }
+  #locate-modal-content tr.muted td { opacity: 0.6; }
 </style>
 </head>
 <body>
@@ -338,6 +525,9 @@ _HTML_PAGE = r"""<!doctype html>
   <footer>cpar Web Dashboard · 数据来源: Orchestrator + perf JSONL</footer>
 
 <script>
+// 注入：dashboard 启动时配置的源码仓库列表
+window._sources = __SOURCES__;
+
 const fmt = (n, d=2) => (n == null ? "—" : Number(n).toFixed(d));
 const fmtTs = (ts) => ts ? new Date(ts*1000).toLocaleTimeString() : "—";
 
@@ -824,6 +1014,10 @@ function renderLocators(sym) {
   let html = ` <span class="locators">`;
   // 复制按钮
   html += `<a class="loc-btn" title="复制函数名" onclick="copyText('${escapeAttr(sym)}', this); return false">📋</a>`;
+  // 本地源码搜索（只在配置了 sources 时显示）
+  if (window._sources && window._sources.length) {
+    html += `<a class="loc-btn" title="在源码搜索: ${window._sources.join(', ')}" onclick="searchSource('${escapeAttr(sym)}', this); return false">🔎</a>`;
+  }
   // 跳转按钮
   for (const l of links) {
     if (l.url === '#') {
@@ -833,6 +1027,73 @@ function renderLocators(sym) {
     }
   }
   return html + '</span>';
+}
+
+// 调用 /api/locate 在本地源码仓库搜函数定义/调用
+async function searchSource(sym, btn) {
+  if (btn) {
+    btn.innerHTML = '⏳';
+    btn.style.pointerEvents = 'none';
+  }
+  try {
+    const url = `/api/locate?sym=${encodeURIComponent(sym)}&max=15&context=2`;
+    const r = await fetch(url);
+    const data = await r.json();
+    showLocateModal(sym, data);
+  } catch (e) {
+    alert('搜索失败: ' + e.message);
+  } finally {
+    if (btn) {
+      btn.innerHTML = '🔎';
+      btn.style.pointerEvents = '';
+    }
+  }
+}
+
+function showLocateModal(sym, data) {
+  let modal = document.getElementById('locate-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'locate-modal';
+    modal.innerHTML = `
+      <div id="locate-modal-bg" onclick="closeLocateModal()"></div>
+      <div id="locate-modal-content"></div>
+    `;
+    document.body.appendChild(modal);
+  }
+  const cnt = document.getElementById('locate-modal-content');
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <div><b style="font-size:14px">源码搜索结果</b> <span class="muted" style="font-size:11px">${escapeHtml(sym)}</span></div>
+    <a class="loc-btn" onclick="closeLocateModal()" style="font-size:14px">✕</a>
+  </div>`;
+  if (data.error) {
+    html += `<div class="err">错误: ${escapeHtml(data.error)}</div>`;
+  } else if (data.total_matches === 0) {
+    html += `<div class="muted">未找到匹配。已尝试查询: <code>${(data.queries_tried||[]).map(escapeHtml).join(', ')}</code></div>`;
+  } else {
+    html += `<div class="muted" style="margin-bottom:8px">共 ${data.total_matches} 个匹配，已尝试 ${data.queries_tried.length} 个查询变体</div>`;
+    for (const [repo, info] of Object.entries(data.repos || {})) {
+      if (!info.matches || !info.matches.length) continue;
+      html += `<div style="margin-top:10px"><b style="color:#4cc2ff">${escapeHtml(repo)}</b> <span class="muted" style="font-size:11px">(${info.count} matches in ${escapeHtml(info.path||'')})</span></div>`;
+      html += '<table style="margin-top:4px;width:100%"><thead><tr><th>文件</th><th style="width:60px">行</th><th>内容</th></tr></thead><tbody>';
+      for (const m of info.matches) {
+        const cls = m.matched ? '' : 'muted';
+        html += `<tr class="${cls}">
+          <td style="font-family:Menlo,monospace;font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis" title="${escapeAttr(m.abs_path||'')}">${escapeHtml(m.file)} <a class="loc-btn" title="复制路径" onclick="copyText('${escapeAttr(m.abs_path)}', this); event.stopPropagation(); return false">📋</a></td>
+          <td>${m.line}</td>
+          <td style="font-family:Menlo,monospace;font-size:11px;color:#c8cdd6">${escapeHtml(m.content)}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+    }
+  }
+  cnt.innerHTML = html;
+  modal.style.display = 'block';
+}
+
+function closeLocateModal() {
+  const modal = document.getElementById('locate-modal');
+  if (modal) modal.style.display = 'none';
 }
 
 function escapeAttr(s) {
