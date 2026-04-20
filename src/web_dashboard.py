@@ -844,6 +844,26 @@ function renderNet(p) {
   return html;
 }
 
+// 采样工具自身开销识别 (xctrace Time Profiler 的符号化/unwind 副作用)
+// 这些函数的 CPU 时间不是业务真实负载，常因业务无 dSYM 而被放大到 30-60%
+function isSamplingOverhead(sym) {
+  if (!sym) return false;
+  // dyld 符号化兜底 (业务无 dSYM 时的主要伪热点)
+  if (/^dyld\d?::/.test(sym)) return true;
+  if (/findClosestSymbol|symbolForAddress/.test(sym)) return true;
+  // atos / dladdr / dlsym (运行时符号查找)
+  if (/^_?(dladdr|dlsym|dlclose|dlopen|atos)/.test(sym)) return true;
+  // libunwind (栈展开)
+  if (/^(unw_|_Unwind_|libunwind)/.test(sym)) return true;
+  // backtrace 系列
+  if (/^backtrace_?(symbols|fd|create_state)/.test(sym)) return true;
+  // Swift demangle (符号化时的子调用)
+  if (/^(_)?swift_demangle/.test(sym)) return true;
+  // _dyld_get_image_* / dyld 加载相关
+  if (/^_?dyld_(get_image|register|process)/.test(sym)) return true;
+  return false;
+}
+
 // 系统/Apple 库符号识别 (用于过滤热点)
 function isSystemSymbol(sym) {
   if (!sym) return true;
@@ -934,17 +954,23 @@ function renderHotspots(p) {
     };
   }).sort((a, b) => b.avgAcrossAll - a.avgAcrossAll);
 
+  // 先剥离采样开销 (无论哪个模式都单独显示，不计入业务/系统排名)
+  const overheadList = allRanked.filter(f => isSamplingOverhead(f.sym));
+  const overheadSum = overheadList.reduce((s,f) => s + f.avgAcrossAll, 0);
+  const overheadCount = overheadList.length;
+  const nonOverhead = allRanked.filter(f => !isSamplingOverhead(f.sym));
+
   // 过滤
   let ranked, filteredOutSum = 0, filteredOutCount = 0;
   if (filterMode === 'biz') {
-    const sysList = allRanked.filter(f => isSystemSymbol(f.sym));
+    const sysList = nonOverhead.filter(f => isSystemSymbol(f.sym));
     filteredOutCount = sysList.length;
     filteredOutSum = sysList.reduce((s,f) => s + f.avgAcrossAll, 0);
-    ranked = allRanked.filter(f => !isSystemSymbol(f.sym)).slice(0, 15);
+    ranked = nonOverhead.filter(f => !isSystemSymbol(f.sym)).slice(0, 15);
   } else if (filterMode === 'sys') {
-    ranked = allRanked.filter(f => isSystemSymbol(f.sym)).slice(0, 12);
+    ranked = nonOverhead.filter(f => isSystemSymbol(f.sym)).slice(0, 12);
   } else {
-    ranked = allRanked.slice(0, 15);
+    ranked = nonOverhead.slice(0, 15);
   }
 
   if (!ranked.length && filterMode === 'biz') {
@@ -963,17 +989,40 @@ function renderHotspots(p) {
   // 全局最大 pct（用于柱状条比例）
   const globalMax = Math.max(...ranked.map(r => r.peak));
 
+  // 采样工具自身开销警告 (xctrace 符号化兜底)
+  let overheadBanner = '';
+  if (overheadCount > 0) {
+    const isHigh = overheadSum > 20;
+    const bgColor = isHigh ? '#7f1d1d' : '#3f3f46';  // 高占比红, 一般灰
+    overheadBanner = `
+      <div style="background:${bgColor}; color:#fef2f2; padding:8px 12px; border-radius:6px;
+                  margin-bottom:10px; font-size:12px; line-height:1.5">
+        <b>⚠ 采样工具自身开销: ${fmt(overheadSum, 1)}%</b> (${overheadCount} 个 dyld/atos/unwind 函数, 已剔除排名)
+        ${isHigh ? `<br><span style="opacity:0.85">这通常意味着<b>业务函数缺 dSYM</b> — xctrace 在做地址兜底符号化, 真实业务热点不可见。
+          <br>解决: 提供 Soul_New.app.dSYM 或开启 LinkMap 后做地址映射。</span>` : ''}
+        <details style="margin-top:6px">
+          <summary style="cursor:pointer; opacity:0.8; font-size:11px">展开采样开销函数列表</summary>
+          <table style="margin-top:6px"><thead><tr><th>占比</th><th>函数</th><th>cycle</th></tr></thead><tbody>
+          ${overheadList.slice(0,8).map(f => `
+            <tr><td>${fmt(f.avgAcrossAll,1)}%</td><td style="font-family:Menlo;font-size:11px">${escapeHtml(f.sym)}</td><td>${f.inCount}/${cycleCount}</td></tr>
+          `).join('')}
+          </tbody></table>
+        </details>
+      </div>
+    `;
+  }
+
   // 过滤切换按钮
   const filterBtns = `
     <div style="margin-bottom:8px">
       <span class="muted" style="font-size:11px">显示模式:</span>
       <a class="loc-btn" style="${filterMode==='biz'?'background:#16a34a;color:#fff':''}" onclick="setHotspotFilter('biz')">仅业务/SDK</a>
       <a class="loc-btn" style="${filterMode==='sys'?'background:#525252;color:#fff':''}" onclick="setHotspotFilter('sys')">仅系统</a>
-      <a class="loc-btn" style="${filterMode==='all'?'background:#4cc2ff;color:#000':''}" onclick="setHotspotFilter('all')">全部</a>
+      <a class="loc-btn" style="${filterMode==='all'?'background:#4cc2ff;color:#000':''}" onclick="setHotspotFilter('all')">全部 (排除采样开销)</a>
       ${filterMode==='biz' && filteredOutCount>0 ? `<span class="muted" style="font-size:11px;margin-left:10px">(已过滤 ${filteredOutCount} 个系统符号, 合计 ${fmt(filteredOutSum,1)}%)</span>` : ''}
     </div>
   `;
-  let html = filterBtns + `
+  let html = overheadBanner + filterBtns + `
     <div class="row" style="margin-bottom:8px">
       <div class="stat"><span class="v">${cycleCount}</span><span class="l">cycle 数</span></div>
       <div class="stat"><span class="v">${fmt(span/60, 1)}min</span><span class="l">采集跨度</span></div>
