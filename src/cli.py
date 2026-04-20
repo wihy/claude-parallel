@@ -1144,6 +1144,151 @@ def _ensure_tunneld_for_perf(args):
         print(f"  → 手动启动: cpar perf tunneld start")
 
 
+def cmd_perf_linkmap(args):
+    """LinkMap 解析与符号查询，转发到 src.perf.linkmap.main()"""
+    from src.perf.linkmap import LinkMap, MultiLinkMap, find_linkmaps, CACHE_DIR
+    from datetime import datetime
+    import json as _json
+    import time as _time
+
+    action = getattr(args, "lm_action", "find")
+    sub_args = getattr(args, "lm_args", []) or []
+
+    if action == "warm":
+        # 并发预热所有 LinkMap, 全部缓存
+        print(f"  ▶ 扫描 DerivedData (project={args.project}, arch={args.arch})...")
+        t0 = _time.perf_counter()
+        files = find_linkmaps(project_name=args.project, arch=args.arch)
+        if not files:
+            print(f"  ✗ 未找到 LinkMap")
+            print(f"  → 在 Xcode Build Settings 开启: Write Link Map File: Yes")
+            return
+        print(f"  发现 {len(files)} 个 LinkMap, 4 线程并发预热...")
+        mlm = MultiLinkMap.warm_all_from_derived_data(
+            project_name=args.project, arch=args.arch, max_workers=4,
+        )
+        elapsed = _time.perf_counter() - t0
+        stats = mlm.stats()
+        print(f"  ✓ 完成 ({elapsed:.2f}s)")
+        print(f"    LinkMaps:        {stats['linkmaps']}")
+        print(f"    总符号:          {stats['total_symbols']:,}")
+        print(f"    OC 方法:         {stats['objc_symbols']:,}")
+        print(f"    C++:             {stats['cpp_symbols']:,}")
+        print(f"    Soul 业务前缀:   {stats['biz_symbols']:,}")
+        # 缓存目录占用
+        cache_size = sum(p.stat().st_size for p in CACHE_DIR.glob("*.pkl") if p.is_file())
+        print(f"    缓存目录:        {CACHE_DIR}")
+        print(f"    缓存占用:        {cache_size / 1024:.1f} KB")
+        return
+
+    if action == "bench":
+        # 解析性能基准 (含/不含缓存对比)
+        files = find_linkmaps(project_name=args.project, arch=args.arch)
+        if not files:
+            print(f"  ✗ 未找到 LinkMap")
+            return
+        # 取最大的一个测
+        biggest = max(files, key=lambda f: f.stat().st_size)
+        size_mb = biggest.stat().st_size / 1024 / 1024
+        print(f"  benchmark 文件: {biggest.name}")
+        print(f"    大小: {size_mb:.2f} MB")
+
+        # 第一次 (无缓存)
+        # 先清掉它的缓存
+        cache_p = LinkMap._cache_path_for(str(biggest.resolve()))
+        if cache_p.exists():
+            cache_p.unlink()
+        t0 = _time.perf_counter()
+        lm = LinkMap.load(str(biggest), use_cache=True)
+        first_load = _time.perf_counter() - t0
+        symbols = len(lm.symbols)
+        print(f"    首次解析:    {first_load*1000:.1f}ms ({symbols:,} 符号)")
+        print(f"    解析速度:    {size_mb / first_load:.2f} MB/s")
+        print(f"    每符号开销:  {first_load * 1e6 / max(symbols,1):.2f}μs")
+
+        # 第二次 (命中缓存)
+        t0 = _time.perf_counter()
+        lm2 = LinkMap.load(str(biggest), use_cache=True)
+        second_load = _time.perf_counter() - t0
+        print(f"    命中缓存:    {second_load*1000:.2f}ms ({first_load/max(second_load, 0.0001):.0f}× 加速)")
+
+        # 1000 次随机 lookup
+        if symbols > 100:
+            import random
+            test_addrs = [random.choice(lm.symbols).addr for _ in range(1000)]
+            t0 = _time.perf_counter()
+            for a in test_addrs:
+                lm.lookup(a)
+            qps_dur = _time.perf_counter() - t0
+            print(f"    1000 次 lookup: {qps_dur*1000:.2f}ms ({1000/qps_dur:.0f} QPS)")
+        return
+
+    if action == "find":
+        files = find_linkmaps(project_name=args.project, arch=args.arch)
+        if not files:
+            print(f"  ✗ 未找到 LinkMap (project={args.project}, arch={args.arch})")
+            print(f"  → 在 Xcode Build Settings 开启: Write Link Map File: Yes")
+            return
+        print(f"  共 {len(files)} 个 LinkMap (按 mtime 降序):")
+        for f in files:
+            mtime = f.stat().st_mtime
+            size_mb = f.stat().st_size / 1024 / 1024
+            print(f"    {datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')}  "
+                  f"{size_mb:>6.2f}MB  {f}")
+        return
+
+    if not sub_args:
+        print(f"  ✗ {action} 需要 LinkMap 文件路径作为第一个参数")
+        sys.exit(1)
+    file_path = sub_args[0]
+
+    if action == "parse":
+        lm = LinkMap.load(file_path)
+        stats = lm.stats()
+        if args.json:
+            print(_json.dumps({**stats, "binary": lm.binary, "arch": lm.arch,
+                               "parse_seconds": lm.parse_seconds}, indent=2))
+        else:
+            print(f"  Binary:        {lm.binary}")
+            print(f"  Arch:          {lm.arch}")
+            print(f"  Symbols:       {stats['total_symbols']:,}")
+            print(f"    OC 方法:     {stats['objc_symbols']:,}")
+            print(f"    C++:         {stats['cpp_symbols']:,}")
+            print(f"    SO 业务前缀: {stats['biz_symbols']:,}")
+            print(f"  Object files:  {stats['total_object_files']:,}")
+            print(f"  Address range: 0x{stats['addr_min']:x} ~ 0x{stats['addr_max']:x}")
+            print(f"  解析耗时:      {lm.parse_seconds*1000:.1f}ms"
+                  f"{' (命中缓存)' if lm.parse_seconds == 0 else ''}")
+        return
+
+    if action == "lookup":
+        if len(sub_args) < 2:
+            print("  ✗ lookup 需要地址参数: cpar perf linkmap lookup <file> 0xADDR")
+            sys.exit(1)
+        lm = LinkMap.load(file_path)
+        addr = int(sub_args[1], 0)
+        sym = lm.lookup(addr)
+        if sym:
+            print(f"  地址:    0x{addr:x}")
+            print(f"  符号:    {sym.name}")
+            print(f"  范围:    0x{sym.addr:x} - 0x{sym.end_addr:x} (size={sym.size})")
+            print(f"  Object:  {sym.file_path}")
+            print(f"  内偏移:  +0x{addr - sym.addr:x}")
+        else:
+            print(f"  地址 0x{addr:x} 未找到对应符号")
+        return
+
+    if action == "search":
+        if len(sub_args) < 2:
+            print("  ✗ search 需要 pattern: cpar perf linkmap search <file> <pattern>")
+            sys.exit(1)
+        lm = LinkMap.load(file_path)
+        results = lm.search_by_name(sub_args[1], max_results=args.max)
+        print(f"  搜 '{sub_args[1]}' 命中 {len(results)} (上限 {args.max}):")
+        for s in results:
+            print(f"    0x{s.addr:>10x}  size=0x{s.size:>5x}  {s.name[:80]}")
+
+
 async def cmd_perf_devices(args):
     import subprocess
     proc = subprocess.run(
@@ -2258,6 +2403,26 @@ def main():
 
     perf_devices = perf_sub.add_parser("devices", help="列出 xctrace 设备")
 
+    # ── perf linkmap (LinkMap 解析与符号查询) ──
+    perf_linkmap = perf_sub.add_parser(
+        "linkmap",
+        help="LinkMap 解析: find/parse/lookup/search 业务符号",
+    )
+    perf_linkmap.add_argument(
+        "lm_action", nargs="?", default="find",
+        choices=["find", "parse", "lookup", "search", "warm", "bench"],
+        help="操作类型 (warm=预热缓存, bench=性能基准)",
+    )
+    perf_linkmap.add_argument("lm_args", nargs="*", help="子命令参数")
+    perf_linkmap.add_argument("--project", default="Soul_New",
+                              help="find: 工程名 (默认 Soul_New)")
+    perf_linkmap.add_argument("--arch", default="arm64",
+                              help="find: 架构 (默认 arm64)")
+    perf_linkmap.add_argument("--max", type=int, default=20,
+                              help="search: 最大返回数")
+    perf_linkmap.add_argument("--json", action="store_true",
+                              help="parse: JSON 输出")
+
     # ── perf tunneld (iOS 17+ DVT 通道守护) ──
     perf_tunneld = perf_sub.add_parser(
         "tunneld",
@@ -2455,6 +2620,8 @@ def main():
             asyncio.run(cmd_perf_report(args))
         elif args.perf_cmd == "tunneld":
             cmd_perf_tunneld(args)
+        elif args.perf_cmd == "linkmap":
+            cmd_perf_linkmap(args)
         elif args.perf_cmd == "devices":
             asyncio.run(cmd_perf_devices(args))
         elif args.perf_cmd == "config":
