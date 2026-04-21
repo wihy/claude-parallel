@@ -306,7 +306,7 @@ class TestSamplingProfilerSidecar(unittest.TestCase):
         )
         self.assertEqual(sidecar.interval_sec, 15)
 
-    @patch("src.perf.sampling.subprocess.Popen")
+    @patch("src.perf.capture.sampling.subprocess.Popen")
     def test_cycle_with_mock_xctrace(self, mock_popen):
         """Mock xctrace, 写入 fixture XML, 验证 JSONL 输出。"""
         xml_content = TIMEPROFILER_XML
@@ -343,7 +343,7 @@ class TestSamplingProfilerSidecar(unittest.TestCase):
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(xml_content)
 
-        with patch("src.perf.sampling.export_xctrace_schema", side_effect=fake_export):
+        with patch("src.perf.capture.sampling.export_xctrace_schema", side_effect=fake_export):
             snapshot = sidecar._run_one_cycle(1)
 
         self.assertIsNotNone(snapshot)
