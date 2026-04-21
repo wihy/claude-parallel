@@ -82,7 +82,7 @@ from .deep_export import (
     format_deep_report,
     probe_trace_schemas,
 )
-from .symbolicate import (
+from .locate.dsym import (
     find_dsym,
     find_dsym_by_uuid,
     find_dsym_in_archives,
@@ -107,7 +107,7 @@ from .time_sync import (
     run_time_sync,
 )
 from .integrator import PerfIntegrator
-from .power_attribution import (
+from .analyze.power_attribution import (
     ProcessPower,
     ProcessLifecycleEvent,
     AnomalyEvent,
@@ -120,7 +120,7 @@ from .power_attribution import (
     format_attribution_report,
     read_lifecycle_events,
 )
-from .ai_diagnosis import (
+from .analyze.ai_diagnosis import (
     DiagnosisContext,
     DiagnosisResult,
     collect_diagnosis_context,
@@ -132,7 +132,7 @@ from .ai_diagnosis import (
     format_diagnosis_report,
     run_diagnosis,
 )
-from .report_html import generate_html_report
+from .present.report_html import generate_html_report
 from .perf_defaults import PerfDefaults
 
 __all__ = [
