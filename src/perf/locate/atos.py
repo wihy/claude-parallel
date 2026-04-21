@@ -1,0 +1,107 @@
+"""常驻 atos 子进程 — 消除每次 subprocess 的启动开销。
+
+使用方式:
+    daemon = AtosDaemon(binary_path, load_addr)
+    daemon.start()          # 启动 atos -i -o bin -l addr
+    sym = daemon.lookup(0x100001234)  # 喂 stdin,读 stdout
+    daemon.shutdown()       # 停进程,flush
+"""
+
+import subprocess
+import threading
+import queue
+from pathlib import Path
+from typing import Optional
+
+
+ATOS_FAILURE_THRESHOLD = 5          # 连续 N 次失败后入黑名单
+ATOS_READ_TIMEOUT_SEC = 0.2         # 单次 lookup 软超时
+
+
+class AtosDaemon:
+    """常驻 atos 进程 —— 用 stdin/stdout 流式查询符号。
+
+    线程安全: lookup() 持锁串行化到 atos;对外 API 可多线程调用。
+    """
+
+    def __init__(self, binary_path: str, load_addr: int = 0):
+        self.binary_path = str(Path(binary_path).expanduser())
+        self.load_addr = load_addr
+        self._proc: Optional[subprocess.Popen] = None
+        self._started = False
+        self._lock = threading.Lock()
+        self._response_queue: "queue.Queue[str]" = queue.Queue()
+        self._reader_thread: Optional[threading.Thread] = None
+        self._failures: dict = {}
+        self._blacklist: set = set()
+
+    def start(self) -> None:
+        if self._started:
+            return
+        args = [
+            "atos", "-i",
+            "-o", self.binary_path,
+            "-l", hex(self.load_addr),
+        ]
+        self._proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1,  # line-buffered
+            text=True,
+        )
+        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader_thread.start()
+        self._started = True
+
+    def _read_loop(self) -> None:
+        if not self._proc or not self._proc.stdout:
+            return
+        for line in self._proc.stdout:
+            self._response_queue.put(line.rstrip("\n"))
+
+    def _put_response(self, text: str) -> None:
+        """测试钩子 — 直接注入响应,绕开真实 atos 子进程。"""
+        self._response_queue.put(text)
+
+    def lookup(self, addr: int) -> str:
+        """同步查询单个地址。失败或未启动时返回 hex 字符串。"""
+        if addr in self._blacklist:
+            return f"0x{addr:x}"
+        if not self._started or not self._proc or not self._proc.stdin:
+            return f"0x{addr:x}"
+
+        with self._lock:
+            try:
+                self._proc.stdin.write(f"{hex(addr)}\n")
+                self._proc.stdin.flush()
+                sym = self._response_queue.get(timeout=ATOS_READ_TIMEOUT_SEC)
+                if sym and not sym.startswith("0x"):
+                    self._failures.pop(addr, None)
+                    return sym
+                self._record_failure(addr)
+                return f"0x{addr:x}"
+            except (BrokenPipeError, OSError, queue.Empty):
+                self._record_failure(addr)
+                return f"0x{addr:x}"
+
+    def _record_failure(self, addr: int) -> None:
+        self._failures[addr] = self._failures.get(addr, 0) + 1
+        if self._failures[addr] >= ATOS_FAILURE_THRESHOLD:
+            self._blacklist.add(addr)
+
+    def shutdown(self) -> None:
+        if not self._started:
+            return
+        self._started = False
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
+        self._proc = None
