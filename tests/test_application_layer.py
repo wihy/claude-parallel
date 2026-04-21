@@ -60,6 +60,14 @@ class ApplicationLayerTest(unittest.TestCase):
         from src.claude_client import strip_code_fences
         self.assertTrue(callable(strip_code_fences))
 
+    def test_chat_input_from_infrastructure(self):
+        from src.infrastructure.input.chat_input import ChatInputSession
+        self.assertTrue(callable(ChatInputSession))
+
+    def test_chat_input_shim_still_works(self):
+        from src.chat_input import ChatInputSession
+        self.assertTrue(callable(ChatInputSession))
+
 
 if __name__ == "__main__":
     unittest.main()
