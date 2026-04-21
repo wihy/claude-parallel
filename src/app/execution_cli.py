@@ -36,6 +36,9 @@ def register_execution_subcommands(subparsers):
     run_parser.add_argument("--perf-battery-interval", type=int, default=10, help="电池轮询间隔(s)")
     run_parser.add_argument("--perf-attach-webcontent", action="store_true", help="采集 WebContent 进程")
     run_parser.add_argument("--perf-composite", default="auto", help="Composite 模式: auto|full|webperf|power_cpu|gpu_full|memory")
+    run_parser.add_argument("--perf-binary", default="", help="主 binary 路径 (resolver 激活)")
+    run_parser.add_argument("--perf-linkmap", default="", help="LinkMap 文件路径 (业务符号)")
+    run_parser.add_argument("--perf-dsym", action="append", default=[], help="dSYM 路径 (可多次)")
     run_parser.add_argument("--web-dashboard", action="store_true", help="启动浏览器仪表盘 (替代 Rich Live)")
     run_parser.add_argument("--web-port", type=int, default=8765, help="dashboard 端口 (默认 8765)")
 
@@ -63,6 +66,9 @@ def register_execution_subcommands(subparsers):
     resume_parser.add_argument("--perf-metrics-interval", type=int, default=1000, help="per-process 采样间隔(ms)")
     resume_parser.add_argument("--perf-battery-interval", type=int, default=10, help="电池轮询间隔(s)")
     resume_parser.add_argument("--perf-attach-webcontent", action="store_true", help="采集 WebContent 进程")
+    resume_parser.add_argument("--perf-binary", default="", help="主 binary 路径 (resolver 激活)")
+    resume_parser.add_argument("--perf-linkmap", default="", help="LinkMap 文件路径 (业务符号)")
+    resume_parser.add_argument("--perf-dsym", action="append", default=[], help="dSYM 路径 (可多次)")
     resume_parser.add_argument("--web-dashboard", action="store_true", help="启动浏览器仪表盘")
     resume_parser.add_argument("--web-port", type=int, default=8765, help="dashboard 端口")
 
