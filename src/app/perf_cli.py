@@ -53,7 +53,11 @@ def register_perf_subcommands(subparsers):
     # --binary: iOS Debug build 需指向 .app/<AppName>.debug.dylib (launcher stub 几乎无符号)
     perf_start.add_argument(
         "--binary", "--perf-binary", dest="binary", default="",
-        help="主 binary 路径 (用于 atos 符号化; iOS Debug build 用 .debug.dylib)",
+        help=(
+            "主 binary 路径 (用于 atos 符号化)。"
+            "iOS Debug build: 传入 .app 目录会自动用内部 .debug.dylib (launcher stub 无符号)。"
+            "iOS Release build: 传入 .app/<AppName> 主 binary。"
+        ),
     )
     perf_start.add_argument(
         "--linkmap", "--perf-linkmap", dest="linkmap", action="append", default=[],

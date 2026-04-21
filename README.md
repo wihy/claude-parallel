@@ -127,18 +127,36 @@ cpar run tasks.yaml --with-perf \
   --perf-binary PATH --perf-linkmap PATH --perf-dsym PATH ...
 ```
 
-**使用示例** (iOS debug 构建需用 `.debug.dylib`,iOS arm64 app 标准基址 `0x100000000`):
+**使用示例** (iOS arm64 app 标准基址 `0x100000000`):
 
 ```bash
+# Debug build: 传 .app 目录, resolver 自动选内部 .debug.dylib (launcher stub 无符号)
 cpar perf start --repo ~/SoulApp --tag live \
   --device UDID --attach Soul_New \
   --sampling --metrics-source device \
-  --binary ~/Library/Developer/Xcode/DerivedData/Soul_New-*/Build/Products/Debug-iphoneos/Soul_New.app/Soul_New.debug.dylib \
+  --binary ~/Library/Developer/Xcode/DerivedData/Soul_New-*/Build/Products/Debug-iphoneos/Soul_New.app \
   --linkmap ~/Library/Developer/Xcode/DerivedData/Soul_New-*/Build/Intermediates.noindex/Soul_New.build/Debug-iphoneos/Soul_New.build/Soul_New-LinkMap-normal-arm64.txt
 
-# 查看业务符号已命中的 Top-N (过滤 xctrace overhead)
+# 多 LinkMap 叠加 (主 + Extensions, 提升命中率)
+cpar perf start ... \
+  --binary ~/Soul_New.app \
+  --linkmap ~/Soul_New-LinkMap.txt \
+  --linkmap ~/SoulShareExtension-LinkMap.txt \
+  --linkmap ~/SoulWidgetExtension-LinkMap.txt
+
+# Release build: 传主 binary 原样使用 (无 .debug.dylib)
+cpar perf start ... --binary ~/Soul.app/Soul --linkmap ~/Soul-LinkMap.txt
+
+# 查看业务符号已命中的 Top-N (自动过滤 xctrace dyld overhead)
 cpar perf hotspots --repo ~/SoulApp --tag live --aggregate
 ```
+
+**iOS Debug vs Release 差异** (resolver 自动识别):
+
+| Build 类型 | `<App>.app/<App>` | `<App>.debug.dylib` | 推荐传 `--binary` |
+|---|---|---|---|
+| Debug | launcher stub (~50 KB, 无业务符号) | 完整代码 (百 MB 级) | `<App>.app` 目录 — 自动选 dylib |
+| Release | 完整代码 | 不存在 | `<App>.app/<App>` 主 binary |
 
 ```bash
 # 符号化业务代码调用栈 (自动搜索 dSYM: DerivedData → Archives → ASC)

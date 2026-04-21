@@ -17,6 +17,38 @@ from .atos import AtosDaemon
 DEFAULT_TIMEOUT_MS = 500
 
 
+def _resolve_ios_debug_binary(binary_path: str) -> Optional[Path]:
+    """智能 binary 路径解析 — 处理 iOS Debug build 的 launcher stub 情况。
+
+    iOS Debug build 的 <App>.app/<App> 是 ~50KB 的 launcher stub (只有 entry
+    point + dyld bindings),真业务代码在 <App>.app/<App>.debug.dylib 里。
+    本函数自动识别:
+      - 若传入的是 .app 目录 → 返回内部 <App>.debug.dylib (若存在)
+      - 若传入的是 launcher stub (同目录下有 <name>.debug.dylib) → 返回 dylib
+      - 其它情况原样返回 (文件必须存在)
+    """
+    p = Path(binary_path).expanduser()
+    if not p.exists():
+        return None
+    # 场景 1: 传入 *.app 目录
+    if p.is_dir() and p.suffix == ".app":
+        app_name = p.stem
+        candidate = p / f"{app_name}.debug.dylib"
+        if candidate.exists():
+            return candidate
+        candidate = p / app_name  # 回退: 主 binary 本身
+        if candidate.exists():
+            return candidate
+        return None
+    # 场景 2: 传入 launcher stub, 同目录下有 <name>.debug.dylib
+    if p.is_file():
+        sibling_dylib = p.parent / f"{p.name}.debug.dylib"
+        if sibling_dylib.exists():
+            return sibling_dylib
+        return p
+    return None
+
+
 @dataclass(frozen=True)
 class Symbol:
     """resolver 输出 — 名字 + 溯源 (便于下游 UI 着色)。"""
@@ -80,15 +112,17 @@ class SymbolResolver:
                     self._linkmap = lm if lm.linkmaps else None
                 except (OSError, ValueError):
                     self._linkmap = None
-            if self.binary_path and Path(self.binary_path).exists():
-                try:
-                    # iOS 用户 app 默认 load base 0x100000000 (arm64)
-                    # 采样地址是设备运行时绝对地址, atos 用 -l 计算 offset = addr - base
-                    daemon = AtosDaemon(self.binary_path, load_addr=0x100000000)
-                    daemon.start()
-                    self._atos = daemon
-                except OSError:
-                    self._atos = None
+            if self.binary_path:
+                resolved_bin = _resolve_ios_debug_binary(self.binary_path)
+                if resolved_bin is not None:
+                    try:
+                        # iOS 用户 app 默认 load base 0x100000000 (arm64)
+                        # 采样地址是设备运行时绝对地址, atos 用 -l 计算 offset = addr - base
+                        daemon = AtosDaemon(str(resolved_bin), load_addr=0x100000000)
+                        daemon.start()
+                        self._atos = daemon
+                    except OSError:
+                        self._atos = None
             self._warmup_done.set()
 
     def resolve(self, addr: int, *, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> Symbol:
