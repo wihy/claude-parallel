@@ -234,39 +234,39 @@ tasks:
 ### 2. 校验配置
 
 ```bash
-python3 run.py validate tasks.yaml
+cpar validate tasks.yaml
 ```
 
 ### 3. 预览计划
 
 ```bash
-python3 run.py plan tasks.yaml
+cpar plan tasks.yaml
 ```
 
 ### 4. 执行
 
 ```bash
 # 执行 + 合并 + 清理
-python3 run.py run tasks.yaml --merge --clean
+cpar run tasks.yaml --merge --clean
 
 # 带预算控制
-python3 run.py run tasks.yaml --retry 3 --total-budget 5.0
+cpar run tasks.yaml --retry 3 --total-budget 5.0
 ```
 
 ### 5. 查看变更
 
 ```bash
 # 预览所有变更 (不合并)
-python3 run.py diff tasks.yaml
+cpar diff tasks.yaml
 
 # Code Review
-python3 run.py review tasks.yaml --budget 1.0
+cpar review tasks.yaml --budget 1.0
 ```
 
 ### 6. 中断恢复
 
 ```bash
-python3 run.py resume tasks.yaml --merge
+cpar resume tasks.yaml --merge
 ```
 
 ### 7. 真机性能采集
@@ -317,47 +317,96 @@ cpar perf battery --repo . --tag full --last 10
 ### 10. 与并行执行框架集成
 
 ```bash
-python3 run.py run tasks.yaml --with-perf \
+cpar run tasks.yaml --with-perf \
   --perf-device UDID --perf-attach Soul_New \
   --perf-sampling --perf-metrics-source auto
 ```
 
 ## 完整命令列表
 
-```
-run       执行任务 (--dry/--merge/--clean/--retry N/--total-budget $, --with-perf ..., --perf-threshold-pct N, --strict-perf-gate)
-resume    从中断处恢复
-plan      展示执行计划
-validate  校验 YAML 配置
-diff      预览所有 worktree 变更
-merge     合并 worktree (支持冲突自动解决)
-review    对所有变更执行 Code Review
-clean     清理 worktree 和协调文件
-logs      查看任务日志
-chat      对话模式 (自然语言生成任务 YAML)
+共 32 个命令: 7 执行 + 3 运维 + 22 性能分析。`perf` 与 `analyze` 等价。
 
-perf 子命令 (21 个):
-  perf start       启动采集 (--sampling, --metrics-source device|xctrace|auto)
-  perf stop        停止采集
-  perf tail        实时查看 syslog
-  perf report      生成报告 (--with-callstack, --callstack-top N)
-  perf devices     列出已连接设备
-  perf live        实时 syslog 告警分析 (自动重连)
-  perf rules       列出/管理告警规则 (13 条内置)
-  perf stream      实时 xctrace 指标流
-  perf snapshot    导出指标快照
-  perf callstack   调用栈分析 (--top N, --full-stack, --from/--to 时间切片)
-  perf hotspots    运行时热点函数 (--follow, --aggregate, --last N)
-  perf dashboard   全指标仪表盘 (时序表+汇总, --json/--csv)
-  perf metrics     Per-process CPU/内存指标
-  perf battery     电池功耗趋势
-  perf templates   Instruments 模板管理 (10 个内置)
-  perf symbolicate dSYM 符号化 (5级搜索: DerivedData→Archives→Spotlight→设备→ASC)
-  perf time-sync   syslog-xctrace 时序对齐
-  perf deep-export 深度 Schema 导出 (GPU/Network/VM/Metal)
-  perf power-attr  进程级功耗归因 (CPU线性 + 多维CPU/GPU/Network拆分)
-  perf ai-diag     AI 辅助诊断 (5种focus+回归分析)
-  perf webcontent  WebKit 进程采集 (PID动态刷新)
+### 执行类
+
+```
+run <YAML>       执行任务 (--dry, --merge, --clean, --retry N, --total-budget $,
+                 --with-perf, --perf-tag, --perf-device, --perf-attach,
+                 --perf-duration, --perf-templates, --perf-baseline,
+                 --perf-threshold-pct, --strict-perf-gate, --perf-sampling,
+                 --perf-metrics-source auto|device|xctrace, --perf-composite,
+                 --perf-binary, --perf-linkmap, --perf-dsym,
+                 --web-dashboard, --web-port)
+resume <YAML>    从中断处恢复 (参数同 run)
+plan <YAML>      展示执行计划 (DAG 层级图)
+merge <YAML>     合并 worktree (冲突自动解决)
+diff <YAML>      预览所有 worktree 变更
+review <YAML>    Code Review (--budget $)
+validate <YAML>  校验 YAML 配置 (--with-perf, --perf-device, --perf-attach)
+```
+
+### 运维类
+
+```
+clean <repo>       清理 worktree + cp-* 分支 + 协调目录
+                   (--prune-logs, --keep-days N, --keep-last N, --force)
+logs <repo>        查看任务日志 (--task/-t ID, --tail/-n N)
+dashboard          启动独立 Web Dashboard 浏览器实时看调度+功耗
+                   (--repo, --tag, --port, --host, --no-open, --source NAME=PATH)
+```
+
+### 性能分析类 (perf / analyze)
+
+`cpar perf <子命令>` 和 `cpar analyze <子命令>` 完全等价。
+
+```
+── 采集控制 ──────────────────────────────────────────────────
+  start         启动真机性能采集 (--device, --attach, --tag, --duration,
+                --sampling, --attach-webcontent, --composite, --binary,
+                --linkmap, --dsym, --no-tunneld, --metrics-source,
+                --metrics-interval, --battery-interval)
+  stop          停止采集 (--clean, --no-clean, --keep-report)
+  tail          查看实时 syslog (--lines N)
+  devices       列出 xctrace 可用设备
+
+── 报告与分析 ────────────────────────────────────────────────
+  report        生成 perf 报告 (--with-callstack, --callstack-top N,
+                --json, --html, --html-output, --baseline, --threshold-pct,
+                --clean, --no-clean, --keep-report)
+  live          实时 syslog 告警分析 (--device, --rules, --buffer, --interval)
+  rules         列出/管理告警规则 (--list, --export, --test)
+  stream        实时 xctrace 指标流 (<trace>, --interval, --window)
+  snapshot      立即导出指标快照 (<trace>, --json)
+
+── 进程级分析 ────────────────────────────────────────────────
+  metrics       Per-process CPU/内存指标 (--last N, --json)
+  battery       电池功耗趋势 (--last N, --json)
+  hotspots      运行时热点函数 (--follow, --top N, --last N, --aggregate, --json)
+  callstack     Time Profiler 调用栈分析 (--top N, --min-weight, --max-depth,
+                --no-flatten, --full-stack, --from SEC, --to SEC, --json)
+  webcontent    WebContent 进程 JS/WebKit 热点 (--top N, --last N, --json)
+  power-attr    进程级功耗归因分析 (--json)
+  dashboard     全指标统一仪表盘 时序表+汇总 (--last N, --json, --csv)
+
+── 符号化与调试 ──────────────────────────────────────────────
+  linkmap       LinkMap 解析 (find|parse|lookup|search|warm|bench)
+                (--project, --arch, --max N, --json)
+  symbolicate   dSYM 符号化调用栈地址 (--app-id, --dsym, --uuid, --arch,
+                --top N, --json)
+
+── 时间关联与深度采集 ────────────────────────────────────────
+  time-sync     syslog-xctrace 时序对齐 + 事件归因 (--syslog, --window N, --json)
+  deep-export   深度 Schema 采集 GPU/Network/VM/Metal (--schemas, --json)
+
+── 基础设施 ──────────────────────────────────────────────────
+  tunneld       管理 pymobiledevice3 RemoteXPC tunneld (iOS 17+ DVT 必需)
+                (start|stop|status|ensure, --no-prompt)
+  config        查看/修改 perf 默认配置 (show | set FIELD VALUE | unset FIELD)
+  templates     Instruments 模板管理 (--list, --available, --devices,
+                --build-cmd, --device, --attach, --duration)
+
+── AI 辅助 ───────────────────────────────────────────────────
+  ai-diag       AI 辅助性能诊断 (--focus general|webkit|power|memory|gpu,
+                --baseline-tag, --offline, --model, --json)
 ```
 
 ## 文件结构
@@ -368,45 +417,32 @@ claude-parallel/
 ├── chat.py                     # 对话模式入口
 ├── cpar                        # Shell 封装脚本
 ├── src/
-│   ├── claude_client.py        # ★ 统一 Claude CLI 调用 + 重试 + 错误分类
-│   ├── task_parser.py          # YAML 解析 + DAG 拓扑排序
-│   ├── worker.py               # Worker 进程管理 + 重试 + 日志
-│   ├── orchestrator.py         # 调度器 (DAG/重试/预算/恢复)
-│   ├── merger.py               # Worktree 合并 + Claude 辅助冲突解决
-│   ├── reviewer.py             # 自动 Code Review
-│   ├── validator.py            # YAML 配置校验 (含 task_id 安全白名单)
-│   ├── context_extractor.py    # 多语言上下文提取
-│   ├── chat_input.py           # 多行输入 (readline)
-│   ├── domain/
-│   │   └── tasks.py            # Task/ProjectConfig 数据类 + 拓扑排序
-│   ├── app/
-│   │   ├── cli.py              # 主 CLI: argparse + 核心调度 (~514 行)
-│   │   ├── chat_cli.py         # 对话模式: planner + Rich UI
-│   │   ├── execution_cli.py    # 执行子命令 (run/resume/plan/merge/diff/review)
+│   ├── app/                    ① 应用入口
+│   │   ├── cli.py              # 主 CLI: argparse + 命令分发 (~521 行)
+│   │   ├── execution_cli.py    # 执行子命令注册 (run/resume/plan/merge/diff/review/validate)
 │   │   ├── ops_cli.py          # 运维子命令 (clean/logs/dashboard)
-│   │   └── perf_cli.py         # ★ 所有 perf 子命令实现 (~1849 行)
-│   ├── infrastructure/
+│   │   └── perf_cli.py         # ★ 所有 perf/analyze 子命令实现 (~1872 行)
+│   ├── application/            ② 编排与工作流
+│   │   ├── orchestration.py    # Orchestrator 调度器 (DAG/重试/预算/恢复)
+│   │   ├── worker.py           # Worker 进程管理 + 重试 + 日志
+│   │   ├── merge.py            # WorktreeMerger 合并 + 冲突解决
+│   │   ├── review.py           # 自动 Code Review
+│   │   ├── validation.py       # YAML 配置校验
+│   │   └── context_extraction.py # 多语言上下文提取
+│   ├── domain/                 ③ 领域模型 (纯数据)
+│   │   └── tasks.py            # Task/ProjectConfig/WorkerResult 数据类
+│   ├── infrastructure/         ④ 外部设施
+│   │   ├── claude/             # Claude CLI 统一调用 + 重试
 │   │   ├── storage/atomic.py   # 原子 JSON 读写
 │   │   ├── monitoring/         # Rich Live 进度面板
-│   │   └── dashboard/          # Web 仪表盘 (WebSocket)
-│   └── perf/                   # 真机性能采集子系统 (20+ 模块)
-│       ├── config.py           # PerfConfig 数据类
-│       ├── session.py          # 采集会话生命周期
-│       ├── sampling.py         # Sampling Profiler 旁路
-│       ├── live_log.py         # 实时 syslog 流式告警 (13 规则, 自动重连)
-│       ├── live_metrics.py     # 实时 xctrace 指标流
-│       ├── webcontent.py       # WebKit 进程分析 + PID 动态刷新
-│       ├── dvt_bridge.py       # pymobiledevice3 DVT 协议桥接
-│       ├── symbolicate.py      # dSYM 符号化 (5 级搜索)
-│       ├── time_sync.py        # syslog-xctrace 时序对齐
-│       ├── deep_export.py      # GPU/网络/VM/Metal 深度导出
-│       ├── power_attribution.py # 进程级功耗归因 + 多维拆分
-│       ├── ai_diagnosis.py     # AI 辅助诊断 (5 focus + 回归分析)
-│       ├── device_metrics.py   # BatteryPoller + ProcessMetrics
-│       ├── templates.py        # Instruments 模板管理 (14 内置 + 5 组合)
-│       ├── integrator.py       # 与 Orchestrator 集成胶水
-│       ├── reconnect.py        # ReconnectableMixin 自动重连
-│       └── ...
+│   │   └── dashboard/          # Web 仪表盘 (WebSocket + 源码定位)
+│   └── perf/                   ⑤ perf 子系统 (内部 6 层)
+│       ├── protocol/           # 设备/协议通信 (reconnect / dvt / device)
+│       ├── capture/            # 原始数据采集 (sampling / webcontent / live_log / live_metrics)
+│       ├── decode/             # Schema/XML 解析 (templates / timeprofiler / deep_export / time_sync)
+│       ├── locate/             # 符号定位层 (linkmap / atos / cache / resolver / dsym)
+│       ├── analyze/            # 高层分析 (power_attribution / ai_diagnosis / callstack / metrics)
+│       └── present/            # 呈现 (report_html / dvt_metrics)
 ├── tests/
 │   ├── test_chat_input.py      # 输入模块测试
 │   ├── test_perf_sampling.py   # Sampling + 解析器测试 (29 cases)

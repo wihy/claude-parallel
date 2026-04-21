@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 PERF_USAGE = (
-    "  用法: cpar perf "
+    "  用法: cpar <perf|analyze> "
     "<start|stop|tail|report|devices|config|live|rules|stream|snapshot|"
     "callstack|hotspots|metrics|battery|templates|symbolicate|time-sync|"
     "deep-export|power-attr|ai-diag> ..."
@@ -23,8 +23,8 @@ PERF_USAGE = (
 from src.perf import PerfConfig, PerfSessionManager
 from src.perf.perf_defaults import PerfDefaults
 
-def register_perf_subcommands(subparsers):
-    perf_parser = subparsers.add_parser("perf", help="真机性能采集与报告")
+def register_perf_subcommands(subparsers, command_name: str = "perf", help_text: str = "真机性能采集与报告"):
+    perf_parser = subparsers.add_parser(command_name, help=help_text)
     perf_sub = perf_parser.add_subparsers(dest="perf_cmd")
 
     perf_start = perf_sub.add_parser("start", help="启动 perf 采集")
@@ -1110,9 +1110,11 @@ async def cmd_perf_stream(args):
         while running:
             summary = streamer.get_summary()
             current_snaps = summary.get("snapshots", 0)
+            # 兼容历史变量名，避免后续维护误改导致 NameError
+            current_snap_count = current_snaps
             latest = summary.get("latest")
 
-            if current_snaps > prev_snap_count and latest:
+            if current_snap_count > prev_snap_count and latest:
                 parts = []
                 if latest.get("display_mw") is not None:
                     parts.append(f"Display={latest['display_mw']:.0f}mW")
@@ -1127,7 +1129,7 @@ async def cmd_perf_stream(args):
 
                 ts = time.strftime("%H:%M:%S", time.localtime(latest.get("ts", 0)))
                 print(f"  [{ts}] snap #{current_snaps}: {' | '.join(parts) if parts else 'no data'}")
-                prev_snap_count = current_snap_count
+                prev_snap_count = current_snaps
 
             time.sleep(args.interval)
     except KeyboardInterrupt:

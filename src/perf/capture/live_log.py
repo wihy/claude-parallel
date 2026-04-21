@@ -255,7 +255,8 @@ class LiveLogAnalyzer(ReconnectableMixin):
             max_delay_sec=30.0,
             backoff_factor=2.0,
         )
-        super().__init__(
+        # ReconnectableMixin 使用 __init_reconnect__（不是 super().__init__）
+        self.__init_reconnect__(
             policy=policy,
             stop_event=threading.Event(),
             on_disconnect=self._on_syslog_disconnect,
@@ -267,7 +268,7 @@ class LiveLogAnalyzer(ReconnectableMixin):
         self.alert_callback = alert_callback
         self.alert_log_path = Path(alert_log_path) if alert_log_path else None
         self.perf_manager = perf_manager
-        self.buffer_lines = buffer_lines
+        self.buffer_lines = self._normalize_buffer_lines(buffer_lines)
 
         self._process: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
@@ -279,6 +280,15 @@ class LiveLogAnalyzer(ReconnectableMixin):
         self._line_buffer: List[str] = []         # 最近 N 行原始日志
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _normalize_buffer_lines(value: Any, default: int = 200) -> int:
+        """buffer_lines 容错归一化，避免传入字符串/None 导致切片 TypeError。"""
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            n = default
+        return max(1, n)
+
     # ── 生命周期 ──
 
     def start(self) -> Dict[str, Any]:
@@ -286,8 +296,8 @@ class LiveLogAnalyzer(ReconnectableMixin):
         if self._running.is_set():
             return {"status": "already_running"}
 
-        # 同步 stop_event 给 mixin
-        self._stop_event = self._running
+        # 重连 stop_event 在 start 时清空，stop 时置位
+        self._stop_event.clear()
 
         if not self._spawn_syslog_process():
             return {"status": "error", "error": "idevicesyslog spawn failed (see logs)"}
@@ -321,6 +331,7 @@ class LiveLogAnalyzer(ReconnectableMixin):
             return {"status": "not_running"}
 
         self._running.clear()
+        self._stop_event.set()
 
         if self._process and self._process.poll() is None:
             try:
@@ -374,8 +385,9 @@ class LiveLogAnalyzer(ReconnectableMixin):
 
     def get_recent_lines(self, lines: int = 50) -> List[str]:
         """获取最近 N 行原始日志"""
+        count = self._normalize_buffer_lines(lines, default=50)
         with self._lock:
-            return list(self._line_buffer[-lines:])
+            return list(self._line_buffer[-count:])
 
     def get_alert_counts_by_level(self) -> Dict[str, int]:
         """按级别统计告警数"""

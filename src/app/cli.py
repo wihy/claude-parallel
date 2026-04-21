@@ -41,7 +41,7 @@ def print_banner():
     print(f"""
   ╔═══════════════════════════════════════════╗
   ║   Claude Parallel v{VERSION}                 ║
-  ║   Multi-Claude Code Parallel Executor     ║
+  ║   双引擎: 并行开发 + App性能分析实时展示     ║
   ╚═══════════════════════════════════════════╝
   """)
 
@@ -439,13 +439,17 @@ async def cmd_validate(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="claude-parallel",
-        description=f"Claude Parallel v{VERSION} — 多 Claude Code 并行协同执行框架",
+        description=(
+            f"Claude Parallel v{VERSION} — 两大主能力: "
+            "(1) 并行协同开发执行  (2) App 性能分析与实时展示"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", help="子命令")
 
     register_execution_subcommands(subparsers)
     register_ops_subcommands(subparsers)
-    register_perf_subcommands(subparsers)
+    register_perf_subcommands(subparsers, command_name="perf", help_text="[分析] App 性能采集/报告 (兼容入口)")
+    register_perf_subcommands(subparsers, command_name="analyze", help_text="[分析] App 全链路性能分析 + 实时展示")
 
     args = parser.parse_args()
 
@@ -472,8 +476,8 @@ def main():
         "dashboard": cmd_dashboard,
     }):
         return
-    if args.command == "perf":
-        # perf 命令处理函数已迁移到 perf_cli.py，此处延迟导入
+    if args.command in ("perf", "analyze"):
+        # perf/analyze 命令处理函数已迁移到 perf_cli.py，此处延迟导入
         from .perf_cli import (
             cmd_perf_start, cmd_perf_stop, cmd_perf_tail, cmd_perf_report,
             cmd_perf_tunneld, cmd_perf_linkmap, cmd_perf_devices, cmd_perf_config,
