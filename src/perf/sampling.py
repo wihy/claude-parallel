@@ -402,7 +402,7 @@ def aggregate_top_n(
         return []
 
     # (leaf_name, addr) → weight
-    # 保留 addr 让后续 resymbolize 阶段能 LinkMap 反查
+    # 保留 addr 让 SymbolResolver 能用 LinkMap/atos 反查
     bucket: Dict[Tuple[str, str], float] = defaultdict(float)
     for s in samples:
         if len(s) >= 3:
