@@ -348,6 +348,8 @@ class SamplingProfilerSidecar:
         self._cleanup_stale_daemon()
 
         # Daemon 不能 pickle resolver,但可提取构造参数让子进程自建
+        # Fix (multi-linkmap): 序列化 linkmap_paths 列表而非单数 linkmap_path,
+        # 否则多 LinkMap 场景下子进程只拿到第一个 (父进程持有的全部列表丢失)
         if self._resolver is not None:
             resolver_init = (
                 "from src.perf.locate.resolver import SymbolResolver as _SR; "
@@ -355,7 +357,7 @@ class SamplingProfilerSidecar:
                 "_r=_SR("
                 f"binary_path={self._resolver.binary_path!r},"
                 f"dsym_paths={list(self._resolver.dsym_paths)!r},"
-                f"linkmap_path={self._resolver.linkmap_path!r},"
+                f"linkmap_paths={list(self._resolver.linkmap_paths)!r},"
                 f"cache_dir=Path({str(self._resolver._cache.cache_dir)!r})); "
                 "_th.Thread(target=_r.warmup,daemon=True).start(); "
             )
