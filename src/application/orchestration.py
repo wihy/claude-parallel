@@ -30,7 +30,7 @@ from src.domain.tasks import (
 from src.application.worker import Worker, WorkerResult, retry_worker
 from src.infrastructure.monitoring.rich_monitor import Monitor
 from src.application.merge import WorktreeMerger, MergeReport
-from src.context_extractor import extract_context_for_downstream
+from src.application.context_extraction import extract_context_for_downstream
 from src.perf import PerfConfig, PerfSessionManager, PerfIntegrator
 
 

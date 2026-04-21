@@ -28,6 +28,30 @@ class ApplicationLayerTest(unittest.TestCase):
         from src.merger import WorktreeMerger
         self.assertTrue(callable(WorktreeMerger))
 
+    def test_reviewer_importable_from_application(self):
+        from src.application.review import CodeReviewer
+        self.assertTrue(callable(CodeReviewer))
+
+    def test_reviewer_shim_still_works(self):
+        from src.reviewer import CodeReviewer
+        self.assertTrue(callable(CodeReviewer))
+
+    def test_validator_importable_from_application(self):
+        from src.application.validation import TaskValidator
+        self.assertTrue(callable(TaskValidator))
+
+    def test_validator_shim_still_works(self):
+        from src.validator import TaskValidator
+        self.assertTrue(callable(TaskValidator))
+
+    def test_context_extractor_importable_from_application(self):
+        from src.application.context_extraction import extract_context_for_downstream
+        self.assertTrue(callable(extract_context_for_downstream))
+
+    def test_context_extractor_shim_still_works(self):
+        from src.context_extractor import extract_context_for_downstream
+        self.assertTrue(callable(extract_context_for_downstream))
+
 
 if __name__ == "__main__":
     unittest.main()
