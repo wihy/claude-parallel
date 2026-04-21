@@ -56,22 +56,24 @@ from .protocol.dvt import (
     format_dvt_process_text,
     dvt_bridge_main,
 )
-from .sampling import (
+from .capture.sampling import (
     SamplingProfilerSidecar,
     HotspotSnapshot,
-    export_xctrace_schema,
-    parse_timeprofiler_xml,
-    aggregate_top_n,
     read_hotspots_jsonl,
     format_hotspots_text,
 )
-from .webcontent import (
+from .decode.timeprofiler import (
+    export_xctrace_schema,
+    parse_timeprofiler_xml,
+    aggregate_top_n,
+)
+from .capture.webcontent import (
     WebContentProfiler,
     find_webcontent_pids,
     read_webcontent_hotspots,
     format_webcontent_hotspots,
 )
-from .deep_export import (
+from .decode.deep_export import (
     DEEP_SCHEMAS,
     export_deep_schema,
     parse_gpu_frame_time,
@@ -95,7 +97,7 @@ from .locate.dsym import (
     extract_binary_uuid,
     extract_app_uuid_from_device,
 )
-from .time_sync import (
+from .decode.time_sync import (
     SyslogEvent,
     CorrelatedEvent,
     get_device_uptime,
