@@ -381,6 +381,7 @@ class PerfSessionManager:
                         interval_sec=self.config.sampling_interval_sec,
                         top_n=self.config.sampling_top_n,
                         retention=self.config.sampling_retention,
+                        resolver=self._resolver,
                     )
                     started = self.sampling_sidecar.start(as_subprocess=True)
                     meta["sampling"] = {
