@@ -20,6 +20,14 @@ class ApplicationLayerTest(unittest.TestCase):
         from src.worker import Worker
         self.assertTrue(callable(Worker))
 
+    def test_merger_importable_from_application(self):
+        from src.application.merge import WorktreeMerger, MergeReport
+        self.assertTrue(callable(WorktreeMerger))
+
+    def test_merger_shim_still_works(self):
+        from src.merger import WorktreeMerger
+        self.assertTrue(callable(WorktreeMerger))
+
 
 if __name__ == "__main__":
     unittest.main()
