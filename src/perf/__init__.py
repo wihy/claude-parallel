@@ -1,30 +1,30 @@
 """
 cpar perf 子包 — 真机性能采集、实时分析、报告生成。
 
-模块:
-- config:             PerfConfig 数据类
-- session:            PerfSessionManager 生命周期管理
-- live_log:           LiveLogAnalyzer 实时 syslog 流式分析
-- live_metrics:       LiveMetricsStreamer 实时 xctrace 指标流
-- templates:          TemplateLibrary Instruments 模板注册与扩展
-- integrator:         与 Orchestrator 的深度集成胶水
-- symbolicate:        dSYM 符号化 (atos / dsymutil / Swift demangle)
-- time_sync:          syslog-xctrace 时序对齐与事件归因
-- power_attribution:  进程级功耗归因与异常检测
+模块 (分层子包):
+- config:                    PerfConfig 数据类
+- session:                   PerfSessionManager 生命周期管理
+- capture.live_log:          LiveLogAnalyzer 实时 syslog 流式分析
+- capture.live_metrics:      LiveMetricsStreamer 实时 xctrace 指标流
+- decode.templates:          TemplateLibrary Instruments 模板注册与扩展
+- integrator:                与 Orchestrator 的深度集成胶水
+- locate.dsym:               dSYM 符号化 (atos / dsymutil / Swift demangle)
+- decode.time_sync:          syslog-xctrace 时序对齐与事件归因
+- analyze.power_attribution: 进程级功耗归因与异常检测
 """
 
 from .config import PerfConfig
 from .protocol.reconnect import ReconnectableMixin, ReconnectPolicy
 from .session import PerfSessionManager
-from .live_log import LiveLogAnalyzer, LogRule, DEFAULT_RULES
-from .live_metrics import (
+from .capture.live_log import LiveLogAnalyzer, LogRule, DEFAULT_RULES
+from .capture.live_metrics import (
     LiveMetricsStreamer,
     MetricSnapshot,
     MetricThreshold,
     DEFAULT_THRESHOLDS,
     build_snapshot_from_exports,
 )
-from .templates import (
+from .decode.templates import (
     InstrumentTemplate,
     TemplateLibrary,
     BUILTIN_TEMPLATES,

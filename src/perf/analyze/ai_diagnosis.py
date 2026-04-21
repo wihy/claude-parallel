@@ -94,7 +94,7 @@ def collect_diagnosis_context(session_dir: str) -> DiagnosisContext:
     hotspots_file = logs_dir / "hotspots.jsonl"
     if hotspots_file.exists():
         try:
-            from .sampling import read_hotspots_jsonl, format_hotspots_text
+            from ..capture.sampling import read_hotspots_jsonl, format_hotspots_text
             snapshots = read_hotspots_jsonl(hotspots_file, aggregate=True)
             ctx.hotspots = format_hotspots_text(snapshots, top_n=15)
         except Exception as e:
@@ -105,7 +105,7 @@ def collect_diagnosis_context(session_dir: str) -> DiagnosisContext:
     wc_hotspots = logs_dir / "webcontent_hotspots.jsonl"
     if wc_hotspots.exists():
         try:
-            from .webcontent import read_webcontent_hotspots, format_webcontent_hotspots
+            from ..capture.webcontent import read_webcontent_hotspots, format_webcontent_hotspots
             snaps = read_webcontent_hotspots(wc_hotspots, last_n=5)
             ctx.webcontent_data = format_webcontent_hotspots(snaps, top_n=10)
         except Exception as e:
@@ -916,7 +916,7 @@ def _collect_deep_schemas(
     for name, xml_path in schema_files.items():
         if xml_path.exists() and xml_path.stat().st_size > 100:
             try:
-                from .deep_export import (
+                from ..decode.deep_export import (
                     DEEP_SCHEMAS,
                     parse_gpu_frame_time,
                     parse_network_stat,

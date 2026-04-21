@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from src.perf.sampling import (
+from src.perf.capture.sampling import (
     SamplingProfilerSidecar,
     HotspotSnapshot,
     parse_timeprofiler_xml,

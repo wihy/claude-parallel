@@ -1041,6 +1041,6 @@ def _read_jsonl(path: Path, last_n: int = 0) -> List[Dict[str, Any]]:
 
 
 if __name__ == "__main__":
-    # 修复: dvt_bridge_main 之前未绑定 __main__，导致 `python -m src.perf.dvt_bridge`
+    # 修复: dvt_bridge_main 之前未绑定 __main__，导致 `python -m src.perf.protocol.dvt`
     # 仅 print parser.parse_args 然后退出。session.py 也未通过子进程启动。
     dvt_bridge_main()

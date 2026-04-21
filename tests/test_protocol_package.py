@@ -18,18 +18,5 @@ class ProtocolPackageTest(unittest.TestCase):
         self.assertTrue(callable(BatteryPoller))
         self.assertTrue(callable(ProcessMetricsStreamer))
 
-    def test_reconnect_old_path_shim(self):
-        from src.perf.reconnect import ReconnectableMixin
-        self.assertTrue(callable(ReconnectableMixin))
-
-    def test_dvt_bridge_old_path_shim(self):
-        from src.perf.dvt_bridge import DvtBridgeThread
-        self.assertTrue(callable(DvtBridgeThread))
-
-    def test_device_metrics_old_path_shim(self):
-        from src.perf.device_metrics import BatteryPoller
-        self.assertTrue(callable(BatteryPoller))
-
-
 if __name__ == "__main__":
     unittest.main()

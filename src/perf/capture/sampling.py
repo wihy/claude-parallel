@@ -364,7 +364,7 @@ class SamplingProfilerSidecar:
 
         daemon_code = (
             "import sys, signal; "
-            "from src.perf.sampling import SamplingProfilerSidecar; "
+            "from src.perf.capture.sampling import SamplingProfilerSidecar; "
             "from pathlib import Path; "
             + resolver_init
             + f"s=SamplingProfilerSidecar(Path({str(self.session_root)!r}),"
@@ -810,7 +810,7 @@ class SamplingProfilerSidecar:
 
 
 def _run_daemon():
-    """当以 python -m src.perf.sampling 启动时，运行 cycle loop 直到 SIGTERM。"""
+    """当以 python -m src.perf.capture.sampling 启动时，运行 cycle loop 直到 SIGTERM。"""
     import argparse as _ap
 
     p = _ap.ArgumentParser()

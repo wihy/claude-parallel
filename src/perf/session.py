@@ -20,10 +20,10 @@ from typing import Optional, Dict, Any
 
 from .config import PerfConfig
 from .protocol.device import BatteryPoller, ProcessMetricsStreamer
-from .webcontent import WebContentProfiler
+from .capture.webcontent import WebContentProfiler
 from .protocol.dvt import DvtBridgeThread, check_dvt_available
 from .locate.resolver import SymbolResolver
-from .sampling import SamplingProfilerSidecar
+from .capture.sampling import SamplingProfilerSidecar
 from ..infrastructure.storage.atomic import atomic_write_json, safe_read_json
 
 
@@ -211,7 +211,7 @@ class PerfSessionManager:
 
         # xctrace sidecar — 根据 templates 配置启动录制 (跳过 device 模式)
         if self.config.device and self.config.attach and not use_device_metrics:
-            from .templates import (
+            from .decode.templates import (
                 TemplateLibrary, build_xctrace_record_cmd,
                 build_composite_record_cmd, resolve_composite, COMPOSITE_PRESETS,
             )

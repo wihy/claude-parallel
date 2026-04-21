@@ -141,7 +141,7 @@ class WebContentProfiler:
         daemon_code = (
             "import sys, signal, json, time; "
             "from pathlib import Path; "
-            "from src.perf.webcontent import _webcontent_cycle_loop; "
+            "from src.perf.capture.webcontent import _webcontent_cycle_loop; "
             f"_webcontent_cycle_loop("
             f"Path({str(self.session_root)!r}),"
             f"{self.device_udid!r},"
