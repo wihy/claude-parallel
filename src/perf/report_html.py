@@ -24,8 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .dvt_bridge import read_dvt_process_jsonl, read_dvt_system_jsonl
-from .device_metrics import read_battery_jsonl
+from .protocol.dvt import read_dvt_process_jsonl, read_dvt_system_jsonl
+from .protocol.device import read_battery_jsonl
 from .sampling import read_hotspots_jsonl
 
 

@@ -123,7 +123,7 @@ def collect_diagnosis_context(session_dir: str) -> DiagnosisContext:
     battery_jsonl = logs_dir / "battery.jsonl"
     if battery_jsonl.exists():
         try:
-            from .device_metrics import read_battery_jsonl, format_battery_text
+            from .protocol.device import read_battery_jsonl, format_battery_text
             records = read_battery_jsonl(battery_jsonl, last_n=50)
             ctx.power_data = format_battery_text(records)
         except Exception as e:
@@ -134,7 +134,7 @@ def collect_diagnosis_context(session_dir: str) -> DiagnosisContext:
     proc_jsonl = logs_dir / "process_metrics.jsonl"
     if proc_jsonl.exists():
         try:
-            from .device_metrics import read_process_metrics_jsonl, format_process_metrics_text
+            from .protocol.device import read_process_metrics_jsonl, format_process_metrics_text
             records = read_process_metrics_jsonl(proc_jsonl, last_n=30)
             ctx.process_data = format_process_metrics_text(records)
         except Exception as e:

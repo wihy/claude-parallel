@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
 from .config import PerfConfig
-from .device_metrics import BatteryPoller, ProcessMetricsStreamer
+from .protocol.device import BatteryPoller, ProcessMetricsStreamer
 from .webcontent import WebContentProfiler
-from .dvt_bridge import DvtBridgeThread, check_dvt_available
+from .protocol.dvt import DvtBridgeThread, check_dvt_available
 from .locate.resolver import SymbolResolver
 from .sampling import (
     SamplingProfilerSidecar,
@@ -1004,7 +1004,7 @@ class PerfSessionManager:
         if dm.get("source") != "dvt_bridge":
             return None
 
-        from .dvt_bridge import read_dvt_process_jsonl, read_dvt_system_jsonl
+        from .protocol.dvt import read_dvt_process_jsonl, read_dvt_system_jsonl
 
         process_jsonl = Path(dm.get("process_jsonl", ""))
         system_jsonl = Path(dm.get("system_jsonl", ""))

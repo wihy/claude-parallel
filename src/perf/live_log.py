@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable
 
-from .reconnect import ReconnectableMixin, ReconnectPolicy
+from .protocol.reconnect import ReconnectableMixin, ReconnectPolicy
 
 logger = logging.getLogger(__name__)
 

@@ -14,7 +14,7 @@ cpar perf 子包 — 真机性能采集、实时分析、报告生成。
 """
 
 from .config import PerfConfig
-from .reconnect import ReconnectableMixin, ReconnectPolicy
+from .protocol.reconnect import ReconnectableMixin, ReconnectPolicy
 from .session import PerfSessionManager
 from .live_log import LiveLogAnalyzer, LogRule, DEFAULT_RULES
 from .live_metrics import (
@@ -35,7 +35,7 @@ from .templates import (
     list_available_devices,
     list_available_templates,
 )
-from .device_metrics import (
+from .protocol.device import (
     BatteryPoller,
     ProcessMetricsStreamer,
     read_battery_jsonl,
@@ -43,7 +43,7 @@ from .device_metrics import (
     format_battery_text,
     format_process_metrics_text,
 )
-from .dvt_bridge import (
+from .protocol.dvt import (
     DvtBridgeThread,
     DvtBridgeSession,
     DvtProcessSnapshot,
