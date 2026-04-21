@@ -15,7 +15,10 @@ from typing import Optional
 
 
 ATOS_FAILURE_THRESHOLD = 5          # 连续 N 次失败后入黑名单
-ATOS_READ_TIMEOUT_SEC = 0.2         # 单次 lookup 软超时
+ATOS_READ_TIMEOUT_SEC = 0.5         # 单次 lookup 软超时 (真机大 dylib
+                                    # 深 offset 地址偶尔需要 >200ms, 200ms
+                                    # 在 500MB+ binary 上会误判为 miss;
+                                    # 0.5s 对齐 resolver 外层 DEFAULT_TIMEOUT_MS)
 
 
 class AtosDaemon:
@@ -24,9 +27,17 @@ class AtosDaemon:
     线程安全: lookup() 持锁串行化到 atos;对外 API 可多线程调用。
     """
 
-    def __init__(self, binary_path: str, load_addr: int = 0):
+    def __init__(
+        self, binary_path: str, load_addr: int = 0,
+        *, read_timeout_sec: Optional[float] = None,
+    ):
         self.binary_path = str(Path(binary_path).expanduser())
         self.load_addr = load_addr
+        # 允许调用方覆盖超时 (大 binary / 压力测试可调高)
+        self.read_timeout_sec = (
+            read_timeout_sec if read_timeout_sec is not None
+            else ATOS_READ_TIMEOUT_SEC
+        )
         self._proc: Optional[subprocess.Popen] = None
         self._started = False
         self._lock = threading.Lock()
@@ -96,7 +107,7 @@ class AtosDaemon:
             try:
                 self._proc.stdin.write(f"{hex(addr)}\n")
                 self._proc.stdin.flush()
-                sym = self._response_queue.get(timeout=ATOS_READ_TIMEOUT_SEC)
+                sym = self._response_queue.get(timeout=self.read_timeout_sec)
                 if sym and not sym.startswith("0x"):
                     self._failures.pop(addr, None)
                     return sym
