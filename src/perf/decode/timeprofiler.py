@@ -376,8 +376,23 @@ def _parse_legacy_timeprofiler_format(text: str) -> List[Tuple[str, float]]:
     return samples
 
 
+# xctrace Time Profiler 自身的符号查找开销,需从 Top-N 剔除,
+# 否则会饱和 hotspots 榜首(真机验证 45%+ 占比)
+_SAMPLING_OVERHEAD_PATTERNS = (
+    "dyld3::MachOLoaded::findClosestSymbol",
+    "dyld4::MachOLoaded::findClosestSymbol",
+    "dyld::MachOLoaded::findClosestSymbol",
+)
+
+
+def _is_sampling_overhead(symbol: str) -> bool:
+    """判定是否 xctrace 自身采样开销符号。"""
+    return any(p in symbol for p in _SAMPLING_OVERHEAD_PATTERNS)
+
+
 def aggregate_top_n(
     samples: List[Tuple], top_n: int,
+    *, filter_overhead: bool = True,
 ) -> List[Dict[str, Any]]:
     """将原始采样聚合为 Top-N 热点函数（取 leaf 符号）。
 
@@ -385,6 +400,9 @@ def aggregate_top_n(
       [(name, weight)]                       最古老格式
       [(name, weight, addr)]                 含地址 (LinkMap 反查)
       [(name, weight, addr, thread)]         含 thread (per-thread 聚合)
+
+    filter_overhead=True 时,剔除 xctrace Time Profiler 自身的 dyld 符号查找
+    开销 (通常饱和 Top-N 榜首,遮蔽业务热点)。
     """
     if not samples:
         return []
@@ -392,6 +410,7 @@ def aggregate_top_n(
     # (leaf_name, addr) → weight
     # 保留 addr 让 SymbolResolver 能用 LinkMap/atos 反查
     bucket: Dict[Tuple[str, str], float] = defaultdict(float)
+    overhead_samples = 0.0
     for s in samples:
         if len(s) >= 3:
             frame, weight, addr = s[0], s[1], s[2]
@@ -399,8 +418,12 @@ def aggregate_top_n(
             frame, weight = s[0], s[1]
             addr = ""
         leaf = frame.rsplit(" → ", 1)[-1]
+        if filter_overhead and _is_sampling_overhead(leaf):
+            overhead_samples += weight
+            continue
         bucket[(leaf, addr)] += weight
 
+    # total 用过滤后的 weight,pct 基于"业务+系统 (不含 overhead)"
     total = sum(bucket.values())
     if total <= 0:
         return []
