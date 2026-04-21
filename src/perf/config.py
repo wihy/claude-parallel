@@ -1,6 +1,6 @@
 """PerfConfig — 性能采集配置数据类"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -48,3 +48,8 @@ class PerfConfig:
     # DvtBridge 网络与图形采集
     collect_network: bool = True       # 采集网络指标到 dvt_network.jsonl
     collect_graphics: bool = True      # 采集图形指标到 dvt_graphics.jsonl
+
+    # Symbol resolver 配置 (Track B resolver 激活条件)
+    binary_path: str = ""                                   # 主 binary 路径 (用于 atos 符号化)
+    linkmap_path: str = ""                                  # LinkMap 文件路径 (业务符号解析)
+    dsym_paths: list = field(default_factory=list)          # dSYM 路径列表

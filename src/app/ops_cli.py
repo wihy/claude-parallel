@@ -46,10 +46,6 @@ def register_ops_subcommands(subparsers):
         "--source", action="append", default=[],
         help="源码仓库 NAME=PATH，可重复指定 (如: --source soul=~/SoulApp --source pods=~/Pods)",
     )
-    dash_parser.add_argument(
-        "--linkmap-project", default="Soul_New",
-        help="LinkMap 工程名 (DerivedData 下匹配, 默认 Soul_New)",
-    )
 
 
 def dispatch_ops_command(args, handlers):
@@ -87,25 +83,8 @@ def cmd_dashboard(args):
             p = Path(spec).expanduser()
             sources_dict[p.name or "default"] = str(p)
 
-    try:
-        from src.perf.linkmap import MultiLinkMap, find_linkmaps
-        from src.infrastructure.dashboard.server import set_global_linkmap
-
-        project = getattr(args, "linkmap_project", "Soul_New")
-        files = find_linkmaps(project_name=project, arch="arm64")
-        if files:
-            print(f"  ▶ 加载 {len(files)} 个 LinkMap (project={project})...")
-            mlm = MultiLinkMap.warm_all_from_derived_data(project_name=project, max_workers=4)
-            set_global_linkmap(mlm)
-            stats = mlm.stats()
-            print(
-                f"  ✓ LinkMap 就绪: {stats['total_symbols']:,} 符号 "
-                f"(业务 {stats['biz_symbols']:,} OC {stats['objc_symbols']:,})"
-            )
-        else:
-            print(f"  · 未找到 LinkMap (project={project}), hotspots 不做二次符号化")
-    except Exception as e:
-        print(f"  ⚠ LinkMap 加载失败: {e}")
+    # hotspots 符号化由 cycle 内 SymbolResolver (cache→linkmap→atos→hex) 完成,
+    # dashboard 不再做事后二次符号化
 
     srv = DashboardServer(
         port=args.port,

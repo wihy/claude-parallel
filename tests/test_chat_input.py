@@ -33,14 +33,14 @@ def t(name):
 
 @t("模块 import 不炸")
 def test_import():
-    from src import chat_input
+    from src.infrastructure.input import chat_input
     assert hasattr(chat_input, "ChatInputSession")
     assert hasattr(chat_input, "SLASH_COMMANDS")
 
 
 @t("ChatInputSession 在无 TTY 时构造成功且 enabled=False")
 def test_construct_no_tty():
-    from src.chat_input import ChatInputSession
+    from src.infrastructure.input.chat_input import ChatInputSession
     s = ChatInputSession()
     # stdin 在 pytest 下非 TTY，应降级
     assert s.enabled is False
@@ -48,13 +48,13 @@ def test_construct_no_tty():
 
 @t("_can_use_pt() 在 isatty=False 时返回 False")
 def test_can_use_pt_no_tty():
-    from src.chat_input import _can_use_pt
+    from src.infrastructure.input.chat_input import _can_use_pt
     assert _can_use_pt() is False
 
 
 @t("SlashCompleter 对 / 返回 6 个补全")
 def test_completer():
-    from src.chat_input import SlashCompleter, SLASH_COMMANDS, _HAS_PT
+    from src.infrastructure.input.chat_input import SlashCompleter, SLASH_COMMANDS, _HAS_PT
     if not _HAS_PT:
         print(" (跳过: prompt_toolkit 未安装)", end="")
         return
@@ -85,7 +85,7 @@ def test_normalize():
 
 @t("降级路径: /done 终止 + 保留 /undo /clear 语义")
 def test_fallback_behavior():
-    from src.chat_input import ChatInputSession
+    from src.infrastructure.input.chat_input import ChatInputSession
     s = ChatInputSession()
 
     sys.stdin = io.StringIO("line 1\nline 2\n/done\n")
@@ -105,7 +105,7 @@ def test_fallback_behavior():
 
 @t("历史文件: 首启创建 + 不可写时退到 InMemoryHistory")
 def test_history():
-    from src.chat_input import _make_history, _history_path, _HAS_PT
+    from src.infrastructure.input.chat_input import _make_history, _history_path, _HAS_PT
     if not _HAS_PT:
         print(" (跳过: prompt_toolkit 未安装)", end="")
         return
@@ -127,7 +127,7 @@ def test_history():
 
 @t("_looks_like_yaml 识别 project:/tasks:/- id: 关键字")
 def test_yaml_detect():
-    from src.chat_input import _looks_like_yaml
+    from src.infrastructure.input.chat_input import _looks_like_yaml
     assert _looks_like_yaml("project:\n  repo: foo")
     assert _looks_like_yaml("tasks:\n  - id: x")
     assert not _looks_like_yaml("我要做一个登录系统")

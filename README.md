@@ -1,4 +1,4 @@
-# Claude Parallel v0.3.1
+# Claude Parallel v0.4.0
 
 多 Claude Code 并行协同执行框架。通过 YAML 定义任务依赖关系，自动编排多个 Claude Code 实例并行工作。
 
@@ -79,6 +79,66 @@
 - **Release 包 dSYM 自动发现** — 5 级搜索策略: DerivedData → Xcode Archives → Spotlight UUID → 设备 UUID 提取 → App Store Connect API 下载，支持 xcodebuild -downloadDsyms 和 JWT 认证
 - **WebKit PID 动态刷新** — 每 N cycle 自动重新扫描 WebContent PID，PID 变化时记录事件并迁移采集目标，连续 3 次未找到自动停止 daemon
 - **binary UUID 提取** — `extract_binary_uuid()` 用 dwarfdump 从 App 二进制提取 UUID，用于 dSYM 精确匹配
+
+### 架构分层 + 实时方法定位 (Phase 5 — v0.4.0)
+
+**架构重构** — `src/` 从平铺单层演化为 4 层 + perf 内部 6 层:
+
+```
+src/
+├── app/            ① 应用入口 (CLI argparse + 命令分发)
+├── application/    ② 编排与工作流 (orchestration / worker / merge / review / validation / context_extraction)
+├── domain/         ③ 领域模型 (Task / ProjectConfig / WorkerResult — 纯数据无行为)
+├── infrastructure/ ④ 外部设施 (claude/ input/ storage/ monitoring/ dashboard/ 适配器)
+└── perf/           ⑤ perf 子系统 (内部 6 层)
+    ├── protocol/   与设备/协议通信 (reconnect / dvt / device)
+    ├── capture/    原始数据采集 (sampling / webcontent / live_log / live_metrics)
+    ├── decode/     Schema/XML 解析 (templates / timeprofiler / deep_export / time_sync)
+    ├── locate/     符号定位层 (linkmap / atos / cache / resolver / dsym)
+    ├── analyze/    高层分析 (power_attribution / ai_diagnosis / callstack / metrics / syslog_stats)
+    └── present/    呈现 (report_html / dvt_metrics)
+```
+
+依赖方向: `app → application → domain ← infrastructure`; perf 只依赖 domain + infrastructure。
+
+**实时方法定位统一入口** — `SymbolResolver` 三层查询:
+
+```
+addr ─► ① LRU cache (0.01ms) ─► ② LinkMap bisect (0.1ms)
+                                          ↓ miss
+                                   ③ atos daemon (2ms 常驻 stdin/stdout 进程池)
+                                          ↓ miss
+                                   ④ hex 兜底 (500ms timeout 保险)
+```
+
+- **常驻 atos daemon** (`src.perf.locate.atos.AtosDaemon`) — 消除每次 subprocess 500ms 启动开销,线程安全 lookup,5 次连续失败自动黑名单
+- **LRU cache 持久化** (`src.perf.locate.cache.SymbolCache`) — OrderedDict + 原子 JSON 落盘,session 间恢复命中
+- **In-cycle 符号化** — sampling cycle 的 `aggregate_top_n` 后立即批量 resolve,JSONL 每条带 `source` 字段 (`cache | linkmap | atos | unresolved`)
+- **xctrace overhead 过滤** — `aggregate_top_n(filter_overhead=True)` 剔除 `dyld3::findClosestSymbol` 等 xctrace 自身采样开销 (实测饱和 Top-10 达 45%),让业务热点真正可见
+
+**新增 CLI 旗标** (激活 resolver):
+
+```bash
+# perf start 子命令
+cpar perf start --binary PATH --linkmap PATH --dsym PATH ...
+
+# run --with-perf 主流程 (同样生效)
+cpar run tasks.yaml --with-perf \
+  --perf-binary PATH --perf-linkmap PATH --perf-dsym PATH ...
+```
+
+**使用示例** (iOS debug 构建需用 `.debug.dylib`,iOS arm64 app 标准基址 `0x100000000`):
+
+```bash
+cpar perf start --repo ~/SoulApp --tag live \
+  --device UDID --attach Soul_New \
+  --sampling --metrics-source device \
+  --binary ~/Library/Developer/Xcode/DerivedData/Soul_New-*/Build/Products/Debug-iphoneos/Soul_New.app/Soul_New.debug.dylib \
+  --linkmap ~/Library/Developer/Xcode/DerivedData/Soul_New-*/Build/Intermediates.noindex/Soul_New.build/Debug-iphoneos/Soul_New.build/Soul_New-LinkMap-normal-arm64.txt
+
+# 查看业务符号已命中的 Top-N (过滤 xctrace overhead)
+cpar perf hotspots --repo ~/SoulApp --tag live --aggregate
+```
 
 ```bash
 # 符号化业务代码调用栈 (自动搜索 dSYM: DerivedData → Archives → ASC)

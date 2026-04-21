@@ -49,6 +49,9 @@ def register_perf_subcommands(subparsers):
         help='Composite 模式: auto|full|webperf|power_cpu|gpu_full|memory|power+time+network|""',
     )
     perf_start.add_argument("--no-tunneld", action="store_true", help="跳过自动启动 tunneld (iOS 17+ DVT 通道将不可用)")
+    perf_start.add_argument("--binary", default="", help="主 binary 路径 (用于 atos 符号化)")
+    perf_start.add_argument("--linkmap", default="", help="LinkMap 文件路径 (业务符号解析)")
+    perf_start.add_argument("--dsym", action="append", default=[], help="dSYM 路径 (可多次指定)")
 
     perf_stop = perf_sub.add_parser("stop", help="停止 perf 采集")
     perf_stop.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
@@ -272,6 +275,9 @@ async def cmd_perf_start(args):
         battery_interval_sec=int(defaults.resolve("battery_interval", getattr(args, "battery_interval", None), 10)),
         attach_webcontent=defaults.resolve_bool("attach_webcontent", getattr(args, "attach_webcontent", None), False),
         composite=defaults.resolve("composite", getattr(args, "composite", None), "auto"),
+        binary_path=getattr(args, "binary", "") or "",
+        linkmap_path=getattr(args, "linkmap", "") or "",
+        dsym_paths=list(getattr(args, "dsym", []) or []),
     )
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)
     meta = perf.start()
@@ -713,8 +719,8 @@ def _ensure_tunneld_for_perf(args):
 
 
 def cmd_perf_linkmap(args):
-    """LinkMap 解析与符号查询，转发到 src.perf.linkmap.main()"""
-    from src.perf.linkmap import LinkMap, MultiLinkMap, find_linkmaps, CACHE_DIR
+    """LinkMap 解析与符号查询，转发到 src.perf.locate.linkmap.main()"""
+    from src.perf.locate.linkmap import LinkMap, MultiLinkMap, find_linkmaps, CACHE_DIR
     from datetime import datetime
     import json as _json
     import time as _time
@@ -1127,7 +1133,7 @@ async def cmd_perf_stream(args):
 
 async def cmd_perf_snapshot(args):
     """立即导出当前指标快照"""
-    from src.perf.live_metrics import build_snapshot_from_exports
+    from src.perf.capture.live_metrics import build_snapshot_from_exports
 
     trace_file = Path(args.trace)
     if not trace_file.exists():
@@ -1177,7 +1183,7 @@ async def cmd_perf_callstack(args):
 
 async def cmd_perf_metrics(args):
     """Per-process 指标查看"""
-    from src.perf.device_metrics import read_process_metrics_jsonl, format_process_metrics_text
+    from src.perf.protocol.device import read_process_metrics_jsonl, format_process_metrics_text
 
     repo, tag, _ = _resolve_perf_repo_tag(args)
     if not repo:
@@ -1201,7 +1207,7 @@ async def cmd_perf_metrics(args):
 
 async def cmd_perf_battery(args):
     """电池趋势查看"""
-    from src.perf.device_metrics import read_battery_jsonl, format_battery_text
+    from src.perf.protocol.device import read_battery_jsonl, format_battery_text
 
     repo, tag, _ = _resolve_perf_repo_tag(args)
     if not repo:
@@ -1226,7 +1232,7 @@ async def cmd_perf_battery(args):
 async def cmd_perf_dashboard(args):
     """全指标统一仪表盘"""
     import time as _time
-    from src.perf.device_metrics import read_battery_jsonl
+    from src.perf.protocol.device import read_battery_jsonl
 
     repo, tag, _ = _resolve_perf_repo_tag(args)
     if not repo:
@@ -1357,7 +1363,7 @@ async def cmd_perf_dashboard(args):
 
 async def cmd_perf_webcontent(args):
     """WebContent 进程热点查看"""
-    from src.perf.webcontent import read_webcontent_hotspots, format_webcontent_hotspots
+    from src.perf.capture.webcontent import read_webcontent_hotspots, format_webcontent_hotspots
 
     repo, tag, _ = _resolve_perf_repo_tag(args)
     if not repo:
@@ -1381,7 +1387,7 @@ async def cmd_perf_webcontent(args):
 
 async def cmd_perf_hotspots(args):
     """运行时热点函数查看"""
-    from src.perf.sampling import read_hotspots_jsonl, format_hotspots_text
+    from src.perf.capture.sampling import read_hotspots_jsonl, format_hotspots_text
 
     repo, tag, _ = _resolve_perf_repo_tag(args)
     if not repo:
@@ -1433,7 +1439,7 @@ async def cmd_perf_hotspots(args):
 async def cmd_perf_templates(args):
     """模板管理"""
     from src.perf import TemplateLibrary, BUILTIN_TEMPLATES
-    from src.perf.templates import (
+    from src.perf.decode.templates import (
         list_available_devices,
         list_available_templates as xctrace_templates,
         build_xctrace_record_cmd,
@@ -1496,10 +1502,10 @@ async def cmd_perf_templates(args):
 async def cmd_perf_symbolicate(args):
     """dSYM 符号化"""
     from pathlib import Path
-    from src.perf.symbolicate import (
+    from src.perf.locate.dsym import (
         find_dsym, find_dsym_by_uuid, auto_symbolicate,
     )
-    from src.perf.sampling import read_hotspots_jsonl
+    from src.perf.capture.sampling import read_hotspots_jsonl
 
     repo, tag, _ = _resolve_perf_repo_tag(args)
     if not repo:
@@ -1563,7 +1569,7 @@ async def cmd_perf_symbolicate(args):
 async def cmd_perf_time_sync(args):
     """syslog-xctrace 时序对齐"""
     from pathlib import Path
-    from src.perf.time_sync import (
+    from src.perf.decode.time_sync import (
         parse_syslog_timestamps, parse_xctrace_timeline,
         align_timelines, correlate_events, format_event_report,
         run_time_sync,
@@ -1609,7 +1615,7 @@ async def cmd_perf_time_sync(args):
 async def cmd_perf_deep_export(args):
     """深度 Schema 采集"""
     from pathlib import Path
-    from src.perf.deep_export import (
+    from src.perf.decode.deep_export import (
         deep_export_all, format_deep_report, probe_trace_schemas,
     )
 
@@ -1660,7 +1666,7 @@ async def cmd_perf_deep_export(args):
 async def cmd_perf_power_attr(args):
     """进程级功耗归因"""
     from pathlib import Path
-    from src.perf.power_attribution import (
+    from src.perf.analyze.power_attribution import (
         parse_system_power, parse_process_cpu,
         attribute_power, format_attribution_report,
     )
@@ -1716,7 +1722,7 @@ async def cmd_perf_power_attr(args):
 async def cmd_perf_ai_diag(args):
     """AI 辅助诊断"""
     from pathlib import Path
-    from src.perf.ai_diagnosis import (
+    from src.perf.analyze.ai_diagnosis import (
         collect_diagnosis_context, build_diagnosis_prompt,
         call_llm, parse_diagnosis_response, format_diagnosis_report,
         run_diagnosis, generate_regression_analysis, generate_webkit_report,

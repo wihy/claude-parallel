@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from src.orchestrator import Orchestrator
-from src.validator import TaskValidator
+from src.application.orchestration import Orchestrator
+from src.application.validation import TaskValidator
 from src.perf import PerfConfig, PerfSessionManager
 from src.perf.perf_defaults import PerfDefaults
 from src.infrastructure.storage.atomic import safe_read_json
@@ -131,6 +131,9 @@ def build_perf_config_from_args(args) -> PerfConfig:
         battery_interval_sec=int(getattr(args, "perf_battery_interval", 10) or 10),
         attach_webcontent=bool(getattr(args, "perf_attach_webcontent", False)),
         composite=getattr(args, "perf_composite", "auto") or "auto",
+        binary_path=getattr(args, "perf_binary", "") or "",
+        linkmap_path=getattr(args, "perf_linkmap", "") or "",
+        dsym_paths=list(getattr(args, "perf_dsym", []) or []),
     )
 
 
@@ -288,7 +291,7 @@ async def cmd_plan(args):
 
 async def cmd_merge_impl(args, orch: Orchestrator):
     """使用 WorktreeMerger 合并"""
-    from src.merger import WorktreeMerger
+    from src.application.merge import WorktreeMerger
 
     merger = WorktreeMerger(
         config=orch.config,
@@ -306,7 +309,7 @@ async def cmd_merge(args):
     orch.load()
 
     # 加载已有结果（safe_read_json 可吃掉并发半写产生的损坏文件）
-    from src.worker import WorkerResult
+    from src.application.worker import WorkerResult
     coord_dir = orch.coord_dir
     for task in orch.tasks:
         result_file = coord_dir / "coord" / f"{task.id}.result"
@@ -343,7 +346,7 @@ async def cmd_diff(args):
     orch.load()
 
     # 加载已有结果（safe_read_json 防并发半写）
-    from src.worker import WorkerResult
+    from src.application.worker import WorkerResult
     coord_dir = orch.coord_dir
     for task in orch.tasks:
         result_file = coord_dir / "coord" / f"{task.id}.result"
@@ -359,7 +362,7 @@ async def cmd_diff(args):
         except KeyError:
             continue
 
-    from src.merger import WorktreeMerger
+    from src.application.merge import WorktreeMerger
     merger = WorktreeMerger(
         config=orch.config,
         coord_dir=orch.coord_dir,
@@ -376,7 +379,7 @@ async def cmd_review(args):
     orch.load()
 
     # 加载已有结果（safe_read_json 防并发半写）
-    from src.worker import WorkerResult
+    from src.application.worker import WorkerResult
     coord_dir = orch.coord_dir
     for task in orch.tasks:
         result_file = coord_dir / "coord" / f"{task.id}.result"
@@ -399,7 +402,7 @@ async def cmd_review(args):
         except KeyError:
             continue
 
-    from src.reviewer import CodeReviewer
+    from src.application.review import CodeReviewer
     reviewer = CodeReviewer(
         config=orch.config,
         coord_dir=orch.coord_dir,

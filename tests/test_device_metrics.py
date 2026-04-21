@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from src.perf.device_metrics import (
+from src.perf.protocol.device import (
     BatteryPoller,
     ProcessMetricsStreamer,
     _read_battery,
@@ -50,7 +50,7 @@ BATTERY_PLIST = """\
 
 
 class TestReadBattery(unittest.TestCase):
-    @patch("src.perf.device_metrics.subprocess.run")
+    @patch("src.perf.protocol.device.subprocess.run")
     def test_parse_plist(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0, stdout=BATTERY_PLIST
@@ -63,7 +63,7 @@ class TestReadBattery(unittest.TestCase):
         self.assertFalse(data["fully_charged"])
         self.assertIn("ts", data)
 
-    @patch("src.perf.device_metrics.subprocess.run")
+    @patch("src.perf.protocol.device.subprocess.run")
     def test_ideviceinfo_failure(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stdout="")
         data = _read_battery("TEST_UDID")
@@ -82,7 +82,7 @@ class TestProcessMetricsStreamer(unittest.TestCase):
         # pymobiledevice3 is installed in this env
         self.assertTrue(ProcessMetricsStreamer.check_available())
 
-    @patch("src.perf.device_metrics.subprocess.run")
+    @patch("src.perf.protocol.device.subprocess.run")
     def test_check_tunneld_not_running(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1)
         self.assertFalse(ProcessMetricsStreamer.check_tunneld_running())

@@ -28,9 +28,9 @@ sys.path.insert(0, str(REPO_ROOT))
 EXAMPLES_DIR = REPO_ROOT / "examples"
 RUN_FILE = REPO_ROOT / "run.py"
 
-from src.validator import TaskValidator
-from src.chat_input import ChatInputSession
-from src.claude_client import (
+from src.application.validation import TaskValidator
+from src.infrastructure.input.chat_input import ChatInputSession
+from src.infrastructure.claude.client import (
     call_claude as _call_claude_impl,
     is_budget_error,
     is_quota_error,

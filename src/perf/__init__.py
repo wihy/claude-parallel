@@ -1,30 +1,30 @@
 """
 cpar perf 子包 — 真机性能采集、实时分析、报告生成。
 
-模块:
-- config:             PerfConfig 数据类
-- session:            PerfSessionManager 生命周期管理
-- live_log:           LiveLogAnalyzer 实时 syslog 流式分析
-- live_metrics:       LiveMetricsStreamer 实时 xctrace 指标流
-- templates:          TemplateLibrary Instruments 模板注册与扩展
-- integrator:         与 Orchestrator 的深度集成胶水
-- symbolicate:        dSYM 符号化 (atos / dsymutil / Swift demangle)
-- time_sync:          syslog-xctrace 时序对齐与事件归因
-- power_attribution:  进程级功耗归因与异常检测
+模块 (分层子包):
+- config:                    PerfConfig 数据类
+- session:                   PerfSessionManager 生命周期管理
+- capture.live_log:          LiveLogAnalyzer 实时 syslog 流式分析
+- capture.live_metrics:      LiveMetricsStreamer 实时 xctrace 指标流
+- decode.templates:          TemplateLibrary Instruments 模板注册与扩展
+- integrator:                与 Orchestrator 的深度集成胶水
+- locate.dsym:               dSYM 符号化 (atos / dsymutil / Swift demangle)
+- decode.time_sync:          syslog-xctrace 时序对齐与事件归因
+- analyze.power_attribution: 进程级功耗归因与异常检测
 """
 
 from .config import PerfConfig
-from .reconnect import ReconnectableMixin, ReconnectPolicy
+from .protocol.reconnect import ReconnectableMixin, ReconnectPolicy
 from .session import PerfSessionManager
-from .live_log import LiveLogAnalyzer, LogRule, DEFAULT_RULES
-from .live_metrics import (
+from .capture.live_log import LiveLogAnalyzer, LogRule, DEFAULT_RULES
+from .capture.live_metrics import (
     LiveMetricsStreamer,
     MetricSnapshot,
     MetricThreshold,
     DEFAULT_THRESHOLDS,
     build_snapshot_from_exports,
 )
-from .templates import (
+from .decode.templates import (
     InstrumentTemplate,
     TemplateLibrary,
     BUILTIN_TEMPLATES,
@@ -35,7 +35,7 @@ from .templates import (
     list_available_devices,
     list_available_templates,
 )
-from .device_metrics import (
+from .protocol.device import (
     BatteryPoller,
     ProcessMetricsStreamer,
     read_battery_jsonl,
@@ -43,7 +43,7 @@ from .device_metrics import (
     format_battery_text,
     format_process_metrics_text,
 )
-from .dvt_bridge import (
+from .protocol.dvt import (
     DvtBridgeThread,
     DvtBridgeSession,
     DvtProcessSnapshot,
@@ -56,22 +56,24 @@ from .dvt_bridge import (
     format_dvt_process_text,
     dvt_bridge_main,
 )
-from .sampling import (
+from .capture.sampling import (
     SamplingProfilerSidecar,
     HotspotSnapshot,
-    export_xctrace_schema,
-    parse_timeprofiler_xml,
-    aggregate_top_n,
     read_hotspots_jsonl,
     format_hotspots_text,
 )
-from .webcontent import (
+from .decode.timeprofiler import (
+    export_xctrace_schema,
+    parse_timeprofiler_xml,
+    aggregate_top_n,
+)
+from .capture.webcontent import (
     WebContentProfiler,
     find_webcontent_pids,
     read_webcontent_hotspots,
     format_webcontent_hotspots,
 )
-from .deep_export import (
+from .decode.deep_export import (
     DEEP_SCHEMAS,
     export_deep_schema,
     parse_gpu_frame_time,
@@ -82,7 +84,7 @@ from .deep_export import (
     format_deep_report,
     probe_trace_schemas,
 )
-from .symbolicate import (
+from .locate.dsym import (
     find_dsym,
     find_dsym_by_uuid,
     find_dsym_in_archives,
@@ -95,7 +97,7 @@ from .symbolicate import (
     extract_binary_uuid,
     extract_app_uuid_from_device,
 )
-from .time_sync import (
+from .decode.time_sync import (
     SyslogEvent,
     CorrelatedEvent,
     get_device_uptime,
@@ -107,7 +109,7 @@ from .time_sync import (
     run_time_sync,
 )
 from .integrator import PerfIntegrator
-from .power_attribution import (
+from .analyze.power_attribution import (
     ProcessPower,
     ProcessLifecycleEvent,
     AnomalyEvent,
@@ -120,7 +122,7 @@ from .power_attribution import (
     format_attribution_report,
     read_lifecycle_events,
 )
-from .ai_diagnosis import (
+from .analyze.ai_diagnosis import (
     DiagnosisContext,
     DiagnosisResult,
     collect_diagnosis_context,
@@ -132,7 +134,7 @@ from .ai_diagnosis import (
     format_diagnosis_report,
     run_diagnosis,
 )
-from .report_html import generate_html_report
+from .present.report_html import generate_html_report
 from .perf_defaults import PerfDefaults
 
 __all__ = [

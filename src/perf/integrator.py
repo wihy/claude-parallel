@@ -15,10 +15,10 @@ from typing import Optional, Dict, Any
 
 from .config import PerfConfig
 from .session import PerfSessionManager
-from .live_log import LiveLogAnalyzer, LogRule, DEFAULT_RULES
-from .live_metrics import LiveMetricsStreamer, MetricSnapshot, DEFAULT_THRESHOLDS
-from .sampling import read_hotspots_jsonl, format_hotspots_text
-from .templates import TemplateLibrary
+from .capture.live_log import LiveLogAnalyzer, LogRule, DEFAULT_RULES
+from .capture.live_metrics import LiveMetricsStreamer, MetricSnapshot, DEFAULT_THRESHOLDS
+from .capture.sampling import read_hotspots_jsonl, format_hotspots_text
+from .decode.templates import TemplateLibrary
 
 
 class PerfIntegrator:
