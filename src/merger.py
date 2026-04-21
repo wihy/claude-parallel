@@ -6,12 +6,16 @@ resolving conflicts automatically when possible by invoking Claude.
 """
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from .task_parser import Task, ProjectConfig
+from .claude_client import call_claude_async, strip_code_fences
+from .domain.tasks import Task, ProjectConfig
 from .worker import WorkerResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -261,7 +265,7 @@ class WorktreeMerger:
             print(f"\n  Rollback 命令: git -C {self._main_repo} reset --hard {pre_head[:12]}")
         return report
 
-    async def _check_main_clean(self) -> tuple[bool, str]:
+    async def _check_main_clean(self) -> Tuple[bool, str]:
         """检查主仓库工作区是否干净。返回 (dirty?, 描述)"""
         stdout, _, rc = await self._git(
             ["status", "--porcelain"], cwd=self._main_repo, check=False
@@ -282,7 +286,7 @@ class WorktreeMerger:
         """保存 pre-merge HEAD 到协调目录，便于事故回滚"""
         try:
             import time as _time
-            from .fs_utils import atomic_write_text
+            from .infrastructure.storage.atomic import atomic_write_text
             rb_file = self.coord_dir / "merge-rollback.txt"
             text = (
                 f"# Pre-merge HEAD (saved by WorktreeMerger)\n"
@@ -489,12 +493,12 @@ class WorktreeMerger:
         try:
             conflicted_content = full_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            print(f"  [merger]   Cannot read conflicted file {filepath}: {exc}")
+            logger.debug("Cannot read conflicted file %s: %s", filepath, exc)
             return None
 
         # Skip binary files (crude heuristic)
         if "\x00" in conflicted_content:
-            print(f"  [merger]   Skipping binary file: {filepath}")
+            logger.debug("Skipping binary file: %s", filepath)
             return None
 
         prompt = (
@@ -509,59 +513,31 @@ class WorktreeMerger:
             "--- END CONFLICTED FILE ---\n"
         )
 
-        # Call Claude CLI
+        # Call Claude CLI via shared async client
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "claude",
-                "-p",
+            success, output, err = await call_claude_async(
                 prompt,
-                "--output-format",
-                "text",
+                timeout=300,
                 cwd=str(self._main_repo),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                output_format="text",
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=300
-            )
-        except asyncio.TimeoutError:
-            print(f"  [merger]   Claude timed out resolving {filepath}")
-            return None
-        except FileNotFoundError:
-            print("  [merger]   'claude' CLI not found; cannot auto-resolve")
+        except Exception as exc:
+            logger.debug("Claude async call failed for %s: %s", filepath, exc)
             return None
 
-        if proc.returncode != 0:
-            err = stderr.decode().strip() if stderr else "unknown error"
-            print(f"  [merger]   Claude error for {filepath}: {err}")
+        if not success:
+            logger.debug("Claude error for %s: %s", filepath, err)
             return None
-
-        resolved = stdout.decode("utf-8", errors="replace")
 
         # Strip potential markdown code fences that Claude might add
-        resolved = self._strip_code_fences(resolved)
+        resolved = strip_code_fences(output)
 
         # Verify no conflict markers remain
         if "<<<<<<" in resolved or ">>>>>>" in resolved:
-            print(f"  [merger]   Claude output still contains conflict markers in {filepath}")
+            logger.debug("Claude output still contains conflict markers in %s", filepath)
             return None
 
         return resolved
-
-    @staticmethod
-    def _strip_code_fences(text: str) -> str:
-        """Remove surrounding markdown code fences if present."""
-        lines = text.split("\n")
-
-        # Remove leading fence
-        if lines and lines[0].strip().startswith("```"):
-            lines = lines[1:]
-
-        # Remove trailing fence
-        while lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-
-        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Diff preview

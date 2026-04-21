@@ -585,8 +585,8 @@ class DvtBridgeSession(ReconnectableMixin):
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(data, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("JSONL 写入失败: %s", e, exc_info=True)
 
     def _log_error(self, msg: str):
         self._error_count += 1
@@ -634,8 +634,8 @@ class DvtBridgeSession(ReconnectableMixin):
                                 # 转 bytes/复杂对象到 str
                                 try:
                                     record[k] = v if isinstance(v, (int, float, str, bool, type(None))) else str(v)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug("网络事件字段序列化失败 k=%s: %s", k, e)
                     self._append_jsonl(self.network_jsonl, record)
         except Exception as e:
             self._log_error(f"NetworkMonitor 流异常退出: {e!r}")
@@ -680,8 +680,8 @@ class DvtBridgeSession(ReconnectableMixin):
         finally:
             try:
                 await channel.stopMonitoring()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("stopMonitoring 失败: %s", e)
 
 
 # ── DVT Bridge 线程 (桥接 asyncio 和 cpar 线程模型) ──
@@ -846,8 +846,8 @@ class DvtBridgeThread:
         def wrapper(data):
             try:
                 callback(data)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("回调执行异常: %s", e, exc_info=True)
 
         return wrapper
 
@@ -986,8 +986,8 @@ def check_dvt_available() -> Dict[str, Any]:
             capture_output=True, timeout=3,
         )
         result["tunneld"] = proc.returncode == 0
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("tunneld 检查失败: %s", e)
 
     # 检查 usbmux
     try:
@@ -995,8 +995,8 @@ def check_dvt_available() -> Dict[str, Any]:
         devices = usbmuxd.select_devices()
         result["usbmux"] = True
         result["usbmux_devices"] = len(devices)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("usbmux 检查失败: %s", e)
 
     return result
 
@@ -1033,8 +1033,8 @@ def _read_jsonl(path: Path, last_n: int = 0) -> List[Dict[str, Any]]:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("读取 JSONL 文件失败 %s: %s", path, e)
     if last_n > 0:
         records = records[-last_n:]
     return records

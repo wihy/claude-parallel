@@ -19,16 +19,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .fs_utils import (
+from .infrastructure.storage.atomic import (
     atomic_write_json, atomic_write_text, safe_read_json,
     acquire_pid_lock, release_pid_lock, list_active_locks,
 )
-from .task_parser import (
+from .domain.tasks import (
     Task, ProjectConfig, parse_task_file,
     topological_levels, get_task_map,
 )
 from .worker import Worker, WorkerResult, retry_worker
-from .monitor import Monitor
+from .infrastructure.monitoring.rich_monitor import Monitor
 from .merger import WorktreeMerger, MergeReport
 from .context_extractor import extract_context_for_downstream
 from .perf import PerfConfig, PerfSessionManager, PerfIntegrator

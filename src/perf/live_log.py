@@ -10,6 +10,7 @@ LiveLogAnalyzer — 实时 syslog 流式分析引擎。
 """
 
 import json
+import logging
 import os
 import re
 import signal
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable
 
 from .reconnect import ReconnectableMixin, ReconnectPolicy
+
+logger = logging.getLogger(__name__)
 
 
 # ── 规则定义 ──
@@ -323,11 +326,12 @@ class LiveLogAnalyzer(ReconnectableMixin):
             try:
                 self._process.terminate()
                 self._process.wait(timeout=5)
-            except Exception:
+            except Exception as e:
+                logger.debug("进程 terminate 失败: %s", e)
                 try:
                     self._process.kill()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("进程 kill 失败: %s", e)
 
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
@@ -475,8 +479,8 @@ class LiveLogAnalyzer(ReconnectableMixin):
                     "syslog_disconnect",
                     detail=f"idevicesyslog disconnected: {reason}",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("mark_event disconnect 失败: %s", e)
 
     def _on_syslog_reconnect(self):
         """重连 mixin 回调: 重连成功时记录事件。"""
@@ -487,8 +491,8 @@ class LiveLogAnalyzer(ReconnectableMixin):
                     "syslog_reconnect",
                     detail=f"idevicesyslog reconnected (PID={self._process.pid})",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("mark_event reconnect 失败: %s", e)
 
     def _reconnectable_reader_loop(self):
         """外层循环: 断连时自动重连。"""
@@ -583,8 +587,8 @@ class LiveLogAnalyzer(ReconnectableMixin):
             err_path.parent.mkdir(parents=True, exist_ok=True)
             with open(err_path, "a", encoding="utf-8") as f:
                 f.write(f"[{ts}] {msg}\n")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("错误日志写入失败: %s", e)
 
     def _analyze_line(self, line: str):
         """对一行日志应用所有规则"""
@@ -610,15 +614,15 @@ class LiveLogAnalyzer(ReconnectableMixin):
                         f"alert_{rule.name}",
                         detail=f"[{rule.level.upper()}] {rule.description}: {alert['match'][:100]}",
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("mark_event alert 失败: %s", e)
 
             # 回调
             if self.alert_callback:
                 try:
                     self.alert_callback(alert)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("alert_callback 执行异常: %s", e, exc_info=True)
 
     def _write_alert_log(self, alert: Dict[str, Any]):
         if not self.alert_log_path:
@@ -628,5 +632,5 @@ class LiveLogAnalyzer(ReconnectableMixin):
             line = f"[{ts}] [{alert['level'].upper()}] {alert['rule']}: {alert['match'][:150]}\n"
             with open(self.alert_log_path, "a", encoding="utf-8") as f:
                 f.write(line)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("告警日志写入失败: %s", e)

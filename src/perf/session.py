@@ -29,7 +29,7 @@ from .sampling import (
     extract_mnemonic_value,
     parse_timeprofiler_xml,
 )
-from ..fs_utils import atomic_write_json, safe_read_json
+from ..infrastructure.storage.atomic import atomic_write_json, safe_read_json
 
 
 class PerfSessionManager:

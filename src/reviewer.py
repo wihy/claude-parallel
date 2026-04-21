@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .task_parser import ProjectConfig, Task
+from .domain.tasks import ProjectConfig, Task
 from .worker import WorkerResult
 
 

@@ -288,47 +288,52 @@ perf 子命令 (21 个):
 claude-parallel/
 ├── run.py                      # CLI 入口
 ├── chat.py                     # 对话模式入口
-├── cpar                        # 封装脚本
+├── cpar                        # Shell 封装脚本
 ├── src/
-│   ├── cli.py                  # CLI 命令处理 (21 perf 子命令)
+│   ├── claude_client.py        # ★ 统一 Claude CLI 调用 + 重试 + 错误分类
 │   ├── task_parser.py          # YAML 解析 + DAG 拓扑排序
 │   ├── worker.py               # Worker 进程管理 + 重试 + 日志
 │   ├── orchestrator.py         # 调度器 (DAG/重试/预算/恢复)
-│   ├── monitor.py              # Rich Live 实时进度面板
-│   ├── merger.py               # Worktree 合并 + 冲突自动解决
+│   ├── merger.py               # Worktree 合并 + Claude 辅助冲突解决
 │   ├── reviewer.py             # 自动 Code Review
-│   ├── validator.py            # YAML 配置校验
+│   ├── validator.py            # YAML 配置校验 (含 task_id 安全白名单)
 │   ├── context_extractor.py    # 多语言上下文提取
-│   ├── chat_input.py           # 多行富文本输入 (prompt_toolkit)
-│   └── perf/                   # 真机性能采集子系统 (17 模块, 11,087 行)
-│       ├── config.py           # PerfConfig 数据类 (39 行)
-│       ├── reconnect.py        # ReconnectableMixin 自动重连 (182 行)
-│       ├── session.py          # 采集会话生命周期 (819 行)
-│       ├── sampling.py         # Sampling Profiler 旁路 (1,042 行)
-│       ├── live_log.py         # 实时 syslog 流式告警 + 自动重连 (632 行)
-│       ├── live_metrics.py     # 实时 xctrace 指标流 (608 行)
-│       ├── webcontent.py       # WebKit 进程分析 + PID 刷新 (579 行)
-│       ├── dvt_bridge.py       # pymobiledevice3 DVT 协议桥接 (692 行)
-│       ├── symbolicate.py      # dSYM 符号化 + 5 级搜索 (1,139 行)
-│       ├── time_sync.py        # syslog-xctrace 时序对齐 (857 行)
-│       ├── deep_export.py      # GPU/网络/VM/Metal 深度导出 (855 行)
-│       ├── power_attribution.py # 进程级功耗归因 + 多维CPU/GPU/Network拆分 (1,286 行)
-│       ├── ai_diagnosis.py     # AI 辅助诊断 (1,260 行)
-│       ├── device_metrics.py   # BatteryPoller + ProcessMetrics (355 行)
-│       ├── templates.py        # Instruments 模板管理 (317 行)
-│       ├── integrator.py       # 与 Orchestrator 集成胶水 (386 行)
-│       └── __init__.py         # 公共导出 (207 行)
-├── scripts/
-│   └── perf_e2e_smoke.sh       # iOS 真机端到端冒烟验证 (4 轮)
+│   ├── chat_input.py           # 多行输入 (readline)
+│   ├── domain/
+│   │   └── tasks.py            # Task/ProjectConfig 数据类 + 拓扑排序
+│   ├── app/
+│   │   ├── cli.py              # 主 CLI: argparse + 核心调度 (~514 行)
+│   │   ├── chat_cli.py         # 对话模式: planner + Rich UI
+│   │   ├── execution_cli.py    # 执行子命令 (run/resume/plan/merge/diff/review)
+│   │   ├── ops_cli.py          # 运维子命令 (clean/logs/dashboard)
+│   │   └── perf_cli.py         # ★ 所有 perf 子命令实现 (~1849 行)
+│   ├── infrastructure/
+│   │   ├── storage/atomic.py   # 原子 JSON 读写
+│   │   ├── monitoring/         # Rich Live 进度面板
+│   │   └── dashboard/          # Web 仪表盘 (WebSocket)
+│   └── perf/                   # 真机性能采集子系统 (20+ 模块)
+│       ├── config.py           # PerfConfig 数据类
+│       ├── session.py          # 采集会话生命周期
+│       ├── sampling.py         # Sampling Profiler 旁路
+│       ├── live_log.py         # 实时 syslog 流式告警 (13 规则, 自动重连)
+│       ├── live_metrics.py     # 实时 xctrace 指标流
+│       ├── webcontent.py       # WebKit 进程分析 + PID 动态刷新
+│       ├── dvt_bridge.py       # pymobiledevice3 DVT 协议桥接
+│       ├── symbolicate.py      # dSYM 符号化 (5 级搜索)
+│       ├── time_sync.py        # syslog-xctrace 时序对齐
+│       ├── deep_export.py      # GPU/网络/VM/Metal 深度导出
+│       ├── power_attribution.py # 进程级功耗归因 + 多维拆分
+│       ├── ai_diagnosis.py     # AI 辅助诊断 (5 focus + 回归分析)
+│       ├── device_metrics.py   # BatteryPoller + ProcessMetrics
+│       ├── templates.py        # Instruments 模板管理 (14 内置 + 5 组合)
+│       ├── integrator.py       # 与 Orchestrator 集成胶水
+│       ├── reconnect.py        # ReconnectableMixin 自动重连
+│       └── ...
 ├── tests/
 │   ├── test_chat_input.py      # 输入模块测试
 │   ├── test_perf_sampling.py   # Sampling + 解析器测试 (29 cases)
 │   └── test_device_metrics.py  # Device 指标测试 (15 cases)
-├── examples/
-│   ├── auth-system.yaml        # 4任务 DAG 示例
-│   ├── test-dag.yaml           # 端到端 DAG 测试
-│   ├── simple-parallel.yaml    # 简单并行
-│   └── test-p2.yaml            # Phase 2 测试
+├── examples/                   # YAML 示例
 ├── docs/
 │   ├── ARCHITECTURE.md         # 整体架构文档
 │   ├── QUICKSTART.md           # 快速上手模板

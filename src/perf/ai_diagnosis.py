@@ -755,7 +755,8 @@ def _read_meta_summary(meta_file: Path) -> str:
         return "(无 meta.json)"
     try:
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.debug("meta.json 解析失败: %s", e)
         return "(meta.json 解析失败)"
 
     lines = []
@@ -796,7 +797,8 @@ def _read_timeline_summary(timeline_file: Path) -> str:
     try:
         data = json.loads(timeline_file.read_text(encoding="utf-8"))
         events = data.get("events", [])
-    except Exception:
+    except Exception as e:
+        logger.debug("timeline 解析失败: %s", e)
         return "(timeline 解析失败)"
 
     if not events:
@@ -820,7 +822,8 @@ def _read_alert_log(alert_log: Path, max_items: int = 30) -> str:
     """读取 alert_log.jsonl 告警。"""
     try:
         lines = alert_log.read_text(encoding="utf-8").strip().splitlines()
-    except Exception:
+    except Exception as e:
+        logger.debug("告警日志读取失败: %s", e)
         return "(告警日志读取失败)"
 
     alerts = []
@@ -866,7 +869,8 @@ def _tail_file(filepath: Path, lines: int = 50) -> str:
         all_lines = filepath.read_text(errors="replace").splitlines()
         tailed = all_lines[-lines:]
         return "\n".join(tailed)
-    except Exception:
+    except Exception as e:
+        logger.debug("文件尾部读取失败 %s: %s", filepath, e)
         return "(文件读取失败)"
 
 
@@ -874,7 +878,8 @@ def _fallback_read_jsonl_text(filepath: Path, max_lines: int = 10) -> str:
     """JSONL 回退：直接格式化每行的 JSON。"""
     try:
         raw_lines = filepath.read_text(encoding="utf-8").strip().splitlines()
-    except Exception:
+    except Exception as e:
+        logger.debug("JSONL 读取失败 %s: %s", filepath, e)
         return ""
     if not raw_lines:
         return ""
@@ -942,8 +947,8 @@ def _collect_deep_schemas(
             vals = re.findall(r"<c[^>]*>([^<]+)</c>", text)
             if vals:
                 sections.append(f"## SystemPowerLevel\n  样本数: {len(vals) // 3}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("SystemPowerLevel XML 解析失败: %s", e)
 
     return "\n\n".join(sections)
 
@@ -955,7 +960,8 @@ def _load_meta_json(session_dir: str) -> Dict[str, Any]:
         return {}
     try:
         return json.loads(meta_file.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.debug("meta.json 加载失败 %s: %s", session_dir, e)
         return {}
 
 
@@ -1093,8 +1099,8 @@ def _extract_power_summary(
             for key in ("display_avg", "cpu_avg", "networking_avg"):
                 if metrics.get(key) is not None:
                     result[key] = metrics[key]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("report.json 读取失败: %s", e)
 
     # 从电池数据提取摘要
     if ctx.power_data:

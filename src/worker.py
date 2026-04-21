@@ -16,8 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .fs_utils import atomic_write_json, atomic_write_text
-from .task_parser import Task, ProjectConfig
+from .infrastructure.storage.atomic import atomic_write_json, atomic_write_text
+from .domain.tasks import Task, ProjectConfig
 
 
 @dataclass

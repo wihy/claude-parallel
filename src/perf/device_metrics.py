@@ -134,7 +134,8 @@ class ProcessMetricsStreamer:
                 capture_output=True, timeout=3,
             )
             return result.returncode == 0
-        except Exception:
+        except Exception as e:
+            logger.debug("tunneld 进程检查失败: %s", e)
             return False
 
     def start(self) -> int:
@@ -251,7 +252,8 @@ def _read_battery(device_udid: str) -> Optional[Dict[str, Any]]:
             "external_connected": plist.get("ExternalConnected", False),
             "fully_charged": plist.get("FullyCharged", False),
         }
-    except Exception:
+    except Exception as e:
+        logger.debug("电池数据采集失败: %s", e)
         return None
 
 
@@ -338,7 +340,8 @@ def _kill_pid(pid: int, grace_seconds: float = 5.0):
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         return
-    except Exception:
+    except Exception as e:
+        logger.debug("发送 SIGTERM 失败 pid=%s: %s", pid, e)
         return
 
     deadline = time.time() + grace_seconds
