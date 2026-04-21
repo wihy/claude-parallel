@@ -11,31 +11,13 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from src.infrastructure.storage.atomic import atomic_write_json, atomic_write_text
 from src.domain.tasks import Task, ProjectConfig
-
-
-@dataclass
-class WorkerResult:
-    """Worker 执行结果"""
-    task_id: str
-    success: bool
-    output: str = ""
-    error: str = ""
-    session_id: str = ""
-    cost_usd: float = 0.0
-    duration_s: float = 0.0
-    num_turns: int = 0
-    model_used: str = ""
-    worktree_path: str = ""
-    stop_reason: str = ""
-    retry_attempt: int = 0
-    json_raw: dict = field(default_factory=dict)
+from src.domain.worker_result import WorkerResult  # noqa: F401 re-export for back-compat
 
 
 class WorkerLogger:

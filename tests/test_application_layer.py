@@ -68,6 +68,22 @@ class ApplicationLayerTest(unittest.TestCase):
         from src.chat_input import ChatInputSession
         self.assertTrue(callable(ChatInputSession))
 
+    def test_worker_result_in_domain(self):
+        from src.domain.worker_result import WorkerResult
+        r = WorkerResult(task_id="t1", success=True)
+        self.assertEqual(r.task_id, "t1")
+        self.assertTrue(r.success)
+
+    def test_worker_result_still_reachable_via_worker(self):
+        # application.worker 应 re-export WorkerResult (避免一次性改所有消费方)
+        from src.application.worker import WorkerResult
+        self.assertTrue(WorkerResult.__module__.startswith("src.domain"))
+
+    def test_worker_result_shim_still_works(self):
+        # 老 shim 路径也应能拿到同一个类
+        from src.worker import WorkerResult
+        self.assertTrue(WorkerResult.__module__.startswith("src.domain"))
+
 
 if __name__ == "__main__":
     unittest.main()
