@@ -131,6 +131,9 @@ def build_perf_config_from_args(args) -> PerfConfig:
         battery_interval_sec=int(getattr(args, "perf_battery_interval", 10) or 10),
         attach_webcontent=bool(getattr(args, "perf_attach_webcontent", False)),
         composite=getattr(args, "perf_composite", "auto") or "auto",
+        binary_path=getattr(args, "perf_binary", "") or "",
+        linkmap_path=getattr(args, "perf_linkmap", "") or "",
+        dsym_paths=list(getattr(args, "perf_dsym", []) or []),
     )
 
 

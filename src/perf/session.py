@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -23,6 +24,7 @@ from .config import PerfConfig
 from .device_metrics import BatteryPoller, ProcessMetricsStreamer
 from .webcontent import WebContentProfiler
 from .dvt_bridge import DvtBridgeThread, check_dvt_available
+from .locate.resolver import SymbolResolver
 from .sampling import (
     SamplingProfilerSidecar,
     export_xctrace_schema,
@@ -49,6 +51,7 @@ class PerfSessionManager:
         self.process_streamer: Optional[ProcessMetricsStreamer] = None
         self.dvt_bridge_thread: Optional[DvtBridgeThread] = None
         self.webcontent_profiler: Optional[WebContentProfiler] = None
+        self._resolver: Optional[SymbolResolver] = None
 
     # ---------- lifecycle ----------
     def start(self) -> Dict[str, Any]:
@@ -60,6 +63,9 @@ class PerfSessionManager:
         meta = self._load_meta()
         if meta.get("status") == "running":
             return meta
+
+        # 启动符号解析器 (后台 warmup,sampling 起来时已可用)
+        self._wire_resolver(self.config)
 
         meta = {
             "tag": self.config.tag,
@@ -375,6 +381,7 @@ class PerfSessionManager:
                         interval_sec=self.config.sampling_interval_sec,
                         top_n=self.config.sampling_top_n,
                         retention=self.config.sampling_retention,
+                        resolver=self._resolver,
                     )
                     started = self.sampling_sidecar.start(as_subprocess=True)
                     meta["sampling"] = {
@@ -460,6 +467,9 @@ class PerfSessionManager:
         # 多模板进程
         for entry in meta.get("xctrace_multi", []):
             self._kill_pid(entry.get("pid", 0))
+
+        # 所有 sidecar 停完后再关 resolver — 让 in-flight lookup 有机会落 cache
+        self._teardown_resolver()
 
         meta["ended_at"] = time.time()
         meta["status"] = "stopped"
@@ -738,6 +748,33 @@ class PerfSessionManager:
 
     def _save_meta(self, meta: Dict[str, Any]):
         atomic_write_json(self.meta_file, meta)
+
+    # ---------- resolver wiring (Task 5) ----------
+    def _wire_resolver(self, cfg) -> None:
+        """session.start() 调用 — 构建 resolver + 后台 warmup。
+
+        若 cfg 里没配 binary/linkmap/dsym,from_config 返回 None —
+        此时 self._resolver 保持 None,sampling 会走原 hex 路径 (零破坏)。
+        """
+        self._resolver = SymbolResolver.from_config(cfg, self.repo)
+        if self._resolver is not None:
+            threading.Thread(
+                target=self._resolver.warmup,
+                name="resolver-warmup",
+                daemon=True,
+            ).start()
+
+    def _teardown_resolver(self) -> None:
+        """session.stop() 调用 — 关 atos daemon + flush cache。
+
+        shutdown 异常被吞,不影响其它 session 收尾工作。_resolver 为 None 时直接返回。
+        """
+        if self._resolver is not None:
+            try:
+                self._resolver.shutdown()
+            except Exception:
+                pass
+            self._resolver = None
 
     def _avg(self, arr: list) -> Optional[float]:
         if not arr:

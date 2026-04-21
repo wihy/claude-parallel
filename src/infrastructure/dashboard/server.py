@@ -102,22 +102,10 @@ def collect_perf_state(repo: Optional[Path], coord_dir: str, tag: str, tail_n: i
     state["metrics"] = _tail_jsonl(metrics_path, tail_n)
 
     # 采样热点（多 cycle 趋势分析需要更长历史）
+    # 符号化由 cycle 内 SymbolResolver 完成 (cache→linkmap→atos→hex),
+    # hotspots.jsonl 已是终态, 无需事后再解析
     hotspots_path = logs_dir / "hotspots.jsonl"
-    raw_hotspots = _tail_jsonl(hotspots_path, max(tail_n, 50))
-    # 二次符号化: 用 LinkMap 反查兜底符号
-    mlm = _get_global_linkmap()
-    if mlm is not None and raw_hotspots:
-        try:
-            from ...perf.resymbolize import resymbolize_cycles
-            new_cycles, resym_stats = resymbolize_cycles(raw_hotspots, mlm)
-            state["hotspots"] = new_cycles
-            if resym_stats.get("resymbolized", 0) > 0:
-                state["resymbolize_stats"] = resym_stats
-        except Exception as e:
-            state["hotspots"] = raw_hotspots
-            state["resymbolize_error"] = str(e)
-    else:
-        state["hotspots"] = raw_hotspots
+    state["hotspots"] = _tail_jsonl(hotspots_path, max(tail_n, 50))
 
     # DVT 进程指标 — 实际文件在 logs/dvt/ 子目录；兼容旧路径
     # network 事件流频率高 (每连接每秒一条 update)，单独给更大窗口
@@ -150,20 +138,6 @@ def collect_perf_state(repo: Optional[Path], coord_dir: str, tag: str, tail_n: i
             pass
 
     return state
-
-
-# 全局 MultiLinkMap 注册 (启动时由 cmd_dashboard 设置)
-_GLOBAL_LINKMAP: Any = None
-
-
-def set_global_linkmap(mlm: Any) -> None:
-    """注入 MultiLinkMap, 让 collect_perf_state 自动应用 hotspots 二次符号化。"""
-    global _GLOBAL_LINKMAP
-    _GLOBAL_LINKMAP = mlm
-
-
-def _get_global_linkmap() -> Any:
-    return _GLOBAL_LINKMAP
 
 
 def _tail_jsonl(path: Path, n: int) -> List[Dict[str, Any]]:
@@ -966,14 +940,7 @@ function renderHotspots(p) {
           sym,
           vals: new Array(cycleCount).fill(0),
           cyclesIn: 0,
-          resymbolized: !!h._resymbolized,
-          originSymbol: h._origin_symbol || '',
         };
-      }
-      // 任一 cycle 中此函数被反查命中, 整体标记
-      if (h._resymbolized) {
-        funcMap[sym].resymbolized = true;
-        if (h._origin_symbol) funcMap[sym].originSymbol = h._origin_symbol;
       }
       seenInCycle.add(sym);
       funcMap[sym].vals[recs.indexOf(cycle)] = pct;
@@ -991,8 +958,6 @@ function renderHotspots(p) {
     return {
       sym: f.sym, vals, inCount, peak, last,
       avgAcrossAll, avgWhenIn,
-      resymbolized: f.resymbolized,
-      originSymbol: f.originSymbol,
       // 趋势：最后 1/3 cycle 均值 vs 最早 1/3
       trend: vals.length >= 3
         ? (vals.slice(-Math.ceil(vals.length/3)).reduce((a,b)=>a+b,0) / Math.ceil(vals.length/3))
@@ -1126,11 +1091,8 @@ function renderHotspots(p) {
     else if (/^0x[0-9a-f]+/.test(sym)) badge = '<span class="pill" style="background:#ca8a04">Unsymbolicated</span>';
     else badge = '<span class="pill" style="background:#16a34a">业务/其他</span>';
 
-    // 二次符号化标识 (如果该函数是用 LinkMap 反查得到的)
-    const resymBadge = (f.resymbolized || (f.allItems && f.allItems.some(i => i._resymbolized)))
-      ? ` <span class="pill" style="background:#16a34a" title="LinkMap 反查命中, 原符号: ${f.originSymbol||''}">⤳ LinkMap</span>` : '';
     html += `<tr>
-      <td>#${i + 1} ${badge}${resymBadge}</td>
+      <td>#${i + 1} ${badge}</td>
       <td class="num"><b>${fmt(f.avgAcrossAll, 1)}</b></td>
       <td class="num">${fmt(f.peak, 1)}</td>
       <td class="num">${f.inCount}/${cycleCount}<br><span class="muted" style="font-size:10px">${presentPct}%</span></td>

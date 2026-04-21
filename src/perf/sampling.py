@@ -402,7 +402,7 @@ def aggregate_top_n(
         return []
 
     # (leaf_name, addr) → weight
-    # 保留 addr 让后续 resymbolize 阶段能 LinkMap 反查
+    # 保留 addr 让 SymbolResolver 能用 LinkMap/atos 反查
     bucket: Dict[Tuple[str, str], float] = defaultdict(float)
     for s in samples:
         if len(s) >= 3:
@@ -429,6 +429,62 @@ def aggregate_top_n(
             item["addr"] = addr
         out.append(item)
     return out
+
+
+def _coerce_addr_to_int(addr) -> Optional[int]:
+    """把 entry.addr 标准化成 int (resolver.resolve_batch 的 key 类型)。
+
+    支持:
+      - int 直接返回
+      - str hex (如 "0x100" / "100" / "abcdef") 尝试解析为 int
+      - 其它情况返回 None (跳过 resolver 调用)
+    """
+    if isinstance(addr, int):
+        return addr
+    if isinstance(addr, str) and addr:
+        try:
+            return int(addr, 16)
+        except ValueError:
+            return None
+    return None
+
+
+def _enrich_top_with_resolver(top_entries: list, resolver) -> list:
+    """在 aggregate_top_n 产出后批量符号化。
+
+    - resolver 为 None 或 warmup 未完成时退化为 hex + source=unresolved
+    - 无 addr 字段的 entry (旧格式/非地址型条目) 保留原 symbol,不打 source 标签
+    - 每条 entry 原地更新 symbol + source (不重建 list,保留其它字段和顺序)
+    - addr 兼容 int 或 hex 字符串 (parse_timeprofiler_xml 产出 string)
+
+    resolver 必须是 SymbolResolver 或兼容 duck-type (需有 resolve_batch 方法)
+    """
+    if not top_entries:
+        return top_entries
+
+    # 收集能解析成 int 的 addr - 与 entry 一一对应
+    pairs = []  # (entry, addr_int)
+    for e in top_entries:
+        addr_int = _coerce_addr_to_int(e.get("addr"))
+        if addr_int is not None:
+            pairs.append((e, addr_int))
+
+    if resolver is None or not pairs:
+        # 纯 hex 降级 - 只有带 addr 的 entry 才打 unresolved 标签
+        for e, _ in pairs:
+            e.setdefault("source", "unresolved")
+        return top_entries
+
+    addrs = [a for _, a in pairs]
+    resolved = resolver.resolve_batch(addrs)
+    for e, addr_int in pairs:
+        sym = resolved.get(addr_int)
+        if sym is not None:
+            e["symbol"] = sym.name
+            e["source"] = sym.source
+        else:
+            e["source"] = "unresolved"
+    return top_entries
 
 
 def aggregate_per_thread(
@@ -628,12 +684,14 @@ class SamplingProfilerSidecar:
         interval_sec: int = 10,
         top_n: int = 10,
         retention: int = 30,
+        resolver=None,
     ):
         self.session_root = Path(session_root)
         self.device_udid = device_udid
         self.process = process
         self.top_n = top_n
         self.retention = retention
+        self._resolver = resolver  # None 或 SymbolResolver - 让 cycle 批量符号化
 
         if interval_sec < self.MIN_INTERVAL:
             logger.warning(
@@ -881,6 +939,8 @@ class SamplingProfilerSidecar:
                 return False
 
             top = aggregate_top_n(samples, self.top_n)
+            # 批量符号化 hex addr → 业务函数名 + source 标签
+            top = _enrich_top_with_resolver(top, self._resolver)
             # 兼容 2/3/4 元组: weight 总在 index 1
             total = sum(s[1] for s in samples)
             # per-thread 聚合 (4 元组才有效, 旧格式自动 noop)
