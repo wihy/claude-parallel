@@ -59,7 +59,9 @@ class SymbolResolver:
                     self._linkmap = None
             if self.binary_path and Path(self.binary_path).exists():
                 try:
-                    daemon = AtosDaemon(self.binary_path, load_addr=0)
+                    # iOS 用户 app 默认 load base 0x100000000 (arm64)
+                    # 采样地址是设备运行时绝对地址, atos 用 -l 计算 offset = addr - base
+                    daemon = AtosDaemon(self.binary_path, load_addr=0x100000000)
                     daemon.start()
                     self._atos = daemon
                 except OSError:
