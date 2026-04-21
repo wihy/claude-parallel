@@ -27,7 +27,7 @@ from src.domain.tasks import (
     Task, ProjectConfig, parse_task_file,
     topological_levels, get_task_map,
 )
-from src.worker import Worker, WorkerResult, retry_worker
+from src.application.worker import Worker, WorkerResult, retry_worker
 from src.infrastructure.monitoring.rich_monitor import Monitor
 from src.merger import WorktreeMerger, MergeReport
 from src.context_extractor import extract_context_for_downstream
