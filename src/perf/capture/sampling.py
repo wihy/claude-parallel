@@ -347,14 +347,30 @@ class SamplingProfilerSidecar:
         # 清理上次残留的孤儿进程
         self._cleanup_stale_daemon()
 
+        # Daemon 不能 pickle resolver,但可提取构造参数让子进程自建
+        if self._resolver is not None:
+            resolver_init = (
+                "from src.perf.locate.resolver import SymbolResolver as _SR; "
+                "import threading as _th; "
+                "_r=_SR("
+                f"binary_path={self._resolver.binary_path!r},"
+                f"dsym_paths={list(self._resolver.dsym_paths)!r},"
+                f"linkmap_path={self._resolver.linkmap_path!r},"
+                f"cache_dir=Path({str(self._resolver._cache.cache_dir)!r})); "
+                "_th.Thread(target=_r.warmup,daemon=True).start(); "
+            )
+        else:
+            resolver_init = "_r=None; "
+
         daemon_code = (
             "import sys, signal; "
             "from src.perf.sampling import SamplingProfilerSidecar; "
             "from pathlib import Path; "
-            f"s=SamplingProfilerSidecar(Path({str(self.session_root)!r}),"
+            + resolver_init
+            + f"s=SamplingProfilerSidecar(Path({str(self.session_root)!r}),"
             f"{self.device_udid!r},{self.process!r},"
             f"interval_sec={self.interval_sec},"
-            f"top_n={self.top_n},retention={self.retention}); "
+            f"top_n={self.top_n},retention={self.retention},resolver=_r); "
             "signal.signal(signal.SIGTERM,"
             "lambda *_:(s._stop_event.set(),s._kill_current_proc())); "
             "s.logs_dir.mkdir(parents=True,exist_ok=True); "
