@@ -31,12 +31,31 @@ class SymbolResolver:
         self,
         binary_path: str,
         dsym_paths: list,
-        linkmap_path: Optional[str],
-        cache_dir: Path,
+        linkmap_path=None,                  # 兼容: Optional[str | list[str]]
+        cache_dir: Path = None,
+        *,
+        linkmap_paths: Optional[list] = None,
     ):
         self.binary_path = binary_path
         self.dsym_paths = list(dsym_paths)
-        self.linkmap_path = linkmap_path
+        # 合并 linkmap_path (单数, 兼容旧调用) 与 linkmap_paths (复数, 新规范)
+        paths: list = []
+        if linkmap_paths:
+            paths.extend(str(p) for p in linkmap_paths if p)
+        if linkmap_path:
+            if isinstance(linkmap_path, (list, tuple)):
+                paths.extend(str(p) for p in linkmap_path if p)
+            else:
+                paths.append(str(linkmap_path))
+        # 去重保序
+        seen = set()
+        self.linkmap_paths: list = []
+        for p in paths:
+            if p not in seen:
+                seen.add(p)
+                self.linkmap_paths.append(p)
+        # 单数属性保留 (hint 兼容): 取第一个
+        self.linkmap_path = self.linkmap_paths[0] if self.linkmap_paths else None
         self._cache = SymbolCache(cache_dir)
         self._linkmap = None  # MultiLinkMap, warmup 时加载
         self._atos: Optional[AtosDaemon] = None
@@ -49,12 +68,16 @@ class SymbolResolver:
             if self._warmup_done.is_set():
                 return
             self._cache.load()
-            if self.linkmap_path:
+            if self.linkmap_paths:
                 try:
                     from .linkmap import MultiLinkMap, LinkMap
                     lm = MultiLinkMap()
-                    lm.add(LinkMap.load(self.linkmap_path))
-                    self._linkmap = lm
+                    for p in self.linkmap_paths:
+                        try:
+                            lm.add(LinkMap.load(p))
+                        except (OSError, ValueError):
+                            continue  # 单个坏文件不阻断其余加载
+                    self._linkmap = lm if lm.linkmaps else None
                 except (OSError, ValueError):
                     self._linkmap = None
             if self.binary_path and Path(self.binary_path).exists():
@@ -122,14 +145,19 @@ class SymbolResolver:
         调用者自行判空后决定是否注入 sampling。
         """
         binary = getattr(cfg, "binary_path", "") or ""
-        linkmap = getattr(cfg, "linkmap_path", "") or None
+        # 新 API linkmap_paths (list), 向后兼容 linkmap_path (单字符串或 None)
+        linkmaps = list(getattr(cfg, "linkmap_paths", []) or [])
+        if not linkmaps:
+            single = getattr(cfg, "linkmap_path", "") or ""
+            if single:
+                linkmaps = [single]
         dsyms = list(getattr(cfg, "dsym_paths", []) or [])
-        if not binary and not linkmap and not dsyms:
+        if not binary and not linkmaps and not dsyms:
             return None
         cache_dir = Path(repo_path) / ".claude-parallel" / "locate_cache"
         return cls(
             binary_path=binary,
             dsym_paths=dsyms,
-            linkmap_path=linkmap,
+            linkmap_paths=linkmaps,
             cache_dir=cache_dir,
         )

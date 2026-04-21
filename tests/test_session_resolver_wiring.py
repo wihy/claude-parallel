@@ -11,9 +11,9 @@ class SessionResolverWiringTest(unittest.TestCase):
         from src.perf.session import PerfSessionManager
         from src.perf import PerfConfig
         cfg = PerfConfig(enabled=True, sampling_enabled=True, tag="test")
-        # PerfConfig 目前没有 binary/linkmap/dsym 字段,用 setattr 注入 (resolver 用 getattr 读)
+        # PerfConfig 已有 binary_path/linkmap_paths/dsym_paths 字段 (v0.4.0+)
         cfg.binary_path = "/tmp/fake_bin"
-        cfg.linkmap_path = ""
+        cfg.linkmap_paths = []
         cfg.dsym_paths = []
         return PerfSessionManager(repo=str(d), coordination_dir=".claude-parallel", config=cfg), cfg
 

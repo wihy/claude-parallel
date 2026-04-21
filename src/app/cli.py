@@ -132,7 +132,7 @@ def build_perf_config_from_args(args) -> PerfConfig:
         attach_webcontent=bool(getattr(args, "perf_attach_webcontent", False)),
         composite=getattr(args, "perf_composite", "auto") or "auto",
         binary_path=getattr(args, "perf_binary", "") or "",
-        linkmap_path=getattr(args, "perf_linkmap", "") or "",
+        linkmap_paths=list(getattr(args, "perf_linkmap", []) or []),
         dsym_paths=list(getattr(args, "perf_dsym", []) or []),
     )
 

@@ -51,5 +51,13 @@ class PerfConfig:
 
     # Symbol resolver 配置 (Track B resolver 激活条件)
     binary_path: str = ""                                   # 主 binary 路径 (用于 atos 符号化)
-    linkmap_path: str = ""                                  # LinkMap 文件路径 (业务符号解析)
+    linkmap_paths: list = field(default_factory=list)       # LinkMap 文件路径列表 (多个可叠加,覆盖主 binary + dylib + Extensions)
     dsym_paths: list = field(default_factory=list)          # dSYM 路径列表
+
+    @property
+    def linkmap_path(self) -> str:
+        """兼容 API — 返回第一个 LinkMap 路径 (若有),空字符串否则。
+
+        历史代码可能用单数形式;新代码应直接用 linkmap_paths。
+        """
+        return self.linkmap_paths[0] if self.linkmap_paths else ""

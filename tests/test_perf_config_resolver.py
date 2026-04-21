@@ -18,17 +18,27 @@ class PerfConfigResolverTest(unittest.TestCase):
         self.assertFalse(cfg.dsym_paths)
 
     def test_perfconfig_accepts_resolver_fields_via_kwargs(self):
-        """PerfConfig(binary_path=..., linkmap_path=..., dsym_paths=...) 构造可用。"""
+        """PerfConfig(binary_path=..., linkmap_paths=[...], dsym_paths=[...]) 构造可用。"""
         from src.perf import PerfConfig
         cfg = PerfConfig(
             enabled=True,
             binary_path="/tmp/fake/Soul",
-            linkmap_path="/tmp/fake/Soul-LinkMap.txt",
+            linkmap_paths=["/tmp/fake/Soul-LinkMap.txt"],
             dsym_paths=["/tmp/fake/Soul.app.dSYM"],
         )
         self.assertEqual(cfg.binary_path, "/tmp/fake/Soul")
+        self.assertEqual(cfg.linkmap_paths, ["/tmp/fake/Soul-LinkMap.txt"])
+        # 单数 property 仍可访问 (返回第一个)
         self.assertEqual(cfg.linkmap_path, "/tmp/fake/Soul-LinkMap.txt")
         self.assertEqual(cfg.dsym_paths, ["/tmp/fake/Soul.app.dSYM"])
+
+    def test_perfconfig_multi_linkmap_paths(self):
+        """linkmap_paths 支持多个 LinkMap (主 binary + dylib + Extensions)。"""
+        from src.perf import PerfConfig
+        paths = ["/tmp/a.txt", "/tmp/b.txt", "/tmp/c.txt"]
+        cfg = PerfConfig(enabled=True, linkmap_paths=paths)
+        self.assertEqual(cfg.linkmap_paths, paths)
+        self.assertEqual(cfg.linkmap_path, "/tmp/a.txt")  # 单数返回第一个
 
     def test_symbol_resolver_from_config_activates_with_binary(self):
         """配了 binary_path 后 from_config 应返回 SymbolResolver (非 None)。"""

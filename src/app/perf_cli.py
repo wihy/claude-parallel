@@ -49,9 +49,20 @@ def register_perf_subcommands(subparsers):
         help='Composite 模式: auto|full|webperf|power_cpu|gpu_full|memory|power+time+network|""',
     )
     perf_start.add_argument("--no-tunneld", action="store_true", help="跳过自动启动 tunneld (iOS 17+ DVT 通道将不可用)")
-    perf_start.add_argument("--binary", default="", help="主 binary 路径 (用于 atos 符号化)")
-    perf_start.add_argument("--linkmap", default="", help="LinkMap 文件路径 (业务符号解析)")
-    perf_start.add_argument("--dsym", action="append", default=[], help="dSYM 路径 (可多次指定)")
+    # resolver 激活参数: 同时接受 --xxx 和 --perf-xxx 两种前缀 (与 run --with-perf 对齐)
+    # --binary: iOS Debug build 需指向 .app/<AppName>.debug.dylib (launcher stub 几乎无符号)
+    perf_start.add_argument(
+        "--binary", "--perf-binary", dest="binary", default="",
+        help="主 binary 路径 (用于 atos 符号化; iOS Debug build 用 .debug.dylib)",
+    )
+    perf_start.add_argument(
+        "--linkmap", "--perf-linkmap", dest="linkmap", action="append", default=[],
+        help="LinkMap 文件路径 (业务符号解析, 可多次指定叠加)",
+    )
+    perf_start.add_argument(
+        "--dsym", "--perf-dsym", dest="dsym", action="append", default=[],
+        help="dSYM 路径 (可多次指定)",
+    )
 
     perf_stop = perf_sub.add_parser("stop", help="停止 perf 采集")
     perf_stop.add_argument("--repo", default="", help="项目仓库路径 (未指定则使用 config 默认)")
@@ -276,7 +287,7 @@ async def cmd_perf_start(args):
         attach_webcontent=defaults.resolve_bool("attach_webcontent", getattr(args, "attach_webcontent", None), False),
         composite=defaults.resolve("composite", getattr(args, "composite", None), "auto"),
         binary_path=getattr(args, "binary", "") or "",
-        linkmap_path=getattr(args, "linkmap", "") or "",
+        linkmap_paths=list(getattr(args, "linkmap", []) or []),
         dsym_paths=list(getattr(args, "dsym", []) or []),
     )
     perf = PerfSessionManager(str(repo), ".claude-parallel", cfg)

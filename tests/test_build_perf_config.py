@@ -12,18 +12,22 @@ import unittest
 class BuildPerfConfigTest(unittest.TestCase):
 
     def test_factory_maps_binary_linkmap_dsym(self):
-        """factory 应把 args.perf_binary / perf_linkmap / perf_dsym 映射到 cfg。"""
+        """factory 应把 args.perf_binary / perf_linkmap / perf_dsym 映射到 cfg。
+
+        argparse 用 action="append" 让 --perf-linkmap 和 --perf-dsym 都为 list。
+        """
         from src.app.cli import build_perf_config_from_args
 
         args = argparse.Namespace()
         args.perf_binary = "/tmp/Soul"
-        args.perf_linkmap = "/tmp/Soul-LinkMap.txt"
+        args.perf_linkmap = ["/tmp/Soul-LinkMap.txt", "/tmp/Soul.dylib-LinkMap.txt"]
         args.perf_dsym = ["/tmp/Soul.app.dSYM"]
 
         cfg = build_perf_config_from_args(args)
 
         self.assertEqual(cfg.binary_path, "/tmp/Soul")
-        self.assertEqual(cfg.linkmap_path, "/tmp/Soul-LinkMap.txt")
+        self.assertEqual(cfg.linkmap_paths, ["/tmp/Soul-LinkMap.txt", "/tmp/Soul.dylib-LinkMap.txt"])
+        self.assertEqual(cfg.linkmap_path, "/tmp/Soul-LinkMap.txt")  # 单数 property
         self.assertEqual(cfg.dsym_paths, ["/tmp/Soul.app.dSYM"])
 
     def test_factory_empty_defaults_when_args_missing(self):
@@ -35,7 +39,8 @@ class BuildPerfConfigTest(unittest.TestCase):
         cfg = build_perf_config_from_args(args)
 
         self.assertEqual(cfg.binary_path, "")
-        self.assertEqual(cfg.linkmap_path, "")
+        self.assertEqual(cfg.linkmap_paths, [])
+        self.assertEqual(cfg.linkmap_path, "")  # property 空 list 返回 ""
         self.assertEqual(cfg.dsym_paths, [])
 
 
