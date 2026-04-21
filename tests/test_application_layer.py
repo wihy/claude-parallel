@@ -52,6 +52,14 @@ class ApplicationLayerTest(unittest.TestCase):
         from src.context_extractor import extract_context_for_downstream
         self.assertTrue(callable(extract_context_for_downstream))
 
+    def test_claude_client_from_infrastructure(self):
+        from src.infrastructure.claude.client import strip_code_fences
+        self.assertTrue(callable(strip_code_fences))
+
+    def test_claude_client_shim_still_works(self):
+        from src.claude_client import strip_code_fences
+        self.assertTrue(callable(strip_code_fences))
+
 
 if __name__ == "__main__":
     unittest.main()

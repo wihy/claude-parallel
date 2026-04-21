@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from src.claude_client import call_claude_async, strip_code_fences
+from src.infrastructure.claude.client import call_claude_async, strip_code_fences
 from src.domain.tasks import Task, ProjectConfig
 from src.application.worker import WorkerResult
 
