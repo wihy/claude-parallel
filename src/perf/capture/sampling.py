@@ -283,6 +283,12 @@ class SamplingProfilerSidecar:
 
     MIN_INTERVAL = 3
     MAX_CONSECUTIVE_FAILURES = 3
+    # Warmup cycles: xctrace record 首次 attach 冷启动慢 (10-20s 连接 device,
+    # load template),常触发 subprocess timeout. 首 N 个 cycles 失败不计
+    # consecutive_failures,避免因冷启动被 MAX_CONSECUTIVE_FAILURES 吞掉整个 session.
+    WARMUP_CYCLES = 1
+    # 失败后微延迟, 给设备/tunneld 喘息
+    FAILURE_BACKOFF_SEC = 2.0
 
     def __init__(
         self,
@@ -477,6 +483,23 @@ class SamplingProfilerSidecar:
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="export")
         pending_future: Optional[Future] = None
 
+        def _register_failure(reason: str, cycle_num: int) -> None:
+            """首 WARMUP_CYCLES 的失败视为冷启动, 不计入 consecutive_failures。"""
+            nonlocal consecutive_failures
+            if cycle_num <= self.WARMUP_CYCLES:
+                self._log_error(
+                    f"cycle {cycle_num}: warmup failure ignored ({reason})"
+                )
+                return
+            consecutive_failures += 1
+            self._log_error(
+                f"cycle {cycle_num}: {reason} "
+                f"(consecutive={consecutive_failures}/{self.MAX_CONSECUTIVE_FAILURES})"
+            )
+            # 失败 backoff: 给 tunneld / device 喘息
+            if not self._stop_event.is_set():
+                self._stop_event.wait(self.FAILURE_BACKOFF_SEC)
+
         try:
             while not self._stop_event.is_set():
                 cycle_num = self._cycle_count + 1
@@ -491,10 +514,9 @@ class SamplingProfilerSidecar:
                         if result:
                             consecutive_failures = 0
                         else:
-                            consecutive_failures += 1
+                            _register_failure("export returned False", cycle_num - 1)
                     except Exception as e:
-                        consecutive_failures += 1
-                        self._log_error(f"export future exception: {e}")
+                        _register_failure(f"export future exception: {e}", cycle_num - 1)
 
                 if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
                     self._log_error(
@@ -508,7 +530,7 @@ class SamplingProfilerSidecar:
                         self._export_and_append, cycle_num, trace_path,
                     )
                 else:
-                    consecutive_failures += 1
+                    _register_failure("record returned no trace", cycle_num)
                     pending_future = None
 
                 self._cycle_count = cycle_num
