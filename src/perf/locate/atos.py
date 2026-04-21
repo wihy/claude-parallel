@@ -65,14 +65,34 @@ class AtosDaemon:
         """测试钩子 — 直接注入响应,绕开真实 atos 子进程。"""
         self._response_queue.put(text)
 
+    def _drain_queue(self) -> int:
+        """清空 response queue 中的残余响应 (前一次 lookup 超时后晚到的)。
+
+        持锁前提下调用。返回丢弃的响应数。
+        """
+        n = 0
+        while True:
+            try:
+                self._response_queue.get_nowait()
+                n += 1
+            except queue.Empty:
+                return n
+
     def lookup(self, addr: int) -> str:
-        """同步查询单个地址。失败或未启动时返回 hex 字符串。"""
+        """同步查询单个地址。失败或未启动时返回 hex 字符串。
+
+        Stale response 防护: 写 stdin 前 drain queue,阻断"上一次 lookup
+        超时后晚到的响应被当前 lookup 误读"的竞态 (真机 atos 偶发 >200ms
+        响应场景)。
+        """
         if addr in self._blacklist:
             return f"0x{addr:x}"
         if not self._started or not self._proc or not self._proc.stdin:
             return f"0x{addr:x}"
 
         with self._lock:
+            # Phase 1: 清空残余响应 (前一次 timeout 后晚到的)
+            self._drain_queue()
             try:
                 self._proc.stdin.write(f"{hex(addr)}\n")
                 self._proc.stdin.flush()

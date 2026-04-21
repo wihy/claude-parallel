@@ -22,13 +22,23 @@ class AtosDaemonTest(unittest.TestCase):
         self.assertTrue(result.startswith("0x"))
 
     def test_lookup_sends_addr_and_reads_symbol(self):
+        """lookup 写 stdin 后读 atos 响应。
+
+        注: Fix 4 (drain-before-write) 后,响应必须在 stdin.write 被调用之后
+        才能出现在 queue (模拟 atos 收到请求后才输出)。
+        """
         from src.perf.locate.atos import AtosDaemon
         d = AtosDaemon(binary_path="/tmp/fake_bin", load_addr=0x100000000)
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
+        # 在 stdin.write 触发时注入响应 (模拟真 atos 行为)
+        original_write = mock_proc.stdin.write
+        def write_and_respond(data):
+            d._put_response("MyClass.swiftFunc()")
+            return original_write(data)
+        mock_proc.stdin.write = write_and_respond
         d._proc = mock_proc
         d._started = True
-        d._put_response("MyClass.swiftFunc()")
         result = d.lookup(0x100001234)
         self.assertEqual(result, "MyClass.swiftFunc()")
 
